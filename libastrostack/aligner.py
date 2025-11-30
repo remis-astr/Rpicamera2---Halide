@@ -151,13 +151,27 @@ class AdvancedAligner:
         
         if transform is None:
             return image, {}, False
-        
+
         # Vérifier drift
         drift = np.sqrt(params.get('dx', 0)**2 + params.get('dy', 0)**2)
         if drift > self.config.quality.max_drift:
             print(f"  [REJECT] Drift trop grand: {drift:.1f}px")
             return image, params, False
-        
+
+        # Vérifier rotation (sauf pour mode TRANSLATION)
+        if self.config.alignment_mode != AlignmentMode.TRANSLATION:
+            angle = abs(params.get('angle', 0))
+            if angle > self.config.quality.max_rotation:
+                print(f"  [REJECT] Rotation trop grande: {angle:.1f}° (max {self.config.quality.max_rotation}°)")
+                return image, params, False
+
+        # Vérifier scale (pour modes ROTATION et AFFINE)
+        if self.config.alignment_mode in [AlignmentMode.ROTATION, AlignmentMode.AFFINE]:
+            scale = params.get('scale', 1.0)
+            if scale < self.config.quality.min_scale or scale > self.config.quality.max_scale:
+                print(f"  [REJECT] Scale aberrant: {scale:.4f} (plage {self.config.quality.min_scale}-{self.config.quality.max_scale})")
+                return image, params, False
+
         # Appliquer transformation
         aligned = self._apply_transform(image, transform)
         
@@ -167,21 +181,53 @@ class AdvancedAligner:
         return aligned, params, True
     
     def _compute_translation(self, ref_stars, cur_stars):
-        """Calcule translation simple (centre de masse)"""
-        ref_center = np.mean(ref_stars[:20], axis=0)
-        cur_center = np.mean(cur_stars[:20], axis=0)
-        
-        dy = ref_center[0] - cur_center[0]
-        dx = ref_center[1] - cur_center[1]
-        
-        params = {'dx': dx, 'dy': dy, 'angle': 0, 'scale': 1.0}
-        
+        """Calcule translation par matching d'étoiles"""
+        # Utiliser au max 30 étoiles les plus brillantes
+        n_ref = min(30, len(ref_stars))
+        n_cur = min(30, len(cur_stars))
+
+        ref_pts = ref_stars[:n_ref]
+        cur_pts = cur_stars[:n_cur]
+
+        # Calculer toutes les distances entre étoiles ref et cur
+        # Pour chaque étoile de référence, trouver la plus proche dans l'image courante
+        matches = []
+        match_distances = []
+
+        for i, ref_pt in enumerate(ref_pts):
+            # Distances à toutes les étoiles courantes
+            distances = np.sqrt(np.sum((cur_pts - ref_pt)**2, axis=1))
+            min_idx = np.argmin(distances)
+            min_dist = distances[min_idx]
+
+            # Accepter seulement les matches proches (< 100px)
+            if min_dist < 100:
+                matches.append((ref_pt, cur_pts[min_idx]))
+                match_distances.append(min_dist)
+
+        # Besoin d'au moins 3 matches
+        if len(matches) < 3:
+            print(f"  [WARN] Pas assez de matches: {len(matches)}")
+            return None, {}
+
+        # Calculer la translation médiane (plus robuste que moyenne)
+        # ref - cur pour ramener l'image courante vers la référence
+        translations = np.array([ref - cur for ref, cur in matches])
+        dy = np.median(translations[:, 0])
+        dx = np.median(translations[:, 1])
+
+        params = {
+            'dx': dx, 'dy': dy, 'angle': 0, 'scale': 1.0,
+            'matches': len(matches),
+            'total': len(ref_pts)
+        }
+
         transform = np.array([
             [1, 0, dx],
             [0, 1, dy],
             [0, 0, 1]
         ])
-        
+
         return transform, params
     
     def _compute_rotation(self, ref_stars, cur_stars, image_shape):
@@ -201,24 +247,32 @@ class AdvancedAligner:
                 maxIters=2000,
                 confidence=0.99
             )
-            
+
             if M is None:
                 return None, {}
-            
+
+            # Vérifier le ratio d'inliers
+            n_inliers = np.sum(inliers) if inliers is not None else 0
+            inliers_ratio = n_inliers / len(cur_pts) if len(cur_pts) > 0 else 0
+
+            if inliers_ratio < self.config.quality.min_inliers_ratio:
+                print(f"  [WARN] Pas assez d'inliers: {n_inliers}/{len(cur_pts)} ({inliers_ratio*100:.1f}%)")
+                return None, {}
+
             # Extraire paramètres
             angle = np.arctan2(M[1, 0], M[0, 0]) * 180 / np.pi
             scale = np.sqrt(M[0, 0]**2 + M[1, 0]**2)
             dx = M[0, 2]
             dy = M[1, 2]
-            
+
             params = {
                 'dx': dx, 'dy': dy, 'angle': angle, 'scale': scale,
-                'inliers': np.sum(inliers) if inliers is not None else 0,
+                'inliers': n_inliers,
                 'total': len(cur_pts)
             }
-            
+
             transform = np.vstack([M, [0, 0, 1]])
-            
+
             return transform, params
         except:
             return None, {}
@@ -238,21 +292,29 @@ class AdvancedAligner:
                 maxIters=2000,
                 confidence=0.99
             )
-            
+
             if M is None:
                 return None, {}
-            
+
+            # Vérifier le ratio d'inliers
+            n_inliers = np.sum(inliers) if inliers is not None else 0
+            inliers_ratio = n_inliers / len(cur_pts) if len(cur_pts) > 0 else 0
+
+            if inliers_ratio < self.config.quality.min_inliers_ratio:
+                print(f"  [WARN] Pas assez d'inliers: {n_inliers}/{len(cur_pts)} ({inliers_ratio*100:.1f}%)")
+                return None, {}
+
             angle = np.arctan2(M[1, 0], M[0, 0]) * 180 / np.pi
             scale = np.sqrt(M[0, 0]**2 + M[1, 0]**2)
-            
+
             params = {
                 'dx': M[0, 2], 'dy': M[1, 2], 'angle': angle, 'scale': scale,
-                'inliers': np.sum(inliers) if inliers is not None else 0,
+                'inliers': n_inliers,
                 'total': len(cur_pts)
             }
-            
+
             transform = np.vstack([M, [0, 0, 1]])
-            
+
             return transform, params
         except:
             return None, {}
@@ -287,9 +349,11 @@ class AdvancedAligner:
         """Affiche infos transformation"""
         mode = self.config.alignment_mode
         drift = np.sqrt(params.get('dx', 0)**2 + params.get('dy', 0)**2)
-        
+
         if mode == AlignmentMode.TRANSLATION:
-            print(f"  Translation: drift={drift:.2f}px")
+            matches = params.get('matches', 0)
+            total = params.get('total', 0)
+            print(f"  Translation: drift={drift:.2f}px, matches={matches}/{total}")
         elif mode == AlignmentMode.ROTATION:
             print(f"  Rotation: angle={params.get('angle', 0):.3f}°, "
                   f"drift={drift:.2f}px, "

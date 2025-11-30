@@ -872,9 +872,9 @@ video       = 0
 timelapse   = 0
 stream      = 0
 stretch_mode = 0  # Mode stretch astro pour le preview
-stretch_p_low = 1    # Percentile bas pour stretch (0% à 0.1%, stocké x10 pour slider)
-stretch_p_high = 995 # Percentile haut pour stretch (99.5% à 100%, stocké x10 pour slider)
-stretch_factor = 100 # Facteur de stretch (1 à 30, stocké x10 pour slider)
+stretch_p_low = 0    # Percentile bas pour stretch (0% à 0.2%, stocké x10 pour slider)
+stretch_p_high = 9998 # Percentile haut pour stretch (99.95% à 100%, stocké x100 pour slider)
+stretch_factor = 25 # Facteur de stretch (0 à 5, stocké x10 pour slider)
 stretch_preset = 0   # Préréglage stretch: 0=OFF, 1=AUTO, 2=Nébuleuse, 3=Galaxie
 fwhm_history = deque(maxlen=240)
 fwhm_times = deque(maxlen=240)
@@ -1096,7 +1096,7 @@ still_limits = ['mode',0,len(modes)-1,'speed',0,len(shutters)-1,'gain',0,30,'bri
                 'histogram',0,len(histograms)-1,'v3_f_speed',0,len(v3_f_speeds)-1]
 video_limits = ['vlen',0,3600,'fps',1,40,'v5_focus',10,2500,'vformat',0,7,'0',0,0,'zoom',0,5,'Focus',0,1,'tduration',1,86400,'tinterval',0.01,10,'tshots',1,999,
                 'flicker',0,3,'codec',0,len(codecs)-1,'profile',0,len(h264profiles)-1,'v3_focus',10,2000,'histarea',10,300,'v3_f_range',0,len(v3_f_ranges)-1,
-                'str_cap',0,len(strs)-1,'v6_focus',10,1020,'stretch_p_low',0,1,'stretch_p_high',995,1000,'stretch_factor',10,300,'stretch_preset',0,3]
+                'str_cap',0,len(strs)-1,'v6_focus',10,1020,'stretch_p_low',0,2,'stretch_p_high',9995,10000,'stretch_factor',0,50,'stretch_preset',0,3]
 
 livestack_limits = ['ls_preview_refresh',1,10,'ls_alignment_mode',0,len(ls_alignment_modes)-1,'ls_enable_qc',0,1,'ls_max_fwhm',0,250,'ls_min_sharpness',0,150,'ls_max_drift',0,5000,'ls_min_stars',0,20]
 
@@ -1167,11 +1167,11 @@ hflip       = config[37]
 
 # Ajouter les nouveaux paramètres stretch si le fichier de config est ancien
 if len(config) <= 38:
-    config.append(1)     # stretch_p_low par défaut (0.1%)
+    config.append(0)     # stretch_p_low par défaut (0%)
 if len(config) <= 39:
-    config.append(995)   # stretch_p_high par défaut
+    config.append(9998)  # stretch_p_high par défaut (99.98%)
 if len(config) <= 40:
-    config.append(100)   # stretch_factor par défaut
+    config.append(25)    # stretch_factor par défaut (2.5)
 if len(config) <= 41:
     config.append(0)     # stretch_preset par défaut (OFF)
 
@@ -2143,9 +2143,9 @@ def astro_stretch(array):
     img_float = array.astype(np.float32)
 
     # Calculer les percentiles pour éviter l'effet des pixels chauds
-    # Utilise les valeurs configurables (divisées par 10 car stockées x10)
+    # stretch_p_low divisé par 10 (stocké x10), stretch_p_high divisé par 100 (stocké x100)
     p_low = np.percentile(img_float, stretch_p_low / 10.0)
-    p_high = np.percentile(img_float, stretch_p_high / 10.0)
+    p_high = np.percentile(img_float, stretch_p_high / 100.0)
 
     # Éviter la division par zéro
     if p_high - p_low < 1:
@@ -3014,7 +3014,7 @@ def Menu():
 
         # Ligne 2 - Stretch High %
         text(0,2,5,0,1,"Stretch High %",ft,7)
-        text(0,2,3,1,1,str(stretch_p_high/10)[0:5],fv,7)
+        text(0,2,3,1,1,str(stretch_p_high/100)[0:6],fv,7)
         draw_Vbar(0,2,greyColor,'stretch_p_high',stretch_p_high)
 
         # Ligne 3 - Stretch Factor
@@ -6930,18 +6930,16 @@ while True:
                   Menu()
 
               elif button_row == 1:
-                # STRETCH LOW PERCENTILE
-                pmin = 1    # 0.1%
-                pmax = 100  # 10%
+                # STRETCH LOW PERCENTILE (0% à 0.2%, stocké x10)
+                pmin = 0    # 0%
+                pmax = 2    # 0.2%
                 if (mousex > preview_width and mousey < ((button_row)*bh) + int(bh/3)):
                     stretch_p_low = int(((mousex-preview_width) / bw) * (pmax+1-pmin))
                 else:
                     if (alt_dis == 0 and mousex < preview_width + (bw/2)) or (alt_dis > 0 and button_pos == 0):
-                        stretch_p_low -=1
-                        stretch_p_low = max(stretch_p_low,pmin)
+                        stretch_p_low = max(0, stretch_p_low - 1)
                     else:
-                        stretch_p_low +=1
-                        stretch_p_low = min(stretch_p_low,pmax)
+                        stretch_p_low = min(pmax, stretch_p_low + 1)
                 # Note: modification manuelle des paramètres - le preset affiché reste inchangé
                 text(0,1,3,1,1,str(stretch_p_low/10)[0:4],fv,7)
                 draw_Vbar(0,1,greyColor,'stretch_p_low',stretch_p_low)
@@ -6950,38 +6948,34 @@ while True:
                 time.sleep(.05)
 
               elif button_row == 2:
-                # STRETCH HIGH PERCENTILE
-                pmin = 900  # 90%
-                pmax = 1000 # 100%
+                # STRETCH HIGH PERCENTILE (99.95% à 100%, stocké x100)
+                pmin = 9995  # 99.95%
+                pmax = 10000 # 100%
                 if (mousex > preview_width and mousey < ((button_row)*bh) + int(bh/3)):
                     stretch_p_high = int(((mousex-preview_width) / bw) * (pmax+1-pmin) + pmin)
                 else:
                     if (alt_dis == 0 and mousex < preview_width + (bw/2)) or (alt_dis > 0 and button_pos == 0):
-                        stretch_p_high -=1
-                        stretch_p_high = max(stretch_p_high,pmin)
+                        stretch_p_high = max(pmin, stretch_p_high - 1)
                     else:
-                        stretch_p_high +=1
-                        stretch_p_high = min(stretch_p_high,pmax)
+                        stretch_p_high = min(pmax, stretch_p_high + 1)
                 # Note: modification manuelle des paramètres - le preset affiché reste inchangé
-                text(0,2,3,1,1,str(stretch_p_high/10)[0:5],fv,7)
+                text(0,2,3,1,1,str(stretch_p_high/100)[0:6],fv,7)
                 draw_Vbar(0,2,greyColor,'stretch_p_high',stretch_p_high)
                 text(0,4,3,1,1,stretch_presets[stretch_preset],fv,7)
                 draw_Vbar(0,4,greyColor,'stretch_preset',stretch_preset)
                 time.sleep(.05)
 
               elif button_row == 3:
-                # STRETCH FACTOR
-                pmin = 10   # 1.0
-                pmax = 300  # 30.0
+                # STRETCH FACTOR (0 à 5, stocké x10)
+                pmin = 0    # 0.0
+                pmax = 50   # 5.0
                 if (mousex > preview_width and mousey < ((button_row)*bh) + int(bh/3)):
                     stretch_factor = int(((mousex-preview_width) / bw) * (pmax+1-pmin) + pmin)
                 else:
                     if (alt_dis == 0 and mousex < preview_width + (bw/2)) or (alt_dis > 0 and button_pos == 0):
-                        stretch_factor -=5
-                        stretch_factor = max(stretch_factor,pmin)
+                        stretch_factor = max(pmin, stretch_factor - 1)
                     else:
-                        stretch_factor +=5
-                        stretch_factor = min(stretch_factor,pmax)
+                        stretch_factor = min(pmax, stretch_factor + 1)
                 # Note: modification manuelle des paramètres - le preset affiché reste inchangé
                 text(0,3,3,1,1,str(stretch_factor/10)[0:4],fv,7)
                 draw_Vbar(0,3,greyColor,'stretch_factor',stretch_factor)
@@ -7010,21 +7004,21 @@ while True:
                     # empêche l'application du traitement stretch dans le code de capture
                     pass
                 elif stretch_preset == 1:
-                    # AUTO - Détection automatique basée sur l'histogramme
-                    # Analyse l'image pour adapter automatiquement les paramètres
-                    stretch_p_low = 10
-                    stretch_p_high = 995
-                    stretch_factor = 100
+                    # AUTO - Équilibré et doux pour usage général
+                    # Nouvelles plages: low 0-0.2%, high 99.95-100%, factor 0-5
+                    stretch_p_low = 0      # 0%
+                    stretch_p_high = 9998  # 99.98%
+                    stretch_factor = 25    # 2.5
                 elif stretch_preset == 2:
                     # Nébuleuse - Moyennement agressif pour nébuleuses et amas
-                    stretch_p_low = 10
-                    stretch_p_high = 995
-                    stretch_factor = 120
+                    stretch_p_low = 1      # 0.1%
+                    stretch_p_high = 9997  # 99.97%
+                    stretch_factor = 30    # 3.0
                 elif stretch_preset == 3:
-                    # Galaxie - Très agressif pour révéler les détails faibles
-                    stretch_p_low = 5
-                    stretch_p_high = 995
-                    stretch_factor = 150
+                    # Galaxie - Plus agressif pour révéler les détails faibles
+                    stretch_p_low = 2      # 0.2%
+                    stretch_p_high = 9995  # 99.95%
+                    stretch_factor = 40    # 4.0
 
                 # Mettre à jour l'affichage
                 text(0,4,3,1,1,stretch_presets[stretch_preset],fv,7)
@@ -7033,7 +7027,7 @@ while True:
                     # Mettre à jour l'affichage des paramètres si un preset a été sélectionné
                     text(0,1,3,1,1,str(stretch_p_low/10)[0:4],fv,7)
                     draw_Vbar(0,1,greyColor,'stretch_p_low',stretch_p_low)
-                    text(0,2,3,1,1,str(stretch_p_high/10)[0:5],fv,7)
+                    text(0,2,3,1,1,str(stretch_p_high/100)[0:6],fv,7)
                     draw_Vbar(0,2,greyColor,'stretch_p_high',stretch_p_high)
                     text(0,3,3,1,1,str(stretch_factor/10)[0:4],fv,7)
                     draw_Vbar(0,3,greyColor,'stretch_factor',stretch_factor)
@@ -7109,6 +7103,9 @@ while True:
                         ls_preview_refresh = min(ls_preview_refresh,pmax)
                 text(0,1,3,1,1,str(ls_preview_refresh),fv,7)
                 draw_Vbar(0,1,greyColor,'ls_preview_refresh',ls_preview_refresh)
+                # Mettre à jour la config livestack en temps réel
+                if livestack_active and livestack is not None:
+                    livestack.configure(preview_refresh=ls_preview_refresh)
                 time.sleep(.05)
 
               elif button_row == 2:
@@ -7128,6 +7125,9 @@ while True:
                         ls_alignment_mode = min(ls_alignment_mode,pmax)
                 text(0,2,3,1,1,ls_alignment_modes[ls_alignment_mode],fv,7)
                 draw_Vbar(0,2,greyColor,'ls_alignment_mode',ls_alignment_mode)
+                # Mettre à jour la config livestack en temps réel
+                if livestack_active and livestack is not None:
+                    livestack.configure(alignment_mode=ls_alignment_modes[ls_alignment_mode])
                 time.sleep(.05)
 
               elif button_row == 3:
@@ -7150,6 +7150,9 @@ while True:
                 else:
                     text(0,3,3,1,1,str(ls_max_fwhm/10)[0:4],fv,7)
                 draw_Vbar(0,3,greyColor,'ls_max_fwhm',ls_max_fwhm)
+                # Mettre à jour la config livestack en temps réel
+                if livestack_active and livestack is not None:
+                    livestack.configure(max_fwhm=ls_max_fwhm / 10.0 if ls_max_fwhm > 0 else 999.0)
                 time.sleep(.05)
 
               elif button_row == 4:
@@ -7172,6 +7175,9 @@ while True:
                 else:
                     text(0,4,3,1,1,str(ls_min_sharpness/1000)[0:5],fv,7)
                 draw_Vbar(0,4,greyColor,'ls_min_sharpness',ls_min_sharpness)
+                # Mettre à jour la config livestack en temps réel
+                if livestack_active and livestack is not None:
+                    livestack.configure(min_sharpness=ls_min_sharpness / 1000.0 if ls_min_sharpness > 0 else 0.0)
                 time.sleep(.05)
 
               elif button_row == 5:
@@ -7194,6 +7200,9 @@ while True:
                 else:
                     text(0,5,3,1,1,str(ls_max_drift),fv,7)
                 draw_Vbar(0,5,greyColor,'ls_max_drift',ls_max_drift)
+                # Mettre à jour la config livestack en temps réel
+                if livestack_active and livestack is not None:
+                    livestack.configure(max_drift=float(ls_max_drift) if ls_max_drift > 0 else 999999.0)
                 time.sleep(.05)
 
               elif button_row == 6:
@@ -7216,6 +7225,9 @@ while True:
                 else:
                     text(0,6,3,1,1,str(ls_min_stars),fv,7)
                 draw_Vbar(0,6,greyColor,'ls_min_stars',ls_min_stars)
+                # Mettre à jour la config livestack en temps réel
+                if livestack_active and livestack is not None:
+                    livestack.configure(min_stars=int(ls_min_stars))
                 time.sleep(.05)
 
               elif button_row == 7:
@@ -7234,6 +7246,9 @@ while True:
                 else:
                     text(0,7,3,1,1,"ON",fv,7)
                 draw_Vbar(0,7,greyColor,'ls_enable_qc',ls_enable_qc)
+                # Mettre à jour la config livestack en temps réel
+                if livestack_active and livestack is not None:
+                    livestack.configure(enable_qc=bool(ls_enable_qc))
                 time.sleep(.05)
 
               elif button_row == 8:

@@ -25,17 +25,23 @@ class StretchMethod:
 
 class QualityConfig:
     """Configuration du contrôle qualité"""
-    
+
     def __init__(self):
         # Activation
         self.enable = True
-        
+
         # Seuils de qualité
         self.max_fwhm = 12.0              # FWHM maximale en pixels
         self.max_ellipticity = 0.4        # Ellipticité max (0=rond, 1=ligne)
         self.min_stars = 10               # Nombre minimum d'étoiles
         self.max_drift = 50.0             # Drift max en pixels
         self.min_sharpness = 0.3          # Netteté minimale (0-1)
+
+        # Seuils d'alignement (pour éviter les transformations aberrantes)
+        self.max_rotation = 5.0           # Rotation max en degrés
+        self.min_scale = 0.95             # Scale minimum (défaut 0.95)
+        self.max_scale = 1.05             # Scale maximum (défaut 1.05)
+        self.min_inliers_ratio = 0.3      # Ratio minimum d'inliers RANSAC (30%)
         
         # Paramètres détection étoiles
         self.star_detection_sigma = 5.0   # Seuil sigma pour détection

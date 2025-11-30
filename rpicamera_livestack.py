@@ -69,7 +69,7 @@ class RPiCameraLiveStack:
     def configure(self, **kwargs):
         """
         Configure paramètres stacking
-        
+
         Paramètres disponibles:
         - alignment_mode: "translation", "rotation", "affine"
         - enable_qc: bool (activer/désactiver le contrôle qualité)
@@ -78,6 +78,9 @@ class RPiCameraLiveStack:
         - min_stars: int
         - max_drift: float
         - min_sharpness: float
+        - max_rotation: float (rotation max en degrés)
+        - min_scale: float (scale minimum)
+        - max_scale: float (scale maximum)
         - png_stretch: "linear", "asinh", "log", "sqrt", "histogram", "auto"
         - png_factor: float
         - preview_refresh: int (toutes les N images)
@@ -102,6 +105,16 @@ class RPiCameraLiveStack:
             self.config.quality.max_drift = float(kwargs['max_drift'])
         if 'min_sharpness' in kwargs:
             self.config.quality.min_sharpness = float(kwargs['min_sharpness'])
+
+        # Seuils d'alignement (pour éviter transformations aberrantes)
+        if 'max_rotation' in kwargs:
+            self.config.quality.max_rotation = float(kwargs['max_rotation'])
+        if 'min_scale' in kwargs:
+            self.config.quality.min_scale = float(kwargs['min_scale'])
+        if 'max_scale' in kwargs:
+            self.config.quality.max_scale = float(kwargs['max_scale'])
+        if 'min_inliers_ratio' in kwargs:
+            self.config.quality.min_inliers_ratio = float(kwargs['min_inliers_ratio'])
         
         # PNG stretch
         if 'png_stretch' in kwargs:
