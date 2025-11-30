@@ -1,0 +1,8 @@
+Available cameras
+-----------------
+0 : imx585 [3840x2160 16-bit RGGB] (/base/axi/pcie@1000120000/rp1/i2c@80000/imx585@1a)
+    Modes: 'SRGGB12_CSI2P' : 1928x1090 [87.60 fps - (0, 0)/3840x2160 crop]
+                             3856x2180 [43.80 fps - (0, 0)/3840x2160 crop]
+           'SRGGB16' : 1928x1090 [43.80 fps - (0, 0)/3840x2160 crop]
+                       3856x2180 [21.90 fps - (0, 0)/3840x2160 crop]
+
