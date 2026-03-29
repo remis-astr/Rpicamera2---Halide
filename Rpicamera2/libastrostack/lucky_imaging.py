@@ -505,31 +505,31 @@ class QualityScorer:
     
     def _score_laplacian(self, gray: np.ndarray) -> float:
         """Score par variance du Laplacien (RECOMMANDÉ - très rapide)"""
-        laplacian = cv2.Laplacian(gray, cv2.CV_64F)
+        laplacian = cv2.Laplacian(gray, cv2.CV_32F)
         return float(laplacian.var())
-    
+
     def _score_gradient(self, gray: np.ndarray) -> float:
         """Score par magnitude du gradient"""
-        gx = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
-        gy = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
+        gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+        gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
         magnitude = np.sqrt(gx**2 + gy**2)
         return float(np.mean(magnitude))
-    
+
     def _score_sobel(self, gray: np.ndarray) -> float:
         """Score par filtre de Sobel"""
-        sobelx = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
-        sobely = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
+        sobelx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+        sobely = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
         return float(np.mean(np.abs(sobelx) + np.abs(sobely)))
-    
+
     def _score_tenengrad(self, gray: np.ndarray) -> float:
         """Score Tenengrad (Sobel au carré) - très sensible au focus"""
-        gx = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
-        gy = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
+        gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+        gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
         return float(np.mean(gx**2 + gy**2))
-    
+
     def _score_brenner(self, gray: np.ndarray) -> float:
         """Score de Brenner (différence horizontale)"""
-        diff = gray[:, 2:].astype(np.float64) - gray[:, :-2].astype(np.float64)
+        diff = gray[:, 2:].astype(np.float32) - gray[:, :-2].astype(np.float32)
         return float(np.mean(diff**2))
     
     def _score_fft(self, gray: np.ndarray) -> float:
@@ -556,7 +556,9 @@ class QualityScorer:
         mean_sq = cv2.boxFilter(img_f * img_f, cv2.CV_32F, ksize)
         var_map = mean_sq - mean * mean
         np.clip(var_map, 0, None, out=var_map)  # Évite les artefacts float négatifs
-        return float(np.percentile(var_map, 90))
+        flat = var_map.ravel()
+        k = max(0, int(0.90 * flat.size) - 1)
+        return float(np.partition(flat, k)[k])
 
     def _score_psd(self, gray: np.ndarray) -> float:
         """Score par densité spectrale de puissance (PSD) haute fréquence.
@@ -587,6 +589,9 @@ class FrameAligner:
         self.reference: Optional[np.ndarray] = None
         self.reference_is_explicit: bool = False  # Track si référence définie par update_alignment_reference()
         self._planetary_aligner = None  # Instance PlanetaryAligner pour modes 2/3
+        # Cache FFT de référence (évite de recalculer FFT(ref) à chaque appel)
+        self._ref_fft_cache: Optional[np.ndarray] = None
+        self._ref_fft_shape: Optional[Tuple[int, int]] = None  # (h_fft, w_fft) du cache
     
     def _create_planetary_aligner(self):
         """Crée un PlanetaryAligner configuré selon align_mode (2=disk, 3=hybrid)."""
@@ -613,6 +618,9 @@ class FrameAligner:
             explicit: True si définie par update_alignment_reference() (préserve entre buffers)
         """
         self.reference_is_explicit = explicit
+
+        self._ref_fft_cache = None  # Invalider le cache FFT à chaque nouvelle référence
+        self._ref_fft_shape = None
 
         if self.config.align_mode in (2, 3):
             # Modes disk/hybrid : référence gérée par PlanetaryAligner
@@ -752,8 +760,13 @@ class FrameAligner:
                 self._logged_no_downscale = True
 
         # FFT sur images downscalées (ou originales si trop petites)
-        ref_fft = np.fft.fft2(ref_small.astype(np.float64))
-        img_fft = np.fft.fft2(img_small.astype(np.float64))
+        # Cache ref_fft : recalculé uniquement si la shape FFT change (set_reference invalide)
+        fft_shape = (h_fft, w_fft)
+        if self._ref_fft_cache is None or self._ref_fft_shape != fft_shape:
+            self._ref_fft_cache = np.fft.fft2(ref_small.astype(np.float32))
+            self._ref_fft_shape = fft_shape
+        ref_fft = self._ref_fft_cache
+        img_fft = np.fft.fft2(img_small.astype(np.float32))
 
         # Cross-power spectrum
         cross_power = (ref_fft * np.conj(img_fft)) / (np.abs(ref_fft * np.conj(img_fft)) + 1e-10)
@@ -797,6 +810,8 @@ class FrameAligner:
         if not self.reference_is_explicit:
             self.reference = None
             self.reference_is_explicit = False
+            self._ref_fft_cache = None
+            self._ref_fft_shape = None
             if self._planetary_aligner is not None:
                 self._planetary_aligner.reset()
 
@@ -915,9 +930,11 @@ class LuckyImagingStacker:
             # Option B: Auto-détection (fallback si raw_format=None)
             else:
                 if self.config.raw_normalize_method == 'percentile':
-                    # MÉTHODE ROBUSTE: Utiliser percentile au lieu de max
-                    # pour ignorer les pixels chauds / saturés
-                    ref_val = np.percentile(frame, self.config.raw_percentile_detect)
+                    # MÉTHODE ROBUSTE: Utiliser np.partition (O(N)) au lieu de
+                    # np.percentile (O(N log N)) pour ignorer les pixels chauds / saturés
+                    flat = frame.ravel()
+                    k = max(0, int(self.config.raw_percentile_detect / 100.0 * flat.size) - 1)
+                    ref_val = float(np.partition(flat, k)[k])
 
                     if ref_val <= 4095:
                         divisor = 16.0
@@ -1142,9 +1159,18 @@ class LuckyImagingStacker:
             start_idx = 0
             print(f"[LUCKY ALIGN] Utilisation référence explicite pour aligner {len(frames)} frames")
 
-        for frame in frames[start_idx:]:
-            aligned_frame, params = self.aligner.align(frame)
-            aligned.append(aligned_frame)
+        to_align = frames[start_idx:]
+        if len(to_align) < 3 or self.config.align_method != "phase":
+            # Séquentiel si peu de frames ou ECC (non thread-safe)
+            for frame in to_align:
+                aligned_frame, params = self.aligner.align(frame)
+                aligned.append(aligned_frame)
+        else:
+            # Parallèle : ref_fft est en lecture seule, warpAffine opère sur des buffers distincts
+            futures = [self.executor.submit(self.aligner.align, f) for f in to_align]
+            for fut in futures:
+                aligned_frame, params = fut.result()
+                aligned.append(aligned_frame)
 
         return aligned
     
