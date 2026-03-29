@@ -7026,9 +7026,10 @@ def apply_lucky_post_stack_filters(img, color_correction=False):
         psf_2d /= psf_2d.sum()
         img_f = gray.astype(np.float32) / 255.0
 
-        # Paramètre ADMM ρ : contrôle la vitesse de convergence
-        # ρ ≈ sqrt(λ) donne un bon équilibre fidélité/TV
-        rho = float(np.sqrt(max(lambda_mm, 1e-4)))
+        # Paramètre ADMM ρ = 1.0 (fixe)
+        # thresh = λ/ρ = λ ≈ 0.01–0.15, adapté aux images normalisées [0,1]
+        # ρ = sqrt(λ) donnait thresh = sqrt(λ) ≈ 0.14 → effaçait les détails fins
+        rho = 1.0
 
         # Noyaux de différences finies (gradients horizontaux et verticaux)
         # dx : décalage -1 colonne  (∂x)
@@ -8971,8 +8972,15 @@ def apply_isp_to_preview(array):
             # Identique au pipeline session.get_preview_png() pour que le preview
             # single-frame corresponde visuellement au résultat stacké.
             _p_high = float(np.percentile(img, 99.9))
-            _pos = img[img > img.max() * 0.001]
-            _p_low = float(np.percentile(_pos, 5)) if len(_pos) > img.size * 0.01 else 0.0
+            # En mode RAW (raw_format >= 2), le BL est déjà soustrait en amont du pipeline
+            # (lucky_raw.py per-frame ou debayer_bayer_stack). _p_low doit être 0 pour ne pas
+            # écrêter les zones sombres valides de la planète (limbe, cratères, bandes sombres).
+            # En mode RGB/YUV, _p_low permet d'éliminer le plancher BL résiduel (comportement original).
+            if raw_format >= 2:
+                _p_low = 0.0
+            else:
+                _pos = img[img > img.max() * 0.001]
+                _p_low = float(np.percentile(_pos, 5)) if len(_pos) > img.size * 0.01 else 0.0
             if _p_high > _p_low + 1e-3:
                 img = np.clip((img - _p_low) / (_p_high - _p_low), 0, 1)
             elif _p_high > 1e-3:
@@ -17191,6 +17199,7 @@ while True:
 
                 # ===== LUCKY STACK RAW BAYER =====
                 elif lucky_raw_active and raw_lucky_stacker is not None and raw_format >= 2:
+                    livestack_display_done = True   # empêche le fallback 2D Bayer d'apparaître
                     try:
                         if not hasattr(pygame, '_lucky_raw_resolution_check'):
                             print(f"\n[LUCKY RAW DEBUG] Array shape: {raw_array.shape}, dtype: {raw_array.dtype}")
@@ -19203,6 +19212,7 @@ while True:
                     # STOP (commun aux deux modes)
                     if _is_raw_lucky:
                         lucky_raw_active = False
+                        raw_array = None   # évite le warning "Array 2D fallback" sur la frame suivante
                         if ls_lucky_save_final == 1 and lucky_last_filtered_array is not None:
                             import time as _tsave
                             _ts = _tsave.strftime("%Y%m%d_%H%M%S")
