@@ -407,6 +407,9 @@ class AdvancedStackingConfig:
     raw_black_level: int = 256        # ADU 12-bit natif capteur, 0 = désactivé
     gradient_removal: bool = False    # Suppression gradient de fond
     gradient_removal_tiles: int = 8   # Taille de la grille n×n
+    gradient_removal_flat_strength: int = 0  # 0=BG seulement, 100=correction vignetage complète
+    gradient_removal_poly_degree: int = 2    # Degré polynôme 2D (1=linéaire, 2=quad, 3=cubique, 4=quartique)
+    gradient_removal_sigma: float = 2.0      # Seuil σ masquage tuiles (0.5=agressif, 5.0=minimal)
     awb_auto: bool = False            # AWB auto (grey-world) pour preview stack RAW12
 
     # BL per-canal Bayer (correction FPN 2×2 avant débayérisation)
@@ -527,6 +530,9 @@ class AdvancedStackingConfig:
         legacy.raw_black_level = self.raw_black_level
         legacy.gradient_removal = self.gradient_removal
         legacy.gradient_removal_tiles = self.gradient_removal_tiles
+        legacy.gradient_removal_flat_strength = self.gradient_removal_flat_strength
+        legacy.gradient_removal_poly_degree = self.gradient_removal_poly_degree
+        legacy.gradient_removal_sigma = self.gradient_removal_sigma
         legacy.awb_auto = self.awb_auto
 
         # BL per-canal Bayer

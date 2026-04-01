@@ -37,6 +37,7 @@ logger = logging.getLogger(__name__)
 # =============================================================================
 _halide_available       = False   # preprocess + score + debayer
 _halide_stack_available = False   # stack_mean + sigma_clip (nécessite recompile)
+_halide_hotpx_available = False   # ls_hot_pixel_removal (nécessite recompile)
 _hlib = None
 
 def _load_halide():
@@ -108,6 +109,20 @@ def _load_halide():
         except Exception as e:
             logger.debug("Halide stacking non disponible (recompiler jsk_halide.so) : %s", e)
 
+        # ── Suppression pixels chauds Bayer (ajoutée avec ls_hot_pixel_removal) ─
+        try:
+            lib.ls_hot_pixel_removal.restype  = ctypes.c_int
+            lib.ls_hot_pixel_removal.argtypes = [
+                ctypes.POINTER(ctypes.c_float),  # input  (H, W) float32 Bayer BL-soustrait
+                ctypes.POINTER(ctypes.c_float),  # output (H, W) float32 Bayer corrigé
+                ctypes.c_int, ctypes.c_int,      # w, h
+                ctypes.c_float,                  # threshold (ratio de détection, ex: 5.0)
+                ctypes.c_float,                  # abs_floor (plancher absolu, ex: 100.0)
+            ]
+            globals()['_halide_hotpx_available'] = True
+        except Exception as e:
+            logger.debug("Halide hot pixel removal non disponible (recompiler jsk_halide.so) : %s", e)
+
     except Exception as e:
         logger.debug("Halide lucky RAW non disponible : %s", e)
 
@@ -120,21 +135,27 @@ _load_halide()
 
 def _halide_preprocess(raw_u16: np.ndarray,
                        bl_r: float, bl_g1: float,
-                       bl_g2: float, bl_b: float
+                       bl_g2: float, bl_b: float,
+                       hot_pixel_threshold: float = 0.0,
+                       hot_pixel_abs_floor: float = 100.0,
                        ) -> Tuple[np.ndarray, np.ndarray]:
-    """Passe Halide fusionnée : BL subtract + extraction G1 half-res.
+    """Passe Halide fusionnée : BL subtract + extraction G1 half-res
+    + suppression optionnelle des pixels chauds.
 
     Remplace _apply_bl_per_channel() + _extract_g1() par une seule passe
     NEON vectorisée. Gain typique : ×3-5 vs NumPy sur RPi5.
 
     Args:
         raw_u16 : uint16 (H, W) Bayer RGGB, espace CSI-2 ×16
-        bl_r/g1/g2/b : BL en ADU 12-bit (la conversion ×16 est faite ici)
+        bl_r/g1/g2/b        : BL en ADU 12-bit (la conversion ×16 est faite ici)
+        hot_pixel_threshold : ratio de détection pixels chauds (0 = désactivé).
+                              Valeurs typiques : 5.0 (standard), 3.0 (agressif),
+                              10.0 (conservateur).
 
     Returns:
         (bayer_f32, g1_f32) :
-            bayer_f32 : float32 (H, W) BL-soustrait clippé ≥ 0
-            g1_f32    : float32 (H/2, W/2) canal G1
+            bayer_f32 : float32 (H, W) BL-soustrait, pixels chauds corrigés si activé
+            g1_f32    : float32 (H/2, W/2) canal G1 (après correction si activée)
     """
     h, w = raw_u16.shape
     raw_c = np.ascontiguousarray(raw_u16)
@@ -153,6 +174,17 @@ def _halide_preprocess(raw_u16: np.ndarray,
     )
     if ret != 0:
         raise RuntimeError(f"lucky_raw_preprocess Halide erreur: {ret}")
+
+    # ── Suppression pixels chauds (passe optionnelle) ─────────────────────────
+    # Appliquée sur le Bayer BL-soustrait avant toute accumulation / score.
+    # Le G1 est recalculé depuis le Bayer corrigé pour que le score de netteté
+    # ne soit pas biaisé par des pixels chauds résiduels.
+    if hot_pixel_threshold > 0.0 and _halide_hotpx_available:
+        bayer_out = _halide_hot_pixel_removal(
+            bayer_out, threshold=hot_pixel_threshold, abs_floor=hot_pixel_abs_floor)
+        # G1 half-res depuis Bayer corrigé (x=2*xh+1, y=2*yh)
+        g1_out = np.ascontiguousarray(bayer_out[::2, 1::2])
+
     return bayer_out, g1_out
 
 
@@ -225,6 +257,87 @@ def _halide_debayer_f32(bayer_f32: np.ndarray,
     # ce qui peut déclencher des copies implicites dans OpenCV ou apply_isp_to_preview.
     # Une copie explicite ici évite de potentielles copies multiples en aval.
     return np.ascontiguousarray(out_planar.transpose(1, 2, 0))
+
+
+def _halide_hot_pixel_removal(bayer_f32: np.ndarray,
+                              threshold: float = 5.0,
+                              abs_floor: float = 100.0) -> np.ndarray:
+    """Suppression des pixels chauds Bayer — 1 passe NEON vectorisée.
+
+    Pour chaque pixel (x, y), compare sa valeur à la médiane exacte des
+    4 voisins de même couleur Bayer (à ±2 en x et y — même parité RGGB).
+    Remplacement par la médiane si  pixel > threshold × max(med4, abs_floor).
+
+    Args:
+        bayer_f32  : float32 (H, W) Bayer RGGB, BL-soustrait, valeurs [0, ~65535]
+        threshold  : ratio de détection (5.0 = standard, 3.0 = agressif, 10.0 = conservateur)
+        abs_floor  : plancher absolu en espace CSI-2 ×16 — évite les faux positifs
+                     quand med4 ≈ 0 (fond noir parfaitement soustrait). Défaut 100.0
+                     ≈ 6 ADU 12-bit, soit le niveau de bruit de lecture typique.
+
+    Returns:
+        float32 (H, W) Bayer corrigé — même layout que l'entrée, hot pixels remplacés.
+    """
+    h, w = bayer_f32.shape
+    bayer_c = np.ascontiguousarray(bayer_f32)
+    output  = np.empty((h, w), dtype=np.float32)
+    ret = _hlib.ls_hot_pixel_removal(
+        bayer_c.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        output.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        w, h,
+        ctypes.c_float(threshold),
+        ctypes.c_float(abs_floor),
+    )
+    if ret != 0:
+        raise RuntimeError(f"ls_hot_pixel_removal Halide erreur: {ret}")
+    return output
+
+
+def debayer_raw_halide(raw_u16: np.ndarray,
+                       bl_r: float = 0.0, bl_g1: float = 0.0,
+                       bl_g2: float = 0.0, bl_b: float = 0.0,
+                       red_gain: float = 1.0, blue_gain: float = 1.0,
+                       hot_pixel_threshold: float = 0.0,
+                       hot_pixel_abs_floor: float = 100.0,
+                       ) -> Optional[np.ndarray]:
+    """Pipeline Halide complet pour le live stack RAW12/16.
+
+    Combine soustraction BL per-canal + suppression pixels chauds (optionnel)
+    + débayérisation bilinéaire + gains AWB en 2-3 passes NEON vectorisées.
+
+    Args:
+        raw_u16             : uint16 (H, W) Bayer RGGB, espace CSI-2 ×16
+        bl_r/g1/g2/b        : BL en ADU 12-bit (0 = pas de soustraction)
+        red_gain            : gain AWB rouge (ch0 = R_physique)
+        blue_gain           : gain AWB bleu  (ch2 = B_physique)
+        hot_pixel_threshold : ratio de détection pixels chauds (0 = désactivé).
+                              Mappe directement sur fix_bad_pixels_sigma/10 depuis l'UI.
+                              Si > 0 mais ls_hot_pixel_removal non disponible, retourne
+                              None pour déclencher le fallback NumPy dans l'appelant.
+
+    Returns:
+        float32 (H, W, 3) [0-65535] — ch0=R_phys, ch1=G, ch2=B_phys
+        Retourne None si Halide non disponible ou si hot_pixel_threshold > 0 et
+        ls_hot_pixel_removal n'est pas compilé (→ fallback NumPy dans debayer_raw_array).
+    """
+    if not _halide_available:
+        return None
+    # Si la correction pixels chauds est demandée mais non compilée → fallback NumPy
+    if hot_pixel_threshold > 0.0 and not _halide_hotpx_available:
+        return None
+    # ── Trace unique au premier appel (mode + flags) ──────────────────────────
+    if not getattr(debayer_raw_halide, '_logged', False):
+        debayer_raw_halide._logged = True
+        _hotpx_info = (f"pixels chauds Halide ON (threshold={hot_pixel_threshold:.1f}, "
+                       f"abs_floor={hot_pixel_abs_floor:.0f})"
+                       if hot_pixel_threshold > 0.0
+                       else "pixels chauds OFF")
+        print(f"[Halide debayer] CHEMIN HALIDE actif — BL-subtract + débayer NEON "
+              f"| {_hotpx_info}")
+    bayer_f32, _ = _halide_preprocess(raw_u16, bl_r, bl_g1, bl_g2, bl_b,
+                                       hot_pixel_threshold=hot_pixel_threshold,
+                                       hot_pixel_abs_floor=hot_pixel_abs_floor)
+    return _halide_debayer_f32(bayer_f32, red_gain, blue_gain)
 
 
 def _halide_stack_mean(frames_3d: np.ndarray) -> np.ndarray:
@@ -688,19 +801,20 @@ class BayerLuckyStacker:
 
     def __init__(
         self,
-        buffer_size:   int   = 50,
-        keep_percent:  float = 20.0,
-        score_method:  str   = 'laplacian',
-        score_roi:     float = 0.50,
-        align_enabled: bool  = True,
-        max_shift_px:  int   = 30,
-        stack_method:  str   = 'mean',
-        sigma_kappa:   float = 2.5,
-        bl_auto:       bool  = False,
-        bl_r:          float = 0.0,
-        bl_g1:         float = 0.0,
-        bl_g2:         float = 0.0,
-        bl_b:          float = 0.0,
+        buffer_size:          int   = 50,
+        keep_percent:         float = 20.0,
+        score_method:         str   = 'laplacian',
+        score_roi:            float = 0.50,
+        align_enabled:        bool  = True,
+        max_shift_px:         int   = 30,
+        stack_method:         str   = 'mean',
+        sigma_kappa:          float = 2.5,
+        bl_auto:              bool  = False,
+        bl_r:                 float = 0.0,
+        bl_g1:                float = 0.0,
+        bl_g2:                float = 0.0,
+        bl_b:                 float = 0.0,
+        hot_pixel_threshold:  float = 0.0,
     ):
         self.buffer_size   = max(2, int(buffer_size))
         self.keep_percent  = float(keep_percent)
@@ -715,6 +829,7 @@ class BayerLuckyStacker:
         self.bl_g1             = float(bl_g1)
         self.bl_g2             = float(bl_g2)
         self.bl_b              = float(bl_b)
+        self.hot_pixel_threshold = float(hot_pixel_threshold)
         # Intervalle de rafraîchissement du BL auto (en frames).
         # Le BL est stable d'une frame à l'autre → inutile de le recalculer
         # à chaque frame. Valeur 0 = recalcul à chaque frame (comportement original).
@@ -790,9 +905,12 @@ class BayerLuckyStacker:
             bl_vals = (self.bl_r, self.bl_g1, self.bl_g2, self.bl_b)
 
         if _halide_available:
-            # Chemin Halide : BL subtract + extraction G1 en une seule passe NEON
+            # Chemin Halide : BL subtract + extraction G1 + suppression pixels chauds
             bl_r_v, bl_g1_v, bl_g2_v, bl_b_v = bl_vals if use_bl else (0.0, 0.0, 0.0, 0.0)
-            processed, g1_half = _halide_preprocess(raw, bl_r_v, bl_g1_v, bl_g2_v, bl_b_v)
+            processed, g1_half = _halide_preprocess(
+                raw, bl_r_v, bl_g1_v, bl_g2_v, bl_b_v,
+                hot_pixel_threshold=self.hot_pixel_threshold,
+            )
         else:
             # Fallback NumPy
             if use_bl:

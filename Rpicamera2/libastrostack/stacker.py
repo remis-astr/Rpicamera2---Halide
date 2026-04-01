@@ -4,7 +4,115 @@
 Empilement d'images pour libastrostack
 """
 
+import ctypes
+import os
 import numpy as np
+
+# =============================================================================
+# Chargement optionnel du pipeline Halide (ls_stack_mean_frame + ls_stack_kappa_frame)
+# =============================================================================
+_halide_ls_available = False
+_hlib_stacker = None
+
+def _load_halide():
+    global _halide_ls_available, _hlib_stacker
+    _so = os.path.join(os.path.dirname(__file__), "halide", "jsk_halide.so")
+    if not os.path.isfile(_so):
+        return
+    try:
+        lib = ctypes.CDLL(_so)
+        _P = ctypes.POINTER(ctypes.c_float)
+
+        # ls_stack_mean_frame(stacked_in, cnt_in, img, stacked_out, cnt_out, w, h)
+        lib.ls_stack_mean_frame.restype  = ctypes.c_int
+        lib.ls_stack_mean_frame.argtypes = [
+            _P, _P, _P,          # stacked_in (3,H,W), cnt_in (H,W), img (3,H,W)
+            _P, _P,              # stacked_out (3,H,W), cnt_out (H,W)
+            ctypes.c_int, ctypes.c_int,  # w, h
+        ]
+
+        # ls_stack_kappa_frame(stacked_in, cnt_in, m2_in, img, kappa,
+        #                      stacked_out, cnt_out, m2_out, w, h)
+        lib.ls_stack_kappa_frame.restype  = ctypes.c_int
+        lib.ls_stack_kappa_frame.argtypes = [
+            _P, _P, _P, _P,      # stacked_in, cnt_in, m2_in, img
+            ctypes.c_float,      # kappa
+            _P, _P, _P,          # stacked_out, cnt_out, m2_out
+            ctypes.c_int, ctypes.c_int,  # w, h
+        ]
+
+        _hlib_stacker = lib
+        _halide_ls_available = True
+    except Exception:
+        pass
+
+_load_halide()
+
+
+# =============================================================================
+# Wrappers Python pour les pipelines Halide live stack
+# =============================================================================
+
+def _halide_ls_stack_mean_frame(stacked_p, cnt, img_p):
+    """Mise à jour incrémentale de moyenne RGB — 1 passe NEON.
+
+    Args:
+        stacked_p : float32 (3,H,W) C-contiguous — moyenne courante (planaire)
+        cnt       : float32 (H,W)   C-contiguous — compteur par pixel
+        img_p     : float32 (3,H,W) C-contiguous — nouvelle frame (planaire)
+
+    Returns:
+        (stacked_out_p, cnt_out) — mêmes shapes, float32
+    """
+    _, h, w = stacked_p.shape
+    _P = ctypes.POINTER(ctypes.c_float)
+    stacked_out_p = np.empty_like(stacked_p)
+    cnt_out       = np.empty_like(cnt)
+    ret = _hlib_stacker.ls_stack_mean_frame(
+        stacked_p.ctypes.data_as(_P),
+        cnt.ctypes.data_as(_P),
+        img_p.ctypes.data_as(_P),
+        stacked_out_p.ctypes.data_as(_P),
+        cnt_out.ctypes.data_as(_P),
+        w, h,
+    )
+    if ret != 0:
+        raise RuntimeError(f"ls_stack_mean_frame Halide erreur: {ret}")
+    return stacked_out_p, cnt_out
+
+
+def _halide_ls_stack_kappa_frame(stacked_p, cnt, m2_p, img_p, kappa):
+    """Welford incrémental + rejet kappa-sigma RGB — 1 passe NEON.
+
+    Args:
+        stacked_p : float32 (3,H,W) — moyenne courante (planaire)
+        cnt       : float32 (H,W)   — compteur par pixel
+        m2_p      : float32 (3,H,W) — variance M2 Welford (planaire)
+        img_p     : float32 (3,H,W) — nouvelle frame (planaire)
+        kappa     : float — seuil sigma (typique 2.5)
+
+    Returns:
+        (stacked_out_p, cnt_out, m2_out_p) — float32, mêmes shapes
+    """
+    _, h, w = stacked_p.shape
+    _P = ctypes.POINTER(ctypes.c_float)
+    stacked_out_p = np.empty_like(stacked_p)
+    cnt_out       = np.empty_like(cnt)
+    m2_out_p      = np.empty_like(m2_p)
+    ret = _hlib_stacker.ls_stack_kappa_frame(
+        stacked_p.ctypes.data_as(_P),
+        cnt.ctypes.data_as(_P),
+        m2_p.ctypes.data_as(_P),
+        img_p.ctypes.data_as(_P),
+        ctypes.c_float(kappa),
+        stacked_out_p.ctypes.data_as(_P),
+        cnt_out.ctypes.data_as(_P),
+        m2_out_p.ctypes.data_as(_P),
+        w, h,
+    )
+    if ret != 0:
+        raise RuntimeError(f"ls_stack_kappa_frame Halide erreur: {ret}")
+    return stacked_out_p, cnt_out, m2_out_p
 
 
 class ImageStacker:
@@ -93,6 +201,22 @@ class ImageStacker:
         """
         cnt = self.weight_map  # (H, W) — compteur courant par pixel
 
+        if is_color and _halide_ls_available:
+            # ── Chemin Halide (2 passes NEON, ×4-5 vs NumPy) ─────────────────
+            # Transpose (H,W,3)→(3,H,W) planaire pour Halide (stride-1 par canal)
+            try:
+                stacked_p = np.ascontiguousarray(self.stacked_image.transpose(2, 0, 1))
+                img_p     = np.ascontiguousarray(img.transpose(2, 0, 1))
+                cnt_c     = np.ascontiguousarray(cnt)
+                new_stacked_p, new_cnt = _halide_ls_stack_mean_frame(
+                    stacked_p, cnt_c, img_p)
+                # Retranspose (3,H,W)→(H,W,3) et copie in-place
+                np.copyto(self.stacked_image, new_stacked_p.transpose(1, 2, 0))
+                np.copyto(self.weight_map, new_cnt)
+                return
+            except Exception:
+                pass  # fallback NumPy ci-dessous
+
         if is_color:
             # Pixel accepté seulement si tous les canaux sont finis
             valid = np.all([np.isfinite(img[:, :, i]) for i in range(3)], axis=0)
@@ -124,6 +248,22 @@ class ImageStacker:
         winsorized = comportement identique en mode streaming.
         """
         cnt = self.weight_map  # (H, W) — compteur par pixel
+
+        if is_color and _halide_ls_available and self._running_m2 is not None:
+            # ── Chemin Halide (1 passe NEON fusionnée, ×8-12 vs NumPy) ───────
+            try:
+                stacked_p = np.ascontiguousarray(self.stacked_image.transpose(2, 0, 1))
+                img_p     = np.ascontiguousarray(img.transpose(2, 0, 1))
+                m2_p      = np.ascontiguousarray(self._running_m2.transpose(2, 0, 1))
+                cnt_c     = np.ascontiguousarray(cnt)
+                new_stacked_p, new_cnt, new_m2_p = _halide_ls_stack_kappa_frame(
+                    stacked_p, cnt_c, m2_p, img_p, float(kappa))
+                np.copyto(self.stacked_image, new_stacked_p.transpose(1, 2, 0))
+                np.copyto(self.weight_map,    new_cnt)
+                np.copyto(self._running_m2,   new_m2_p.transpose(1, 2, 0))
+                return
+            except Exception:
+                pass  # fallback NumPy ci-dessous
 
         if is_color:
             # Masque de rejet unifié : pixel rejeté si l'un de ses canaux

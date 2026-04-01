@@ -631,6 +631,18 @@ class RPiCameraLiveStackAdvanced:
             self.config.gradient_removal_tiles = int(kwargs['gradient_removal_tiles'])
             if hasattr(self, 'session') and self.session:
                 self.session.config.gradient_removal_tiles = int(kwargs['gradient_removal_tiles'])
+        if 'gradient_removal_flat_strength' in kwargs:
+            self.config.gradient_removal_flat_strength = int(kwargs['gradient_removal_flat_strength'])
+            if hasattr(self, 'session') and self.session:
+                self.session.config.gradient_removal_flat_strength = int(kwargs['gradient_removal_flat_strength'])
+        if 'gradient_removal_poly_degree' in kwargs:
+            self.config.gradient_removal_poly_degree = int(kwargs['gradient_removal_poly_degree'])
+            if hasattr(self, 'session') and self.session:
+                self.session.config.gradient_removal_poly_degree = int(kwargs['gradient_removal_poly_degree'])
+        if 'gradient_removal_sigma' in kwargs:
+            self.config.gradient_removal_sigma = float(kwargs['gradient_removal_sigma'])
+            if hasattr(self, 'session') and self.session:
+                self.session.config.gradient_removal_sigma = float(kwargs['gradient_removal_sigma'])
         if 'awb_auto' in kwargs:
             self.config.awb_auto = bool(kwargs['awb_auto'])
             if hasattr(self, 'session') and self.session:
@@ -783,6 +795,7 @@ class RPiCameraLiveStackAdvanced:
             self.lucky_stacker.start()
         
         self.is_running = True
+        self.is_paused = False
         self.start_time = datetime.now()
         self.frame_count = 0
         self._last_stacks_count = 0  # Compteur pour détecter nouveaux stacks Lucky
@@ -937,19 +950,28 @@ class RPiCameraLiveStackAdvanced:
             
         else:
             # Mode standard : traitement via session (qualité + alignement étoiles)
+            # process_image_data retourne None si rejetée OU si preview_refresh pas atteint
+            # → vérifier num_stacked pour distinguer les deux cas
+            _stacked_before = self.session.config.num_stacked
             result = self.session.process_image_data(image_data)
-            
-            if result is None:
+            _stacked_after = self.session.config.num_stacked
+
+            if _stacked_after > _stacked_before:
+                # Frame acceptée et empilée par session.stacker
+                self.stats['accepted_frames'] += 1
+                # session.stacker a déjà empilé → ne pas re-stacker dans advanced_stacker
+                self._update_memory_stats()
+                self.frame_count += 1
+                if result is not None:
+                    return result  # Preview refresh atteint
+                if self.frame_count % self.config.preview_refresh_interval == 0:
+                    return self.get_current_preview()
+                return None
+            else:
+                # Frame réellement rejetée (QC ou alignement échoué)
                 self.stats['rejected_frames'] += 1
                 return None
-            
-            self.stats['accepted_frames'] += 1
-            aligned_image = result
-            
-            transform_params = {
-                'dx': 0.0, 'dy': 0.0, 'angle': 0.0, 'scale': 1.0
-            }
-        
+
         # Stacking avancé
         if self.use_advanced_stacking and self.advanced_stacker:
             quality_metrics = {}

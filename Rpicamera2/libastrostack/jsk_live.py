@@ -214,6 +214,51 @@ def HDR_compute_12bit(image_12b, method="Median", bits_to_clip=2, type_bayer=cv2
     return HDR_image_rgb
 
 
+def hdr_mean_raw_bayer(image_12b, bits_to_clip=2, weights=None):
+    """
+    Fusion HDR Mean pondérée en espace Bayer RAW (pas de debayer).
+    Retourne un array float32 2D Bayer [0, 4095] pour stacking aval.
+
+    Args:
+        image_12b: Image RAW 12 bits (numpy array 2D, pattern Bayer)
+        bits_to_clip: Nombre de bits de poids fort à retirer (0-3)
+        weights: Liste de poids (0-100) par niveau, longueur = bits_to_clip+1.
+                 None = poids égaux.
+
+    Returns:
+        Image Bayer float32 [0, 4095]
+    """
+    if bits_to_clip <= 0:
+        return image_12b.astype(np.float32)
+
+    image_float = image_12b.astype(np.float32)
+    n_images = bits_to_clip + 1
+
+    # Seuils : 4095, 2047, 1023, 511 ...
+    thresholds = [2 ** (12 - i) - 1 for i in range(n_images)]
+
+    # Images clippées normalisées à [0, 4095]
+    img_list = []
+    for thres in thresholds:
+        img_norm = np.clip(image_float, 0, thres) / thres * 4095.0
+        img_list.append(img_norm)
+
+    # Poids normalisés
+    if weights is not None:
+        w = [max(0, v) for v in weights[:n_images]]
+    else:
+        w = [100] * n_images
+    w_sum = sum(w)
+    if w_sum == 0:
+        w = [1.0] * n_images
+        w_sum = float(n_images)
+    w_norm = [float(x) / w_sum for x in w]
+
+    # Moyenne pondérée → reste en float32 Bayer
+    img_stack = np.stack(img_list, axis=0)
+    return np.average(img_stack, axis=0, weights=w_norm).astype(np.float32)
+
+
 def HDR_bypass_12bit(image_12b, type_bayer=cv2.COLOR_BayerRG2RGB):
     """
     Bypass HDR: simple conversion 12bits -> 8bits avec debayering.

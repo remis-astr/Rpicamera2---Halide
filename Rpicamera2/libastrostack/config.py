@@ -85,6 +85,9 @@ class StackingConfig:
         # Algorithme par grille de médiane/percentile (mesh-based background estimation)
         self.gradient_removal = False
         self.gradient_removal_tiles = 8   # Taille de la grille n×n (8 = grille 8×8)
+        self.gradient_removal_flat_strength = 0  # 0=soustraction BG seulement, 100=correction vignetage complète
+        self.gradient_removal_poly_degree = 2    # Degré polynôme 2D (1=linéaire, 2=quad, 3=cubique, 4=quartique)
+        self.gradient_removal_sigma = 2.0        # Seuil σ masquage tuiles (0.5=agressif, 5.0=minimal)
         self.awb_auto = False             # AWB auto (grey-world) pour preview stack RAW12
 
         # Paramètres ISP (Image Signal Processor)

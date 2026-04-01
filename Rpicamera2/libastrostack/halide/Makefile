@@ -112,8 +112,14 @@ $(GEN_DIR)/lucky_raw.a: $(BUILD_DIR)/lucky_gen | $(GEN_DIR)
 	    -o $(GEN_DIR) \
 	    -f lucky_debayer_hal \
 	    target=$(TARGET)
+	@echo "==> Génération AOT ls_hot_pixel_removal (médiane Bayer ±2, rejet ratio)"
+	LD_LIBRARY_PATH=$(HALIDE_DIR)/lib $(BUILD_DIR)/lucky_gen \
+	    -g ls_hot_pixel_removal \
+	    -o $(GEN_DIR) \
+	    -f ls_hot_pixel_removal_hal \
+	    target=$(TARGET)
 	touch $(GEN_DIR)/lucky_raw.a
-	@echo "==> lucky_preprocess_hal + lucky_debayer_hal générés"
+	@echo "==> lucky_preprocess_hal + lucky_debayer_hal + ls_hot_pixel_removal_hal générés"
 
 # ─── Étape 2e : générer les 4 variantes de scoring Lucky RAW ─────────────────
 $(GEN_DIR)/lucky_score.a: $(BUILD_DIR)/score_gen | $(GEN_DIR)
@@ -136,7 +142,7 @@ $(GEN_DIR)/lucky_score.a: $(BUILD_DIR)/score_gen | $(GEN_DIR)
 	touch $(GEN_DIR)/lucky_score.a
 	@echo "==> 4 variantes de scoring générées"
 
-# ─── Étape 2f : générer les 2 variantes de stacking Lucky RAW ────────────────
+# ─── Étape 2f : générer les 4 variantes de stacking (Lucky RAW + Live Stack) ──
 $(GEN_DIR)/lucky_stack.a: $(BUILD_DIR)/stack_gen | $(GEN_DIR)
 	@echo "==> Génération AOT lucky_stack_mean (moyenne N frames float32)"
 	LD_LIBRARY_PATH=$(HALIDE_DIR)/lib $(BUILD_DIR)/stack_gen \
@@ -146,8 +152,24 @@ $(GEN_DIR)/lucky_stack.a: $(BUILD_DIR)/stack_gen | $(GEN_DIR)
 	LD_LIBRARY_PATH=$(HALIDE_DIR)/lib $(BUILD_DIR)/stack_gen \
 	    -g lucky_sigma_clip -o $(GEN_DIR) -f lucky_sigma_clip_hal \
 	    target=$(TARGET)
+	@echo "==> Génération AOT ls_stack_mean_frame (moyenne incrémentale RGB)"
+	LD_LIBRARY_PATH=$(HALIDE_DIR)/lib $(BUILD_DIR)/stack_gen \
+	    -g ls_stack_mean_frame -o $(GEN_DIR) -f ls_stack_mean_frame_hal \
+	    target=$(TARGET)
+	@echo "==> Génération AOT ls_stack_kappa_frame (Welford kappa-sigma RGB)"
+	LD_LIBRARY_PATH=$(HALIDE_DIR)/lib $(BUILD_DIR)/stack_gen \
+	    -g ls_stack_kappa_frame -o $(GEN_DIR) -f ls_stack_kappa_frame_hal \
+	    target=$(TARGET)
+	@echo "==> Génération AOT ls_apply_calibration (fond+vignetage 1 passe)"
+	LD_LIBRARY_PATH=$(HALIDE_DIR)/lib $(BUILD_DIR)/stack_gen \
+	    -g ls_apply_calibration -o $(GEN_DIR) -f ls_apply_calibration_hal \
+	    target=$(TARGET)
+	@echo "==> Génération AOT ls_poly_bg_apply (polynôme 2D + calibration 1 passe)"
+	LD_LIBRARY_PATH=$(HALIDE_DIR)/lib $(BUILD_DIR)/stack_gen \
+	    -g ls_poly_bg_apply -o $(GEN_DIR) -f ls_poly_bg_apply_hal \
+	    target=$(TARGET)
 	touch $(GEN_DIR)/lucky_stack.a
-	@echo "==> lucky_stack_mean_hal + lucky_sigma_clip_hal générés"
+	@echo "==> 6 variantes de stacking/calibration générées"
 
 # ─── Étape 3 : créer le .so Python-callable ──────────────────────────────────
 jsk_halide.so: $(GEN_DIR)/jsk_pipeline.a $(GEN_DIR)/denoise_med3x3.a $(GEN_DIR)/guided_filter.a $(GEN_DIR)/lucky_raw.a $(GEN_DIR)/lucky_score.a $(GEN_DIR)/lucky_stack.a jsk_wrapper.cpp
@@ -163,12 +185,17 @@ jsk_halide.so: $(GEN_DIR)/jsk_pipeline.a $(GEN_DIR)/denoise_med3x3.a $(GEN_DIR)/
 	    $(GEN_DIR)/guided_filter.a \
 	    $(GEN_DIR)/lucky_preprocess_hal.a \
 	    $(GEN_DIR)/lucky_debayer_hal.a \
+	    $(GEN_DIR)/ls_hot_pixel_removal_hal.a \
 	    $(GEN_DIR)/lucky_score_var_hal.a \
 	    $(GEN_DIR)/lucky_score_lap_hal.a \
 	    $(GEN_DIR)/lucky_score_ten_hal.a \
 	    $(GEN_DIR)/lucky_score_grad_hal.a \
 	    $(GEN_DIR)/lucky_stack_mean_hal.a \
 	    $(GEN_DIR)/lucky_sigma_clip_hal.a \
+	    $(GEN_DIR)/ls_stack_mean_frame_hal.a \
+	    $(GEN_DIR)/ls_stack_kappa_frame_hal.a \
+	    $(GEN_DIR)/ls_apply_calibration_hal.a \
+	    $(GEN_DIR)/ls_poly_bg_apply_hal.a \
 	    $(HALIDE_DIR)/lib/libHalide.a \
 	    -lpthread -ldl \
 	    -o jsk_halide.so

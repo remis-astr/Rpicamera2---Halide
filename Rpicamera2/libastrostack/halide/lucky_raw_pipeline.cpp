@@ -226,5 +226,96 @@ private:
 };
 
 // =============================================================================
-HALIDE_REGISTER_GENERATOR(LuckyPreprocess,   lucky_preprocess)
-HALIDE_REGISTER_GENERATOR(LuckyDebayerF32,  lucky_debayer_f32)
+// Generator 3 : LsHotPixelRemoval
+// =============================================================================
+/**
+ * Suppression des pixels chauds sur image Bayer float32 (live stack RAW).
+ *
+ * Algorithme :
+ *   Pour chaque pixel (x, y), les 4 voisins de même couleur Bayer sont
+ *   à (x±2, y) et (x, y±2) — même parité en x et y, donc même canal RGGB.
+ *   On calcule la médiane exacte de ces 4 voisins via un réseau de tri 4 éléments.
+ *   Si le pixel dépasse  threshold × max(med4, abs_floor)  il est remplacé par med4.
+ *
+ * Paramètres :
+ *   threshold (float, défaut 5.0) — ratio de détection.
+ *     Valeurs typiques :
+ *       3.0  = aggressif (peut toucher des étoiles serrées en mauvais seeing)
+ *       5.0  = standard  (sûr pour la plupart des cibles)
+ *       10.0 = conservateur (uniquement pixels très chauds)
+ *   abs_floor (float, défaut 100.0) — plancher absolu pour la référence en
+ *     espace float32 BL-soustrait CSI-2 ×16 (≈ 6 ADU 12-bit).
+ *     Empêche les faux positifs quand med4 ≈ 0 (fond noir).
+ *
+ * Convention mémoire : même que LuckyPreprocess — float32 (W, H) row-major.
+ *
+ * Gain vs NumPy (RPi5, 1090×1928) :
+ *   ×4-6 — accès neighbourhood ±2 en NEON, 4 cœurs parallèles.
+ */
+class LsHotPixelRemoval : public Generator<LsHotPixelRemoval> {
+public:
+    // ── Entrée ────────────────────────────────────────────────────────────────
+    // Bayer float32 BL-soustrait (W, H) — sortie de LuckyPreprocess
+    Input<Buffer<float, 2>> input     {"input"};
+
+    // ── Paramètres ────────────────────────────────────────────────────────────
+    Input<float> threshold{"threshold", 5.0f};   // ratio de détection
+    Input<float> abs_floor{"abs_floor", 100.0f}; // plancher absolu (CSI-2 ×16)
+
+    // ── Sortie ────────────────────────────────────────────────────────────────
+    Output<Buffer<float, 2>> output{"output"};
+
+    void generate() {
+        Var x("x"), y("y");
+
+        // Bords miroir : répétition du bord pour éviter les accès hors-buffer
+        // (les 4 pixels de bord par côté sont susceptibles d'avoir des voisins
+        //  à ±2 en dehors du buffer)
+        Func clamped = BoundaryConditions::repeat_edge(input);
+
+        // ── 4 voisins de même couleur Bayer (distance ±2) ─────────────────────
+        // Valides pour tout pixel (x,y) quel que soit son canal RGGB :
+        //   R  (even_x, even_y) : voisins à (x±2,y) → even_x±2 ✓, (x,y±2) → even_y±2 ✓
+        //   G1 (odd_x,  even_y) : idem avec odd_x±2 ✓
+        //   G2 (even_x, odd_y)  : idem avec odd_y±2 ✓
+        //   B  (odd_x,  odd_y)  : idem ✓
+        Expr n_N = clamped(x,   y-2);
+        Expr n_S = clamped(x,   y+2);
+        Expr n_W = clamped(x-2, y  );
+        Expr n_E = clamped(x+2, y  );
+
+        // ── Médiane exacte de 4 valeurs — réseau de tri optimal ───────────────
+        // Étape 1 : trier 2 paires
+        Expr lo_NS = min(n_N, n_S),  hi_NS = max(n_N, n_S);
+        Expr lo_WE = min(n_W, n_E),  hi_WE = max(n_W, n_E);
+        // Étape 2 : médiane = (2e + 3e élément) / 2  après fusion des paires
+        //   2e = max(lo_NS, lo_WE)   3e = min(hi_NS, hi_WE)
+        Expr med4 = (max(lo_NS, lo_WE) + min(hi_NS, hi_WE)) * 0.5f;
+
+        // ── Détection pixel chaud ──────────────────────────────────────────────
+        // Référence = max(med4, abs_floor) pour éviter les faux positifs quand
+        // med4 ≈ 0 (fond noir parfaitement soustrait) : sans plancher,
+        // threshold × 0 = 0 flaguerait toute intensité non nulle.
+        Expr ref    = max(med4, abs_floor);
+        Expr is_hot = input(x, y) > threshold * ref;
+
+        // Remplacement par la médiane des voisins si pixel chaud
+        output(x, y) = select(is_hot, med4, input(x, y));
+    }
+
+    void schedule() {
+        // Pas de Func intermédiaire à matérialiser : les accès ±2 en mémoire
+        // contiguë sont vectorisables directement (gather NEON 4×float32).
+        output
+            .vectorize(x, 4)
+            .parallel(y);
+    }
+
+private:
+    Var x{"x"}, y{"y"};
+};
+
+// =============================================================================
+HALIDE_REGISTER_GENERATOR(LuckyPreprocess,    lucky_preprocess)
+HALIDE_REGISTER_GENERATOR(LuckyDebayerF32,   lucky_debayer_f32)
+HALIDE_REGISTER_GENERATOR(LsHotPixelRemoval, ls_hot_pixel_removal)
