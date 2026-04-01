@@ -67,7 +67,7 @@ from libastrostack.rpicamera_livestack_advanced import create_advanced_livestack
 from libastrostack.allsky import AllskyMeanController, stack_timelapse_images
 
 # Import JSK LIVE module (dans libastrostack/)
-from libastrostack.jsk_live import JSKLiveProcessor, JSKVideoRecorder
+from libastrostack.jsk_live import JSKLiveProcessor, JSKVideoRecorder, hdr_mean_raw_bayer
 
 # Import Mineral Moon module (dans libastrostack/)
 from libastrostack.mineral_moon import MineralMoonProcessor, MOON_PRESETS
@@ -77,6 +77,17 @@ from libastrostack.solar import SolarProcessor, SOLAR_PRESETS
 
 # Import Collimation module (dans libastrostack/)
 from libastrostack.collimation import CollimationDetector, CIRCLE_COLORS, CIRCLE_LABELS, CIRCLE_ORDER
+
+# Import Galaxy Structure Enhancer (filtre Frangi+USM multi-échelle)
+from libastrostack.galaxy_filter import GalaxyEnhancer, GALAXY_PRESETS as GALAXY_FILTER_PRESETS
+
+# Import pipeline Halide pour débayérisation accélérée NEON (live stack + preview RAW)
+try:
+    from libastrostack.lucky_raw import debayer_raw_halide as _halide_debayer_fn
+    from libastrostack.lucky_raw import _halide_available as _halide_debayer_available
+except ImportError:
+    _halide_debayer_available = False
+    _halide_debayer_fn = None
 
 # ============================================================================
 # Helper pour tuer le subprocess rpicam-vid (mode non-Picamera2)
@@ -1142,6 +1153,59 @@ def debayer_raw_array(raw_array, raw_format_str, red_gain=1.0, blue_gain=1.0, ap
         Array numpy uint16 (height, width, 3) RGB [0-65535]
     """
     try:
+        # ── Chemin Halide (2 passes NEON vectorisées) ─────────────────────────────
+        # Conditions : pas de correction pixels morts, pas VNG, pas swap_rb.
+        # Remplace : per-canal BL loop + cvtColor + astype + gains + clip → ×3-5 plus rapide.
+        # Chemin Halide : BL + pixels chauds (Halide) + débayer — ignoré si VNG ou swap_rb
+        # fix_bad_pixels=True est géré nativement par Halide via hot_pixel_threshold ;
+        # si ls_hot_pixel_removal n'est pas compilé, debayer_raw_halide retourne None → fallback.
+        if _halide_debayer_available and not use_vng and not swap_rb:
+            try:
+                # Dépaqueter en uint16 si nécessaire
+                if raw_array.dtype == np.uint16:
+                    _raw_u16 = raw_array
+                else:
+                    _raw_u16 = raw_array.view(np.uint16).reshape(
+                        raw_array.shape[0], -1)[:, :raw_array.shape[1] // 2]
+                # Déterminer les 4 BL en ADU 12-bit
+                if bl_per_channel is not None:
+                    _bl_r, _bl_g1, _bl_g2, _bl_b = (float(x) for x in bl_per_channel)
+                elif bl_auto_estimate:
+                    # Estimation sur chaque sous-canal CSI-2 ×16 :
+                    # percentile 1% (était 5% — trop agressif pour champs sombres / galaxies)
+                    # marge -64 CSI-2 (= 4 ADU natifs) pour ne pas rogner le fond de ciel
+                    _bl_vals = []
+                    for _sy, _sx in ((0, 0), (0, 1), (1, 0), (1, 1)):
+                        _sub = _raw_u16[_sy::2, _sx::2].astype(np.float32)
+                        _p1  = float(np.percentile(_sub, 1))
+                        _bv  = min(max(0.0, _p1 - 64.0), 256.0 * 16.0 * 1.3)
+                        _bl_vals.append(_bv / 16.0)  # repasser en ADU 12-bit pour Halide
+                    _bl_r, _bl_g1, _bl_g2, _bl_b = _bl_vals
+                elif global_black_level > 0:
+                    _bl_r = _bl_g1 = _bl_g2 = _bl_b = float(global_black_level)
+                else:
+                    _bl_r = _bl_g1 = _bl_g2 = _bl_b = 0.0
+                # Passer les deux seuils pixels chauds vers Halide :
+                #   sigma_threshold    → ratio de détection (ex: 5.0)
+                #   min_adu_threshold  → plancher absolu ADU 12-bit → ×16 pour espace CSI-2
+                _hpt   = sigma_threshold if fix_bad_pixels else 0.0
+                _hfloor = min_adu_threshold * 16.0  # ADU 12-bit → float32 BL-soustrait CSI-2 ×16
+                _result = _halide_debayer_fn(_raw_u16, _bl_r, _bl_g1, _bl_g2, _bl_b,
+                                             red_gain, blue_gain,
+                                             hot_pixel_threshold=_hpt,
+                                             hot_pixel_abs_floor=_hfloor)
+                if _result is not None:
+                    return _result
+                # Halide retourné None (hot pixel demandé mais ls_hot_pixel_removal absent)
+                if not getattr(debayer_raw_array, '_fallback_logged', False):
+                    debayer_raw_array._fallback_logged = True
+                    print("[Halide debayer] FALLBACK NumPy — ls_hot_pixel_removal non compilé "
+                          "(recompiler jsk_halide.so)")
+            except Exception as _he:
+                if not getattr(debayer_raw_array, '_except_logged', False):
+                    debayer_raw_array._except_logged = True
+                    print(f"[Halide debayer] EXCEPTION → fallback NumPy : {_he}")
+
         # *** VALIDATION: Vérifier que l'array est bien 2D (format RAW Bayer) ***
         if len(raw_array.shape) != 2:
             print(f"[WARNING] debayer_raw_array: Array reçu n'est PAS du format RAW Bayer!")
@@ -1190,10 +1254,11 @@ def debayer_raw_array(raw_array, raw_format_str, red_gain=1.0, blue_gain=1.0, ap
             for _idx, (_sy, _sx) in enumerate([(0, 0), (0, 1), (1, 0), (1, 1)]):
                 _sub = _raw_f[_sy::2, _sx::2]
                 if _offsets_adu[_idx] is None:
-                    # Auto-estimation : percentile 5% du sous-canal
-                    # -16 de marge (= 1 ADU natif) pour ne pas écrêter les pixels très sombres
-                    _p5 = float(np.percentile(_sub, 5))
-                    _bl_val = max(0.0, _p5 - 16.0)
+                    # Auto-estimation : percentile 1% du sous-canal (était 5% — trop agressif
+                    # pour galaxies dont le fond de ciel est proche du vrai BL)
+                    # Marge -64 CSI-2 (= 4 ADU natifs) pour préserver les pixels proches du BL
+                    _p1 = float(np.percentile(_sub, 1))
+                    _bl_val = max(0.0, _p1 - 64.0)
                     # Plafond : évite la sur-soustraction sur scènes lumineuses/saturées
                     # IMX585 BL nominal = 256 ADU 12-bit = 4096 CSI-2 ×16, marge ×1.3 → ~5325
                     _bl_val = min(_bl_val, 256.0 * 16.0 * 1.3)
@@ -1235,7 +1300,10 @@ def debayer_raw_array(raw_array, raw_format_str, red_gain=1.0, blue_gain=1.0, ap
         # En espace CSI-2 ×16 : 256 ADU 12-bit → 4096 dans raw_image → présent dans rgb_float.
         # Désactivé si bl_per_channel ou bl_auto_estimate sont actifs (FPN mode gère déjà le BL).
         if global_black_level > 0 and bl_per_channel is None and not bl_auto_estimate:
-            _bl_csi2 = float(global_black_level) * 16.0
+            # Pied de page de 16 ADU (256 CSI-2) : évite d'écrêter les pixels proches du BL
+            # (bruit de lecture, fond de ciel très faible). Pixels à exactement BL → 256 CSI-2
+            # au lieu de 0 → préservés après stacking.
+            _bl_csi2 = max(0.0, float(global_black_level) * 16.0 - 256.0)
             rgb_float -= _bl_csi2
             np.clip(rgb_float, 0.0, None, out=rgb_float)
 
@@ -1288,17 +1356,43 @@ def _ls_process_frame_thread(arr_copy, proc_kw, livestack_obj):
                     _save_q.put((arr_copy.copy(), _cur_acc))
                 proc_kw['_last_accepted'] = _cur_acc   # passé au main loop via proc_kw mutable
 
-        stacked = livestack_obj.get_preview_for_display()
-        if stacked is None:
-            return None
-
-        # Post-traitement → uint8 pour pygame
-        # Le stretch N'est PAS appliqué ici : il est appliqué dans le main loop
-        # pour permettre le réglage interactif en pause (ls_pre_stretch_array).
         if proc_kw.get('raw_format', 0) >= 2:
-            if stacked.dtype != np.uint8:
-                stacked = np.clip(stacked, 0, 255).astype(np.uint8)
+            # MODE RAW : bypass session.get_preview_png() qui applique EMA vmin
+            # (fond de ciel soustrait progressivement → écrêtage des détails faibles).
+            # On lit le stack linéaire directement et on normalise par EMA vmax uniquement.
+            # ThreadPoolExecutor(max_workers=1) garantit l'accès séquentiel à livestack_obj.
+            _sess = getattr(livestack_obj, 'session', None)
+            _raw = None
+            if _sess is not None and hasattr(_sess, 'stacker') and _sess.stacker is not None:
+                _raw = _sess.stacker.get_result()
+            if _raw is None:
+                return None
+            _mx = float(_raw.max()) if _raw.size > 0 else 0.0
+            _ema = getattr(livestack_obj, '_ls_vmax_ema', 0.0)
+            _new_ema = _mx if _ema <= 0.0 else 0.25 * _mx + 0.75 * _ema
+            livestack_obj._ls_vmax_ema = _new_ema
+            # Normaliser à [0,1] (même espace que session.get_preview_png)
+            _norm = np.clip(_raw * (1.0 / max(_new_ema, 1e-6)), 0.0, 1.0)
+            # Retrait de gradient si activé — même position que dans
+            # session.get_preview_png() : après norm, avant stretch
+            if _sess is not None and getattr(getattr(_sess, 'config', None), 'gradient_removal', False):
+                _ls_cfg = _sess.config
+                _norm = _sess._remove_gradient(
+                    _norm,
+                    n_tiles=getattr(_ls_cfg, 'gradient_removal_tiles', 8),
+                    flat_strength=getattr(_ls_cfg, 'gradient_removal_flat_strength', 0),
+                    poly_degree=getattr(_ls_cfg, 'gradient_removal_poly_degree', 2),
+                    grid_sigma=getattr(_ls_cfg, 'gradient_removal_sigma', 2.0),
+                )
+            stacked = np.clip(_norm * 255.0, 0, 255).astype(np.uint8)
         else:
+            # MODE ISP/YUV : get_preview_png() n'active pas l'EMA vmin (clip_high=100.0)
+            # → pas d'écrêtage progressif, chemin normal conservé.
+            stacked = livestack_obj.get_preview_for_display()
+            if stacked is None:
+                return None
+            # Le stretch N'est PAS appliqué ici : il est appliqué dans le main loop
+            # pour permettre le réglage interactif en pause (ls_pre_stretch_array).
             stacked = apply_isp_to_preview(stacked)
             if stacked.dtype != np.uint8:
                 stacked = np.clip(stacked, 0, 255).astype(np.uint8)
@@ -1307,6 +1401,166 @@ def _ls_process_frame_thread(arr_copy, proc_kw, livestack_obj):
 
     except Exception as _e:
         print(f"[LS THREAD] {_e}")
+        return None
+
+
+def _galaxy_process_frame_thread(arr_copy, proc_kw, galaxy_ls_obj):
+    """
+    Thread de traitement Galaxy : process_frame + get_preview.
+    Reçoit un array float32 RGB (débayérisé, post-HDR).
+    Retourne uint8 (H, W, 3) pour pygame ou None.
+    """
+    try:
+        galaxy_ls_obj.process_frame(arr_copy)
+
+        stacked = galaxy_ls_obj.get_preview_for_display()
+        if stacked is None:
+            return None
+
+        if stacked.dtype != np.uint8:
+            stacked = np.clip(stacked, 0, 255).astype(np.uint8)
+
+        return stacked
+
+    except Exception as _e:
+        print(f"[GALAXY THREAD] {_e}")
+        return None
+
+
+def _files_scan_dir():
+    """Scanne files_dir et peuple files_list (triée chronologiquement)."""
+    global files_list, files_index
+    _EXTS = {'.dng', '.raw', '.cr2', '.nef', '.arw', '.orf', '.rw2', '.pef',
+             '.fit', '.fits', '.fts', '.ser',
+             '.png', '.jpg', '.jpeg', '.tif', '.tiff', '.bmp'}
+    try:
+        _paths = [
+            os.path.join(files_dir, f)
+            for f in sorted(os.listdir(files_dir))
+            if os.path.splitext(f)[1].lower() in _EXTS
+            and os.path.isfile(os.path.join(files_dir, f))
+        ]
+        _paths.sort(key=lambda p: (os.path.getmtime(p), p))
+        files_list = _paths
+    except Exception as _e:
+        print(f"[FILES] Scan: {_e}")
+        files_list = []
+    files_index = 0
+    print(f"[FILES] {len(files_list)} fichier(s) dans {files_dir}")
+
+
+def _files_load_and_stack(file_path, ls_obj):
+    """
+    Charge un fichier image (DNG/FITS/SER/PNG/JPEG...) et l'injecte dans le
+    pipeline galaxy (process_frame + normalisation EMA vmax + gradient removal).
+    Retourne uint8 (H,W,3) ou None.
+    Appelé depuis ThreadPoolExecutor(max_workers=1).
+    """
+    _ext = os.path.splitext(file_path)[1].lower()
+    try:
+        rgb = None   # float32 (H,W,3)
+
+        if _ext in ('.dng', '.raw', '.cr2', '.nef', '.arw', '.orf', '.rw2', '.pef'):
+            import rawpy as _rawpy
+            with _rawpy.imread(file_path) as _rp:
+                _rgb8 = _rp.postprocess(
+                    use_camera_wb=True, half_size=False,
+                    no_auto_bright=True, output_bps=8)
+            rgb = _rgb8.astype(np.float32) / 255.0
+
+        elif _ext in ('.fit', '.fits', '.fts'):
+            from astropy.io import fits as _fits
+            with _fits.open(file_path) as _hdul:
+                _d = _hdul[0].data
+            if _d is None:
+                return None
+            _d = _d.astype(np.float32)
+            if _d.ndim == 3 and _d.shape[0] in (1, 3):
+                _d = _d.transpose(1, 2, 0)   # (C,H,W) → (H,W,C)
+            if _d.ndim == 2:
+                _d = np.stack([_d, _d, _d], axis=2)
+            elif _d.shape[2] == 1:
+                _d = np.concatenate([_d, _d, _d], axis=2)
+            _mn, _mx_d = float(_d.min()), float(_d.max())
+            if _mx_d > _mn + 1e-9:
+                _d = (_d - _mn) / (_mx_d - _mn)
+            rgb = _d
+
+        elif _ext == '.ser':
+            import struct as _struct
+            with open(file_path, 'rb') as _f:
+                _hdr = _f.read(178)
+            if len(_hdr) < 178:
+                return None
+            _color_id  = _struct.unpack_from('<i', _hdr, 18)[0]
+            _endian    = _struct.unpack_from('<i', _hdr, 22)[0]
+            _img_w     = _struct.unpack_from('<i', _hdr, 26)[0]
+            _img_h     = _struct.unpack_from('<i', _hdr, 30)[0]
+            _bit_depth = _struct.unpack_from('<i', _hdr, 34)[0]
+            _fc        = _struct.unpack_from('<i', _hdr, 38)[0]
+            _bpp  = (_bit_depth + 7) // 8
+            _chs  = 3 if _color_id > 0 else 1
+            _fsize = _img_w * _img_h * _bpp * _chs
+            _fidx = getattr(ls_obj, '_ser_frame_idx', 0)
+            if _fidx >= _fc:
+                return None
+            with open(file_path, 'rb') as _f:
+                _f.seek(178 + _fidx * _fsize)
+                _raw_bytes = _f.read(_fsize)
+            if len(_raw_bytes) < _fsize:
+                return None
+            _dtype = np.uint8 if _bpp == 1 else (np.uint16 if _endian == 0 else np.dtype('>u2'))
+            _arr = np.frombuffer(_raw_bytes, dtype=_dtype).astype(np.float32)
+            _arr /= (255.0 if _bpp == 1 else 65535.0)
+            rgb = (_arr.reshape(_img_h, _img_w, 3) if _chs == 3
+                   else np.stack([_arr.reshape(_img_h, _img_w)] * 3, axis=2))
+            ls_obj._ser_frame_idx = _fidx + 1
+
+        elif _ext in ('.png', '.jpg', '.jpeg', '.tif', '.tiff', '.bmp'):
+            import cv2 as _cv2
+            _img = _cv2.imread(file_path, _cv2.IMREAD_COLOR)
+            if _img is None:
+                return None
+            rgb = _cv2.cvtColor(_img, _cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+
+        else:
+            print(f"[FILES] Format non supporté: {_ext}")
+            return None
+
+        if rgb is None:
+            return None
+
+        # Injecter dans le pipeline de stacking (identique à _gx_stack_worker)
+        ls_obj.process_frame(rgb)
+
+        _stacked = None
+        if ls_obj.session is not None and ls_obj.session.stacker is not None:
+            _raw = ls_obj.session.stacker.get_result()
+            if _raw is not None:
+                _raw = _raw.copy()
+                # Remplacer NaN/inf (bordures warpAffine) par 0 avant normalisation
+                if not np.all(np.isfinite(_raw)):
+                    _raw = np.where(np.isfinite(_raw), _raw, 0.0)
+                _mx = float(_raw.max())
+                if _mx > 0:
+                    _ema = getattr(ls_obj, '_files_vmax_ema', 0.0)
+                    _new_ema = _mx if _ema <= 0 else 0.25 * _mx + 0.75 * _ema
+                    ls_obj._files_vmax_ema = _new_ema
+                    _norm = np.clip(_raw * (1.0 / max(_new_ema, 1e-6)), 0.0, 1.0)
+                    _sess = ls_obj.session
+                    if getattr(getattr(_sess, 'config', None), 'gradient_removal', False):
+                        _gc = _sess.config
+                        _norm = _sess._remove_gradient(
+                            _norm,
+                            n_tiles=getattr(_gc, 'gradient_removal_tiles', 8),
+                            flat_strength=getattr(_gc, 'gradient_removal_flat_strength', 0),
+                            poly_degree=getattr(_gc, 'gradient_removal_poly_degree', 2),
+                            grid_sigma=getattr(_gc, 'gradient_removal_sigma', 2.0))
+                    _stacked = np.clip(_norm * 255.0, 0, 255).astype(np.uint8)
+        return _stacked
+
+    except Exception as _e:
+        print(f"[FILES] {os.path.basename(file_path)}: {_e}")
         return None
 
 
@@ -1870,7 +2124,7 @@ _home_pending_capture = -1    # -1=rien, 0=still, 1=video, 2=timelapse
 _home_passthrough     = False # True = prochain MOUSEBUTTONUP ignore le bloc home
 _home_suppress_oldui  = False # True = button()/text()/Menu() ne dessinent pas (capture home)
 _HOME_GAIN_SCALES     = [100, 200, 300, 400, 500, 600, 700, 800]   # Échelles max du slider Gain
-_HOME_EXPO_SCALES_MS  = [50, 100, 500, 1000, 2000, 3000, 4000, 8000, 12000]  # Échelles max expo (ms)
+_HOME_EXPO_SCALES_MS  = [50, 100, 500, 1000, 2000, 3000, 4000, 8000, 12000, 30000, 60000]  # Échelles max expo (ms)
 home_gain_scale_idx   = 2   # Index dans _HOME_GAIN_SCALES → max=300 par défaut
 home_expo_scale_idx   = 3   # Index dans _HOME_EXPO_SCALES_MS → max=1000ms par défaut
 home_windowed         = 0   # 0=plein écran, 1=fenêtré
@@ -1925,6 +2179,8 @@ ls_wpsf_defocus      = 0     # Z4 defocus ×100 (-100→-1.0 … +100→+1.0 λ 
 ls_wpsf_astig_x      = 0     # Z5 astigmatisme oblique ×100
 ls_wpsf_astig_y      = 0     # Z6 astigmatisme droit ×100
 ls_wpsf_spherical    = 0     # Z11 sphérique ×100
+# Cache PSF+H pour WavePSF RL : évite de recalculer la PSF Zernike à chaque appel
+_wpsf_cache          = {}    # clé=(aperture,obstr,scale,seeing,defocus,ax,ay,sph,img_shape)
 # Balance RVB et saturation post-traitement (correction couleur après CLAHE)
 ls_post_red   = 100   # Gain rouge post-traitement ×0.01 (50→×0.50 … 200→×2.00)
 ls_post_green = 100   # Gain vert  post-traitement ×0.01
@@ -2011,6 +2267,100 @@ ls_elite_entry_mode    = 0    # 0=min (> pire frame), 1=mean (> moyenne pool)
 ls_elite_score_clip    = 1    # 0=OFF, 1=ON (sigma-clipping des scores avant stack)
 ls_elite_score_kappa   = 20   # Kappa ×10 (15→1.5 … 40→4.0)
 
+# ============================================================
+# GALAXY MODE — HDR LiveStack (RAW Bayer)
+# ============================================================
+# Interface state
+galaxy_interface_mode = 0       # 0=OFF, 1=interface active
+galaxy_settings_visible = 0     # 0=masqué, 1=affiché
+galaxy_settings_tab = 0         # 0=Cap., 1=HDR, 2=Stack, 3=Img/Str., 4=Filtres, 5=Struct.
+
+# Galaxy Structure Enhancer (tab 5)
+galaxy_filter_en      = 0    # 0=OFF, 1=ON
+galaxy_filter_preset  = 1    # 0=Elliptique, 1=Spirale, 2=Tranche
+galaxy_filter_enh     = 20   # enhancement ×0.1 → 2.0 (Frangi+gamma)
+galaxy_filter_usm     = 10   # usm_strength ×0.1 → 1.0 (USM multi-échelle)
+galaxy_filter_star_r  = 65   # star_reduction ×0.01 → 0.65
+galaxy_filter_star_k  = 7    # star_kernel (px, 3-15)
+galaxy_filter_n_scales = 4   # nombre d'échelles (2-6)
+galaxy_enhancer = GalaxyEnhancer()
+_galaxy_slider_rects = {}
+_galaxy_slider_dragging = False
+_galaxy_ge_dragging = None
+_files_slider_rects = {}
+_files_slider_dragging = False
+_files_browser_rects = {}
+
+# Stacking state
+galaxy_active = False           # True = stacking en cours
+galaxy_livestack = None         # Instance RPiCameraLiveStackAdvanced
+galaxy_paused = False
+
+# HDR parameters
+galaxy_hdr_bits_clip = 2        # 0-3 bits de poids fort à retirer
+galaxy_hdr_weights = [100, 100, 100, 100]  # Poids par niveau (0-100%)
+
+# Display arrays (pause / re-stretch / re-filter interactif)
+galaxy_last_filtered_array = None
+galaxy_pre_filter_array = None
+galaxy_pre_stretch_array = None
+
+# Camera settings
+galaxy_gain = 10
+galaxy_exposure_us = 10000000   # 10s par défaut (pose longue galaxie)
+galaxy_zoom = 0
+galaxy_saved_gain = 0
+galaxy_saved_exposure = 0
+galaxy_saved_zoom = 0
+galaxy_saved_vwidth = 1920
+galaxy_saved_vheight = 1080
+galaxy_saved_use_native = 0
+
+# Stacking parameters
+galaxy_stack_method = 0         # 0=mean, 1=median, 2=kappa_sigma, 3=winsorized, 4=weighted
+galaxy_stack_kappa = 25         # Kappa x10 (valeur réelle: 2.5)
+galaxy_stack_iterations = 3     # Itérations sigma-clip
+galaxy_preview_refresh = 5      # Rafraîchir preview toutes les N images
+
+# Quality control
+galaxy_enable_qc = 0
+galaxy_max_fwhm = 170           # x10
+galaxy_min_sharpness = 70       # x1000
+galaxy_max_drift = 2500
+galaxy_min_stars = 10
+
+galaxy_alignment_mode = 1       # 0=OFF, 1=Translation
+galaxy_binning = 1              # 1=binning ON (1928×1090), 0=natif (3856×2180)
+
+# Gradient removal (pour RAW)
+galaxy_gradient_removal = 0
+galaxy_gradient_flat_strength = 0
+galaxy_gradient_poly_degree = 2
+galaxy_gradient_sigma = 20      # x10
+
+galaxy_color_enabled = 0    # 0=OFF, 1=ON — Correction couleur RVB (post-stretch)
+galaxy_r_gain = 100         # 50-200 → 0.5x-2.0x (100=neutre)
+galaxy_g_gain = 100
+galaxy_b_gain = 100
+
+galaxy_save_raws = 0        # 0=OFF, 1=ON — Sauvegarder chaque frame RAW (FITS) pendant le stacking
+
+# ─── Mode FICHIERS ────────────────────────────────────────────────────────────
+files_interface_mode  = 0       # 0=OFF, 1=interface active
+files_settings_visible = 0      # 0=masqué, 1=panneau affiché
+files_settings_tab    = 0       # 0=Fich. 1=Stack 2=Str. 3=Filtres 4=Struct.
+files_active   = False          # True = traitement en cours
+files_paused   = False          # True = en pause
+files_livestack = None          # Instance RPiCameraLiveStackAdvanced
+files_dir      = os.path.expanduser("~/stacks")
+files_list     = []             # Liste triée chronologiquement
+files_index    = 0              # Index du fichier en cours de traitement
+files_last_filtered_array = None
+files_pre_filter_array    = None
+files_pre_stretch_array   = None
+files_browser_visible = False   # Navigateur de dossier ouvert
+files_browser_scroll  = 0       # Scroll dans le navigateur
+
 # RAW Format parameters (pour Lucky/Live Stack et vidéo RAW)
 raw_format = 1  # 0=YUV420, 1=XRGB8888, 2=SRGGB12, 3=SRGGB16
 raw_formats = ['YUV420 8bit', 'XRGB8888 ISP', 'RAW12 Bayer', 'RAW16 Clear HDR']
@@ -2033,6 +2383,9 @@ isp_wb_blue = 100             # 0.5-2.0 → 50-200 (défaut 1.0)
 isp_gamma = 100               # 0.5-3.0 → 50-300 (défaut 1.0, correspond à gamma 2.2)
 isp_black_level = 256         # 0-500 direct (défaut 256 pour IMX585 12-bit)
 ls_gradient_removal = 0       # 0=OFF, 1=ON  (suppression gradient fond de ciel, RAW uniquement)
+ls_gradient_flat_strength = 0 # 0-100 : intensité correction vignetage (0=BG seulement, 100=flat complet)
+ls_gradient_poly_degree = 2   # Degré polynôme 2D (1=linéaire 2=quadratique 3=cubique 4=quartique)
+ls_gradient_sigma = 2.0       # Seuil σ masquage tuiles (0.5=agressif, 5.0=minimal)
 ls_raw_awb_auto = 0           # 0=OFF, 1=ON  (AWB auto grey-world pour preview stack RAW12)
 
 # Correction FPN 2×2 : soustraction black level per-canal Bayer avant débayérisation
@@ -5777,7 +6130,7 @@ def draw_ls_controls(screen_width, screen_height):
     global ls_settings_tab, livestack_active, ls_sched_frames_done
     global stretch_preset, isp_gamma, isp_brightness, isp_contrast, isp_saturation
     global ls_cam_brightness, ls_cam_contrast, ls_cam_saturation, raw_format
-    global isp_black_level, ls_gradient_removal, ls_raw_awb_auto
+    global isp_black_level, ls_gradient_removal, ls_gradient_flat_strength, ls_gradient_poly_degree, ls_gradient_sigma, ls_raw_awb_auto
     global log_factor, mtf_shadows, mtf_midtone, mtf_highlights
     global ghs_D, ghs_b, ghs_SP, ghs_LP, ghs_HP, ghs_preset, stretch_factor, stretch_p_low, stretch_p_high
     global ls_planetary_enable, ls_planetary_mode, ls_planetary_disk_min, ls_planetary_disk_max
@@ -6135,6 +6488,20 @@ def draw_ls_controls(screen_width, screen_height):
                 panel_x, start_y, slider_w, slider_h,
                 f"Gradient BG: {_gr_lbl}", ls_gradient_removal, 0, 1, (110, 160, 140))
             start_y += slider_h + margin
+            control_rects['ls_raw_flat_strength'] = draw_jsk_slider(
+                panel_x, start_y, slider_w, slider_h,
+                f"Vignetage: {ls_gradient_flat_strength}%", ls_gradient_flat_strength, 0, 100, (110, 160, 140))
+            start_y += slider_h + margin
+            _poly_labels = {1: "Lin", 2: "Quad", 3: "Cub", 4: "Qua4"}
+            control_rects['ls_raw_poly_degree'] = draw_jsk_slider(
+                panel_x, start_y, slider_w, slider_h,
+                f"Poly deg: {_poly_labels.get(ls_gradient_poly_degree, ls_gradient_poly_degree)}",
+                ls_gradient_poly_degree, 1, 4, (110, 160, 140))
+            start_y += slider_h + margin
+            control_rects['ls_raw_grid_sigma'] = draw_jsk_slider(
+                panel_x, start_y, slider_w, slider_h,
+                f"Sigma tuiles: {ls_gradient_sigma:.1f}", ls_gradient_sigma * 10, 5, 50, (110, 160, 140))
+            start_y += slider_h + margin
             _awb_lbl = "ON" if ls_raw_awb_auto else "OFF"
             control_rects['ls_raw_awb_auto'] = draw_jsk_slider(
                 panel_x, start_y, slider_w, slider_h,
@@ -6428,7 +6795,7 @@ def handle_ls_slider_click(mx, my, control_rects):
     global ls_scheduler_enabled, ls_sched_gain, ls_sched_expo_us, ls_sched_frames
     global stretch_preset, isp_gamma, isp_brightness, isp_contrast, isp_saturation
     global ls_cam_brightness, ls_cam_contrast, ls_cam_saturation, picam2, use_picamera2
-    global livestack, isp_black_level, ls_gradient_removal, ls_raw_awb_auto
+    global livestack, isp_black_level, ls_gradient_removal, ls_gradient_flat_strength, ls_gradient_poly_degree, ls_gradient_sigma, ls_raw_awb_auto
     global debayer_vng, ls_bl_per_channel_enable, ls_bl_r, ls_bl_g1, ls_bl_g2, ls_bl_b
     global log_factor, mtf_shadows, mtf_midtone, mtf_highlights
     global ghs_D, ghs_b, ghs_SP, ghs_LP, ghs_HP, stretch_factor, stretch_p_low, stretch_p_high
@@ -6599,6 +6966,18 @@ def handle_ls_slider_click(mx, my, control_rects):
                 ls_gradient_removal = 1 if ratio > 0.5 else 0
                 if livestack is not None:
                     livestack.configure(gradient_removal=bool(ls_gradient_removal))
+            elif name == 'ls_raw_flat_strength':
+                ls_gradient_flat_strength = int(ratio * 100)
+                if livestack is not None:
+                    livestack.configure(gradient_removal_flat_strength=ls_gradient_flat_strength)
+            elif name == 'ls_raw_poly_degree':
+                ls_gradient_poly_degree = max(1, min(4, int(1 + ratio * 3 + 0.5)))
+                if livestack is not None:
+                    livestack.configure(gradient_removal_poly_degree=ls_gradient_poly_degree)
+            elif name == 'ls_raw_grid_sigma':
+                ls_gradient_sigma = round(max(0.5, min(5.0, 0.5 + ratio * 4.5)), 1)
+                if livestack is not None:
+                    livestack.configure(gradient_removal_sigma=ls_gradient_sigma)
             elif name == 'ls_raw_awb_auto':
                 ls_raw_awb_auto = 1 if ratio > 0.5 else 0
                 if livestack is not None:
@@ -6613,6 +6992,12 @@ def handle_ls_slider_click(mx, my, control_rects):
                 ls_planetary_disk_max = max(50, min(1000, int(50 + ratio * 950 + 0.5)))
             elif name == 'ls_raw_fix_bad':
                 fix_bad_pixels = 1 if ratio > 0.5 else 0
+                # Réinitialiser le flag de trace → le prochain appel affichera le mode actuel
+                try:
+                    from libastrostack.lucky_raw import debayer_raw_halide as _drf
+                    _drf._logged = False
+                except Exception:
+                    pass
             elif name == 'ls_raw_fix_sig':
                 fix_bad_pixels_sigma = max(10, int(10 + ratio * 90 + 0.5))
             elif name == 'ls_raw_fix_adu':
@@ -6755,6 +7140,1982 @@ def draw_ls_interface(screen_width, screen_height):
 
     if _numpad_active:
         draw_numpad_overlay()
+
+
+# ============================================================================
+# GALAXY MODE INTERFACE — HDR LiveStack (RAW Bayer)
+# Schéma couleur : violet/pourpre
+# ============================================================================
+
+def draw_galaxy_settings_icon(screen_width, screen_height, active=False):
+    """Icône SET — Galaxy interface."""
+    global windowSurfaceObj, _font_cache
+    icon_size = 50; margin = 15
+    bg = (50, 30, 60) if active else (35, 20, 40)
+    border = (140, 80, 180) if active else (70, 40, 90)
+    icon_rect = pygame.Rect(margin, margin, icon_size, icon_size)
+    pygame.draw.rect(windowSurfaceObj, bg, icon_rect, border_radius=8)
+    pygame.draw.rect(windowSurfaceObj, border, icon_rect, 2, border_radius=8)
+    ck = 22
+    if ck not in _font_cache:
+        _font_cache[ck] = pygame.font.Font(None, ck)
+    s = _font_cache[ck].render("SET", True, (200, 150, 240))
+    windowSurfaceObj.blit(s, s.get_rect(center=icon_rect.center))
+    return icon_rect
+
+
+def draw_galaxy_start_stop_button(screen_width, screen_height, is_running=False):
+    """Bouton START/STOP — Galaxy interface."""
+    global windowSurfaceObj, _font_cache
+    icon_size = 50; margin = 15
+    icon_rect = pygame.Rect(margin + icon_size + margin, margin, icon_size, icon_size)
+    if is_running:
+        bg, border, tc, label = (120, 40, 40), (220, 80, 80), (255, 180, 180), "STOP"
+    else:
+        bg, border, tc, label = (60, 30, 80), (130, 70, 180), (200, 150, 255), "START"
+    pygame.draw.rect(windowSurfaceObj, bg, icon_rect, border_radius=8)
+    pygame.draw.rect(windowSurfaceObj, border, icon_rect, 2, border_radius=8)
+    ck = 20
+    if ck not in _font_cache:
+        _font_cache[ck] = pygame.font.Font(None, ck)
+    s = _font_cache[ck].render(label, True, tc)
+    windowSurfaceObj.blit(s, s.get_rect(center=icon_rect.center))
+    return icon_rect
+
+
+def draw_galaxy_save_fit_button(screen_width, screen_height, has_stack=False):
+    """Bouton SAVE FIT — Galaxy interface (haut droite)."""
+    global windowSurfaceObj, _font_cache
+    icon_size = 50; margin = 15
+    icon_x = screen_width - icon_size - margin
+    bg = (50, 30, 70) if has_stack else (25, 18, 30)
+    border = (130, 80, 180) if has_stack else (55, 40, 65)
+    tc = (200, 160, 255) if has_stack else (90, 70, 100)
+    icon_rect = pygame.Rect(icon_x, margin, icon_size, icon_size)
+    pygame.draw.rect(windowSurfaceObj, bg, icon_rect, border_radius=8)
+    pygame.draw.rect(windowSurfaceObj, border, icon_rect, 2, border_radius=8)
+    ck = 19
+    if ck not in _font_cache:
+        _font_cache[ck] = pygame.font.Font(None, ck)
+    f = _font_cache[ck]
+    cx, cy = icon_rect.centerx, icon_rect.centery
+    windowSurfaceObj.blit(f.render("SAVE", True, tc),
+                          f.render("SAVE", True, tc).get_rect(centerx=cx, centery=cy - 8))
+    windowSurfaceObj.blit(f.render("FIT", True, tc),
+                          f.render("FIT", True, tc).get_rect(centerx=cx, centery=cy + 8))
+    return icon_rect
+
+
+def draw_galaxy_save_png_button(screen_width, screen_height):
+    """Bouton SAVE PNG — Galaxy interface (à gauche de SAVE FIT)."""
+    global windowSurfaceObj, _font_cache, galaxy_last_filtered_array
+    icon_size = 50; margin = 15
+    icon_x = screen_width - 2 * icon_size - 2 * margin
+    has_img = galaxy_last_filtered_array is not None
+    if has_img:
+        bg, border, tc = (30, 20, 55), (80, 60, 140), (160, 130, 220)
+    else:
+        bg, border, tc = (22, 18, 25), (45, 38, 50), (75, 65, 80)
+    icon_rect = pygame.Rect(icon_x, margin, icon_size, icon_size)
+    pygame.draw.rect(windowSurfaceObj, bg, icon_rect, border_radius=8)
+    pygame.draw.rect(windowSurfaceObj, border, icon_rect, 2, border_radius=8)
+    ck = 18
+    if ck not in _font_cache:
+        _font_cache[ck] = pygame.font.Font(None, ck)
+    f = _font_cache[ck]
+    cx, cy = icon_rect.centerx, icon_rect.centery
+    windowSurfaceObj.blit(f.render("SAVE", True, tc),
+                          f.render("SAVE", True, tc).get_rect(centerx=cx, centery=cy - 8))
+    windowSurfaceObj.blit(f.render("PNG", True, tc),
+                          f.render("PNG", True, tc).get_rect(centerx=cx, centery=cy + 8))
+    return icon_rect
+
+
+def draw_galaxy_binning_button(screen_width, screen_height, binning_active=True):
+    """Bouton BINNING — Galaxy interface (bas droite)."""
+    global windowSurfaceObj, _font_cache
+    icon_size = 50; margin = 15
+    icon_x = screen_width - icon_size - margin
+    icon_y = screen_height - icon_size - margin
+    if binning_active:
+        bg, border, tc = (50, 30, 80), (100, 70, 150), (180, 150, 230)
+    else:
+        bg, border, tc = (35, 30, 40), (60, 50, 70), (130, 120, 140)
+    icon_rect = pygame.Rect(icon_x, icon_y, icon_size, icon_size)
+    pygame.draw.rect(windowSurfaceObj, bg, icon_rect, border_radius=8)
+    pygame.draw.rect(windowSurfaceObj, border, icon_rect, 2, border_radius=8)
+    ck = 19
+    if ck not in _font_cache:
+        _font_cache[ck] = pygame.font.Font(None, ck)
+    f = _font_cache[ck]
+    cx, cy = icon_rect.centerx, icon_rect.centery
+    windowSurfaceObj.blit(f.render("BIN", True, tc), f.render("BIN", True, tc).get_rect(centerx=cx, centery=cy - 8))
+    windowSurfaceObj.blit(f.render("2x2" if binning_active else "OFF", True, tc),
+                          f.render("2x2" if binning_active else "OFF", True, tc).get_rect(centerx=cx, centery=cy + 8))
+    return icon_rect
+
+
+def is_click_on_galaxy_binning(mousex, mousey, screen_width, screen_height):
+    """Vérifie si clic sur bouton BINNING Galaxy."""
+    icon_size = 50; margin = 15
+    icon_x = screen_width - icon_size - margin
+    icon_y = screen_height - icon_size - margin
+    return (icon_x <= mousex <= icon_x + icon_size and
+            icon_y <= mousey <= icon_y + icon_size)
+
+
+def draw_galaxy_exit_button(screen_width, screen_height):
+    """Bouton EXIT — Galaxy interface (bas gauche)."""
+    global windowSurfaceObj, _font_cache
+    icon_size = 50; margin = 15
+    icon_rect = pygame.Rect(margin, screen_height - icon_size - margin, icon_size, icon_size)
+    pygame.draw.rect(windowSurfaceObj, (70, 40, 50), icon_rect, border_radius=8)
+    pygame.draw.rect(windowSurfaceObj, (130, 70, 90), icon_rect, 2, border_radius=8)
+    ck = 22
+    if ck not in _font_cache:
+        _font_cache[ck] = pygame.font.Font(None, ck)
+    s = _font_cache[ck].render("EXIT", True, (220, 150, 170))
+    windowSurfaceObj.blit(s, s.get_rect(center=icon_rect.center))
+    return icon_rect
+
+
+def draw_galaxy_reset_button(screen_width, screen_height):
+    """Bouton RST — Galaxy interface (bas gauche +1)."""
+    global windowSurfaceObj, _font_cache
+    icon_size = 50; margin = 15
+    icon_rect = pygame.Rect(margin + icon_size + margin,
+                            screen_height - icon_size - margin, icon_size, icon_size)
+    pygame.draw.rect(windowSurfaceObj, (40, 30, 55), icon_rect, border_radius=8)
+    pygame.draw.rect(windowSurfaceObj, (80, 60, 120), icon_rect, 2, border_radius=8)
+    ck = 19
+    if ck not in _font_cache:
+        _font_cache[ck] = pygame.font.Font(None, ck)
+    f = _font_cache[ck]
+    cx, cy = icon_rect.centerx, icon_rect.centery
+    windowSurfaceObj.blit(f.render("RST", True, (170, 140, 220)),
+                          f.render("RST", True, (170, 140, 220)).get_rect(centerx=cx, centery=cy - 8))
+    windowSurfaceObj.blit(f.render("STACK", True, (140, 110, 190)),
+                          f.render("STACK", True, (140, 110, 190)).get_rect(centerx=cx, centery=cy + 8))
+    return icon_rect
+
+
+def draw_galaxy_pause_button(screen_width, screen_height, is_paused=False, is_active=False):
+    """Bouton PAUSE/REPRISE — Galaxy interface (bas gauche +2)."""
+    global windowSurfaceObj, _font_cache
+    icon_size = 50; margin = 15
+    ix = margin + 2 * (icon_size + margin)
+    iy = screen_height - icon_size - margin
+    icon_rect = pygame.Rect(ix, iy, icon_size, icon_size)
+    if is_paused:
+        bg, border, tc = (70, 55, 10), (190, 150, 30), (255, 210, 70)
+        lbl1, lbl2 = "▶", "RES."
+    elif is_active:
+        bg, border, tc = (40, 25, 55), (100, 60, 140), (180, 130, 230)
+        lbl1, lbl2 = "II", "PAUSE"
+    else:
+        bg, border, tc = (25, 20, 28), (45, 38, 50), (80, 70, 85)
+        lbl1, lbl2 = "II", "PAUSE"
+    pygame.draw.rect(windowSurfaceObj, bg, icon_rect, border_radius=8)
+    pygame.draw.rect(windowSurfaceObj, border, icon_rect, 2, border_radius=8)
+    ck = 18
+    if ck not in _font_cache:
+        _font_cache[ck] = pygame.font.Font(None, ck)
+    f = _font_cache[ck]
+    cx, cy = icon_rect.centerx, icon_rect.centery
+    windowSurfaceObj.blit(f.render(lbl1, True, tc),
+                          f.render(lbl1, True, tc).get_rect(centerx=cx, centery=cy - 8))
+    windowSurfaceObj.blit(f.render(lbl2, True, tc),
+                          f.render(lbl2, True, tc).get_rect(centerx=cx, centery=cy + 8))
+    return icon_rect
+
+
+def _galaxy_ge_slider_positions(screen_height, screen_width=1920):
+    """Positions des sliders Gain/Expo/Zoom — Galaxy interface (haut-centre)."""
+    slider_w = 300
+    slider_h = 28
+    sx = (screen_width - slider_w) // 2
+    sy_expo = 75
+    sy_gain = sy_expo + slider_h + 6
+    sy_zoom = sy_gain + slider_h + 6
+    return sx, sy_gain, sy_expo, sy_zoom, slider_w, slider_h
+
+
+def draw_galaxy_gain_expo_zoom(screen_width, screen_height):
+    """Dessine les sliders Gain, Expo, Zoom — Galaxy interface (haut-centre)."""
+    global windowSurfaceObj, _font_cache, galaxy_gain, galaxy_exposure_us, galaxy_zoom
+    global home_gain_scale_idx, home_expo_scale_idx, _HOME_GAIN_SCALES, _HOME_EXPO_SCALES_MS
+    import math
+    sx, sy_gain, sy_expo, sy_zoom, slider_w, slider_h = _galaxy_ge_slider_positions(screen_height, screen_width)
+
+    _gain_max = _HOME_GAIN_SCALES[max(0, min(home_gain_scale_idx, len(_HOME_GAIN_SCALES)-1))]
+    _expo_max_us = _HOME_EXPO_SCALES_MS[max(0, min(home_expo_scale_idx, len(_HOME_EXPO_SCALES_MS)-1))] * 1000
+
+    min_exp_us = 1000
+    exp_c = max(min_exp_us, min(galaxy_exposure_us, _expo_max_us))
+    log_min = math.log10(min_exp_us)
+    log_max = math.log10(_expo_max_us)
+    expo_ratio = (math.log10(exp_c) - log_min) / max(0.001, log_max - log_min)
+
+    expo_ms = galaxy_exposure_us / 1000.0
+    if expo_ms >= 1000:
+        expo_text = f"Expo: {expo_ms/1000:.1f}s"
+    elif expo_ms >= 10:
+        expo_text = f"Expo: {expo_ms:.0f}ms"
+    else:
+        expo_text = f"Expo: {expo_ms:.1f}ms"
+    gain_ratio = galaxy_gain / _gain_max if galaxy_gain > 0 else 0.0
+    gain_text = f"Gain: {'AUTO' if galaxy_gain == 0 else galaxy_gain}"
+    zoom_ratio = galaxy_zoom / 5.0
+    zoom_text = f"Zoom: {galaxy_zoom}x"
+
+    ck = 22
+    if ck not in _font_cache:
+        _font_cache[ck] = pygame.font.Font(None, ck)
+    fontObj = _font_cache[ck]
+
+    for sy, label, ratio, color in [
+        (sy_expo, expo_text, expo_ratio, (100, 60, 160)),
+        (sy_gain, gain_text, gain_ratio, (120, 80, 170)),
+        (sy_zoom, zoom_text, zoom_ratio, (90, 70, 150)),
+    ]:
+        bg_rect = pygame.Rect(sx, sy, slider_w, slider_h)
+        pygame.draw.rect(windowSurfaceObj, (25, 18, 32), bg_rect, border_radius=5)
+        pygame.draw.rect(windowSurfaceObj, (55, 40, 70), bg_rect, 1, border_radius=5)
+        fill_w = int(min(1.0, ratio) * (slider_w - 10))
+        if fill_w > 0:
+            pygame.draw.rect(windowSurfaceObj, color,
+                             pygame.Rect(sx + 5, sy + 5, fill_w, slider_h - 10), border_radius=3)
+        lbl = fontObj.render(label, True, (210, 190, 240))
+        windowSurfaceObj.blit(lbl, lbl.get_rect(center=bg_rect.center))
+
+
+# --- Galaxy click detection functions ---
+
+def is_click_on_galaxy_settings(mx, my):
+    icon_size = 50; margin = 15
+    return margin <= mx <= margin + icon_size and margin <= my <= margin + icon_size
+
+
+def is_click_on_galaxy_start_stop(mx, my):
+    icon_size = 50; margin = 15
+    ix = margin + icon_size + margin
+    return ix <= mx <= ix + icon_size and margin <= my <= margin + icon_size
+
+
+def is_click_on_galaxy_save_fit(mx, my, screen_width):
+    icon_size = 50; margin = 15
+    ix = screen_width - icon_size - margin
+    return ix <= mx <= ix + icon_size and margin <= my <= margin + icon_size
+
+
+def is_click_on_galaxy_save_png(mx, my, screen_width):
+    icon_size = 50; margin = 15
+    ix = screen_width - 2 * icon_size - 2 * margin
+    return ix <= mx <= ix + icon_size and margin <= my <= margin + icon_size
+
+
+def is_click_on_galaxy_exit(mx, my, screen_height):
+    icon_size = 50; margin = 15
+    iy = screen_height - icon_size - margin
+    return margin <= mx <= margin + icon_size and iy <= my <= iy + icon_size
+
+
+def is_click_on_galaxy_reset(mx, my, screen_height):
+    icon_size = 50; margin = 15
+    ix = margin + icon_size + margin
+    iy = screen_height - icon_size - margin
+    return ix <= mx <= ix + icon_size and iy <= my <= iy + icon_size
+
+
+def is_click_on_galaxy_pause(mx, my, screen_height):
+    icon_size = 50; margin = 15
+    ix = margin + 2 * (icon_size + margin)
+    iy = screen_height - icon_size - margin
+    return ix <= mx <= ix + icon_size and iy <= my <= iy + icon_size
+
+
+def is_click_on_galaxy_gain_slider(mx, my, screen_width, screen_height):
+    global home_gain_scale_idx, _HOME_GAIN_SCALES
+    _gain_max = _HOME_GAIN_SCALES[max(0, min(home_gain_scale_idx, len(_HOME_GAIN_SCALES)-1))]
+    sx, sy_gain, _, _, slider_w, slider_h = _galaxy_ge_slider_positions(screen_height, screen_width)
+    if sx <= mx <= sx + slider_w and sy_gain <= my <= sy_gain + slider_h:
+        return max(0, min(_gain_max, int((mx - sx) / slider_w * _gain_max)))
+    return None
+
+
+def is_click_on_galaxy_expo_slider(mx, my, screen_width, screen_height):
+    global home_expo_scale_idx, _HOME_EXPO_SCALES_MS
+    import math
+    _expo_max_us = _HOME_EXPO_SCALES_MS[max(0, min(home_expo_scale_idx, len(_HOME_EXPO_SCALES_MS)-1))] * 1000
+    sx, _, sy_expo, _, slider_w, slider_h = _galaxy_ge_slider_positions(screen_height, screen_width)
+    if sx <= mx <= sx + slider_w and sy_expo <= my <= sy_expo + slider_h:
+        ratio = max(0.0, min(1.0, (mx - sx) / slider_w))
+        log_min = math.log10(1000)
+        log_max = math.log10(_expo_max_us)
+        return int(10 ** (log_min + ratio * (log_max - log_min)))
+    return None
+
+
+def is_click_on_galaxy_zoom_slider(mx, my, screen_width, screen_height):
+    sx, _, _, sy_zoom, slider_w, slider_h = _galaxy_ge_slider_positions(screen_height, screen_width)
+    if sx <= mx <= sx + slider_w and sy_zoom <= my <= sy_zoom + slider_h:
+        return max(0, min(5, int((mx - sx) / slider_w * 5 + 0.5)))
+    return None
+
+
+# --- Galaxy stats bar ---
+
+def draw_galaxy_stats_bar(screen_width, screen_height, stats, is_paused=False, hdr_bits=2):
+    """Barre de statistiques Galaxy — bas-centre."""
+    global windowSurfaceObj, _font_cache
+    if not stats:
+        return
+    ck = 20
+    if ck not in _font_cache:
+        _font_cache[ck] = pygame.font.Font(None, ck)
+    f = _font_cache[ck]
+    accepted = stats.get('accepted_frames', 0)
+    total = stats.get('total_frames', 0)
+    rejected = stats.get('rejected_frames', 0)
+    snr = stats.get('snr_gain', 1.0)
+    pause_txt = "  PAUSE" if is_paused else ""
+    line = f"GALAXY HDR{hdr_bits}b: {accepted}/{total}  Rej: {rejected}  SNR: x{snr:.1f}{pause_txt}"
+    bar_w = min(len(line) * 8 + 20, screen_width - 100)
+    bar_h = 24
+    surf = pygame.Surface((bar_w, bar_h), pygame.SRCALPHA)
+    surf.fill((0, 0, 0, 160))
+    tx = (screen_width - bar_w) // 2
+    ty = screen_height - 95
+    windowSurfaceObj.blit(surf, (tx, ty))
+    color = (255, 210, 70) if is_paused else (210, 180, 255)
+    lbl = f.render(line, True, color)
+    windowSurfaceObj.blit(lbl, lbl.get_rect(centerx=screen_width // 2, centery=ty + 12))
+
+
+# --- Galaxy tab bar ---
+
+def _draw_galaxy_tab_bar(panel_x, panel_w, y):
+    """Dessine la barre d'onglets Galaxy (6 onglets) et retourne les rects."""
+    global windowSurfaceObj, _font_cache, galaxy_settings_tab
+    tab_labels = ["Cap.", "HDR", "Stack", "Img/Str.", "Filtres", "Struct."]
+    n = len(tab_labels)
+    tab_h = 24
+    tab_w = panel_w // n
+    rects = {}
+    ck = 15
+    if ck not in _font_cache:
+        _font_cache[ck] = pygame.font.Font(None, ck)
+    f = _font_cache[ck]
+    for i, label in enumerate(tab_labels):
+        active = (galaxy_settings_tab == i)
+        bg     = (60, 30, 80)  if active else (28, 16, 32)
+        border = (140, 80, 180) if active else (55, 35, 65)
+        tc     = (220, 180, 255) if active else (105, 80, 120)
+        r = pygame.Rect(panel_x + i * tab_w, y, tab_w - 2, tab_h)
+        pygame.draw.rect(windowSurfaceObj, bg, r, border_radius=4)
+        pygame.draw.rect(windowSurfaceObj, border, r, 1, border_radius=4)
+        windowSurfaceObj.blit(f.render(label, True, tc), f.render(label, True, tc).get_rect(center=r.center))
+        rects[f'gx_tab_{i}'] = r
+    return rects, y + tab_h + 4
+
+
+# --- Galaxy settings panel ---
+
+def draw_galaxy_controls(screen_width, screen_height):
+    """
+    Panneau de réglages Galaxy — côté droit, 5 onglets.
+    Retourne dict des rects pour détection clics.
+    """
+    global windowSurfaceObj, _font_cache
+    global galaxy_settings_tab, galaxy_active, galaxy_livestack, galaxy_alignment_mode
+    global galaxy_hdr_bits_clip, galaxy_hdr_weights
+    global galaxy_stack_method, galaxy_stack_kappa, galaxy_stack_iterations
+    global galaxy_enable_qc, galaxy_max_fwhm, galaxy_min_sharpness, galaxy_max_drift, galaxy_min_stars
+    global galaxy_preview_refresh, galaxy_gradient_removal
+    global stretch_preset, stretch_factor, stretch_p_low, stretch_p_high
+    global ghs_D, ghs_b, ghs_SP, ghs_LP, ghs_HP
+    global log_factor, mtf_shadows, mtf_midtone, mtf_highlights
+    global isp_brightness, isp_contrast, isp_saturation
+    global isp_black_level, debayer_vng, ls_bl_per_channel_enable
+    global ls_bl_r, ls_bl_g1, ls_bl_g2, ls_bl_b
+    global fix_bad_pixels, fix_bad_pixels_sigma, fix_bad_pixels_min_adu
+    global ls_lucky_clahe_en, ls_lucky_clahe_str, ls_lucky_clahe_tile
+    global ls_lucky_usm_en, ls_lucky_usm_sigma, ls_lucky_usm_amount
+    global ls_lucky_lr_en, ls_lucky_lr_iter, ls_lucky_lr_sigma
+    global ls_lucky_mm_en, ls_lucky_mm_iter, ls_lucky_mm_sigma, ls_lucky_mm_lambda
+    global ls_lucky_wpsf_en, ls_lucky_wpsf_iter
+    global ls_wpsf_aperture, ls_wpsf_obstruction, ls_wpsf_pixel_scale, ls_wpsf_seeing
+    global ls_wpsf_defocus, ls_wpsf_astig_x, ls_wpsf_astig_y, ls_wpsf_spherical
+    global ls_post_red, ls_post_green, ls_post_blue, ls_post_sat, ls_post_brightness
+    global galaxy_gradient_flat_strength, galaxy_gradient_poly_degree, galaxy_gradient_sigma
+    global galaxy_color_enabled, galaxy_r_gain, galaxy_g_gain, galaxy_b_gain
+    global ls_raw_awb_auto
+    global galaxy_save_raws
+
+    panel_w  = 260
+    panel_m  = 10
+    panel_x  = screen_width - panel_w - panel_m
+    start_y  = 80
+    slider_w = panel_w - 10
+    slider_h = 26
+    margin   = 4
+    control_rects = {}
+
+    # Fond semi-transparent violet
+    panel_h = screen_height - start_y - 70
+    surf = pygame.Surface((panel_w, panel_h), pygame.SRCALPHA)
+    surf.fill((22, 14, 30, 205))
+    windowSurfaceObj.blit(surf, (panel_x, start_y - 10))
+
+    ck_title = 24
+    if ck_title not in _font_cache:
+        _font_cache[ck_title] = pygame.font.Font(None, ck_title)
+    ck_sect = 19
+    if ck_sect not in _font_cache:
+        _font_cache[ck_sect] = pygame.font.Font(None, ck_sect)
+
+    windowSurfaceObj.blit(
+        _font_cache[ck_title].render("GALAXY HDR", True, (180, 130, 240)),
+        (panel_x, start_y - 15))
+    start_y += 16
+
+    # Barre d'onglets
+    tab_rects, start_y = _draw_galaxy_tab_bar(panel_x, panel_w, start_y)
+    control_rects.update(tab_rects)
+
+    # =====================================================
+    # ONGLET 0 : Capture
+    # =====================================================
+    if galaxy_settings_tab == 0:
+        windowSurfaceObj.blit(
+            _font_cache[ck_sect].render("Alignement", True, (170, 140, 210)),
+            (panel_x + 2, start_y))
+        start_y += 16
+
+        _align_names = ['OFF', 'Translation']
+        _align_idx = galaxy_alignment_mode
+        control_rects['gx_alignment_mode'] = draw_jsk_slider(
+            panel_x, start_y, slider_w, slider_h,
+            f"Align: {_align_names[_align_idx]}", _align_idx, 0, 1, (120, 90, 170))
+        start_y += slider_h + margin
+
+        control_rects['gx_preview_refresh'] = draw_jsk_slider(
+            panel_x, start_y, slider_w, slider_h,
+            f"Refresh: /{galaxy_preview_refresh} img", galaxy_preview_refresh, 1, 10, (100, 80, 150))
+        start_y += slider_h + margin + 8
+
+        windowSurfaceObj.blit(
+            _font_cache[ck_sect].render("RAW", True, (170, 140, 210)),
+            (panel_x + 2, start_y))
+        start_y += 16
+
+        _db_lbl = "VNG" if debayer_vng else "Bilinéaire"
+        control_rects['gx_raw_debayer'] = draw_jsk_slider(
+            panel_x, start_y, slider_w, slider_h,
+            f"Débayer: {_db_lbl}", debayer_vng, 0, 1, (130, 100, 170))
+        start_y += slider_h + margin
+
+        _bl_mode_names = ["Global", "Auto FPN", "Manuel"]
+        _bl_mode_lbl = _bl_mode_names[min(ls_bl_per_channel_enable, 2)]
+        control_rects['gx_raw_bl_mode'] = draw_jsk_slider(
+            panel_x, start_y, slider_w, slider_h,
+            f"BL Mode: {_bl_mode_lbl}", ls_bl_per_channel_enable, 0, 2, (160, 120, 140))
+        start_y += slider_h + margin
+
+        _bl_global_active = (ls_bl_per_channel_enable == 0)
+        _bl_color = (160, 120, 140) if _bl_global_active else (60, 45, 55)
+        control_rects['gx_raw_black_level'] = draw_jsk_slider(
+            panel_x, start_y, slider_w, slider_h,
+            f"Black Level: {isp_black_level}", isp_black_level, 0, 500, _bl_color)
+        start_y += slider_h + margin
+
+        if ls_bl_per_channel_enable == 2:
+            for _ch_lbl, _ch_val, _ch_key in [
+                ("BL R",  ls_bl_r,  'gx_raw_bl_r'),
+                ("BL G1", ls_bl_g1, 'gx_raw_bl_g1'),
+                ("BL G2", ls_bl_g2, 'gx_raw_bl_g2'),
+                ("BL B",  ls_bl_b,  'gx_raw_bl_b'),
+            ]:
+                control_rects[_ch_key] = draw_jsk_slider(
+                    panel_x, start_y, slider_w, slider_h,
+                    f"{_ch_lbl}: {_ch_val}", _ch_val, 0, 512, (120, 100, 160))
+                start_y += slider_h + margin
+
+        control_rects['gx_raw_fix_bad'] = draw_jsk_slider(
+            panel_x, start_y, slider_w, slider_h,
+            f"Pix chauds: {'ON' if fix_bad_pixels else 'OFF'}", fix_bad_pixels, 0, 1, (180, 90, 120))
+        start_y += slider_h + margin
+        if fix_bad_pixels:
+            control_rects['gx_raw_fix_sig'] = draw_jsk_slider(
+                panel_x, start_y, slider_w, slider_h,
+                f"Sigma: {fix_bad_pixels_sigma}", fix_bad_pixels_sigma, 10, 100, (165, 90, 120))
+            start_y += slider_h + margin
+
+        start_y += 6
+        control_rects['gx_save_raws'] = draw_jsk_slider(
+            panel_x, start_y, slider_w, slider_h,
+            f"Sauv. RAW: {'ON' if galaxy_save_raws else 'OFF'}", galaxy_save_raws, 0, 1,
+            (200, 100, 50) if galaxy_save_raws else (90, 60, 40))
+        start_y += slider_h + margin
+
+    # =====================================================
+    # ONGLET 1 : HDR (NOUVEAU)
+    # =====================================================
+    elif galaxy_settings_tab == 1:
+        windowSurfaceObj.blit(
+            _font_cache[ck_sect].render("HDR Mean (RAW Bayer)", True, (200, 160, 240)),
+            (panel_x + 2, start_y))
+        start_y += 18
+
+        clip_label = "HDR Clip: OFF" if galaxy_hdr_bits_clip == 0 else f"HDR Clip: {galaxy_hdr_bits_clip} bits"
+        control_rects['gx_hdr_clip'] = draw_jsk_slider(
+            panel_x, start_y, slider_w, slider_h,
+            clip_label, galaxy_hdr_bits_clip, 0, 3, (160, 120, 200))
+        start_y += slider_h + margin + 6
+
+        # Poids HDR par niveau de bit
+        if galaxy_hdr_bits_clip > 0:
+            windowSurfaceObj.blit(
+                _font_cache[ck_sect].render("Poids par niveau", True, (180, 150, 220)),
+                (panel_x + 2, start_y))
+            start_y += 16
+
+            bit_labels = ["12-bit", "11-bit", "10-bit", "9-bit"]
+            weight_colors = [
+                (100, 180, 220), (140, 160, 200),
+                (180, 140, 180), (200, 120, 160)
+            ]
+            n_weights = galaxy_hdr_bits_clip + 1
+            for i in range(n_weights):
+                w_val = galaxy_hdr_weights[i] if i < len(galaxy_hdr_weights) else 100
+                control_rects[f'gx_hdr_w{i}'] = draw_jsk_slider(
+                    panel_x, start_y, slider_w, slider_h,
+                    f"{bit_labels[i]}: {w_val}%", w_val, 0, 100,
+                    weight_colors[i % len(weight_colors)])
+                start_y += slider_h + margin
+
+    # =====================================================
+    # ONGLET 2 : Stacking + QC
+    # =====================================================
+    elif galaxy_settings_tab == 2:
+        windowSurfaceObj.blit(
+            _font_cache[ck_sect].render("Méthode de stacking", True, (170, 140, 210)),
+            (panel_x + 2, start_y))
+        start_y += 16
+
+        control_rects['gx_stack_method'] = draw_jsk_slider(
+            panel_x, start_y, slider_w, slider_h,
+            f"Méthode: {stack_methods[galaxy_stack_method]}",
+            galaxy_stack_method, 0, 4, (120, 100, 180))
+        start_y += slider_h + margin
+
+        if galaxy_stack_method >= 2:
+            control_rects['gx_stack_kappa'] = draw_jsk_slider(
+                panel_x, start_y, slider_w, slider_h,
+                f"Kappa: {galaxy_stack_kappa/10:.1f}",
+                galaxy_stack_kappa, 10, 50, (140, 110, 190))
+            start_y += slider_h + margin
+            control_rects['gx_stack_iterations'] = draw_jsk_slider(
+                panel_x, start_y, slider_w, slider_h,
+                f"Itérations: {galaxy_stack_iterations}",
+                galaxy_stack_iterations, 1, 10, (140, 110, 190))
+            start_y += slider_h + margin
+
+        start_y += 8
+        windowSurfaceObj.blit(
+            _font_cache[ck_sect].render("Contrôle qualité", True, (170, 140, 210)),
+            (panel_x + 2, start_y))
+        start_y += 16
+
+        control_rects['gx_enable_qc'] = draw_jsk_slider(
+            panel_x, start_y, slider_w, slider_h,
+            f"QC: {'ON' if galaxy_enable_qc else 'OFF'}",
+            galaxy_enable_qc, 0, 1, (150, 120, 190))
+        start_y += slider_h + margin
+
+        if galaxy_enable_qc:
+            control_rects['gx_max_fwhm'] = draw_jsk_slider(
+                panel_x, start_y, slider_w, slider_h,
+                f"FWHM max: {galaxy_max_fwhm/10:.1f}px",
+                galaxy_max_fwhm, 0, 250, (130, 110, 170))
+            start_y += slider_h + margin
+            control_rects['gx_min_sharpness'] = draw_jsk_slider(
+                panel_x, start_y, slider_w, slider_h,
+                f"Sharp min: {galaxy_min_sharpness/1000:.3f}",
+                galaxy_min_sharpness, 0, 150, (130, 110, 170))
+            start_y += slider_h + margin
+            control_rects['gx_max_drift'] = draw_jsk_slider(
+                panel_x, start_y, slider_w, slider_h,
+                f"Drift max: {galaxy_max_drift}px",
+                galaxy_max_drift, 0, 5000, (130, 110, 170))
+            start_y += slider_h + margin
+            control_rects['gx_min_stars'] = draw_jsk_slider(
+                panel_x, start_y, slider_w, slider_h,
+                f"Étoiles min: {galaxy_min_stars}",
+                galaxy_min_stars, 0, 50, (130, 110, 170))
+            start_y += slider_h + margin
+
+        start_y += 8
+        windowSurfaceObj.blit(
+            _font_cache[ck_sect].render("Gradient", True, (170, 140, 210)),
+            (panel_x + 2, start_y))
+        start_y += 16
+        control_rects['gx_gradient'] = draw_jsk_slider(
+            panel_x, start_y, slider_w, slider_h,
+            f"Gradient BG: {'ON' if galaxy_gradient_removal else 'OFF'}",
+            galaxy_gradient_removal, 0, 1, (130, 120, 170))
+        start_y += slider_h + margin
+
+        if galaxy_gradient_removal:
+            _poly_labels = {1: 'Linéaire', 2: 'Quadratique', 3: 'Cubique', 4: 'Quartique'}
+            control_rects['gx_gradient_flat_strength'] = draw_jsk_slider(
+                panel_x, start_y, slider_w, slider_h,
+                f"Vignetage: {galaxy_gradient_flat_strength}%",
+                galaxy_gradient_flat_strength, 0, 100, (110, 160, 140))
+            start_y += slider_h + margin
+            control_rects['gx_gradient_poly_degree'] = draw_jsk_slider(
+                panel_x, start_y, slider_w, slider_h,
+                f"Poly deg: {_poly_labels.get(galaxy_gradient_poly_degree, galaxy_gradient_poly_degree)}",
+                galaxy_gradient_poly_degree, 1, 4, (110, 160, 140))
+            start_y += slider_h + margin
+            control_rects['gx_gradient_sigma'] = draw_jsk_slider(
+                panel_x, start_y, slider_w, slider_h,
+                f"Sigma tuiles: {galaxy_gradient_sigma/10:.1f}",
+                galaxy_gradient_sigma, 5, 50, (110, 160, 140))
+            start_y += slider_h + margin
+
+    # =====================================================
+    # ONGLET 3 : Image / Stretch
+    # =====================================================
+    elif galaxy_settings_tab == 3:
+        # Canaux RVB
+        windowSurfaceObj.blit(
+            _font_cache[ck_sect].render("Canaux RVB", True, (170, 140, 210)),
+            (panel_x + 2, start_y))
+        start_y += 16
+        _cc_lbl = "Couleur: ON" if galaxy_color_enabled else "Couleur: OFF"
+        _cc_col = (80, 200, 100) if galaxy_color_enabled else (140, 80, 80)
+        control_rects['gx_img_color_enabled'] = draw_jsk_slider(
+            panel_x, start_y, slider_w, slider_h,
+            _cc_lbl, galaxy_color_enabled, 0, 1, _cc_col)
+        start_y += slider_h + margin
+        if galaxy_color_enabled:
+            control_rects['gx_img_r_gain'] = draw_jsk_slider(
+                panel_x, start_y, slider_w, slider_h,
+                f"R: {galaxy_r_gain/100:.2f}x", galaxy_r_gain, 50, 200, (200, 80, 80))
+            start_y += slider_h + margin
+            control_rects['gx_img_g_gain'] = draw_jsk_slider(
+                panel_x, start_y, slider_w, slider_h,
+                f"G: {galaxy_g_gain/100:.2f}x", galaxy_g_gain, 50, 200, (80, 200, 80))
+            start_y += slider_h + margin
+            control_rects['gx_img_b_gain'] = draw_jsk_slider(
+                panel_x, start_y, slider_w, slider_h,
+                f"B: {galaxy_b_gain/100:.2f}x", galaxy_b_gain, 50, 200, (80, 120, 220))
+            start_y += slider_h + margin
+        start_y += 4
+
+        # Stretch
+        windowSurfaceObj.blit(
+            _font_cache[ck_sect].render("Stretch", True, (170, 140, 210)),
+            (panel_x + 2, start_y))
+        start_y += 16
+
+        _preset_names = ['OFF', 'GHS', 'Arcsinh', 'Log', 'MTF']
+        control_rects['gx_img_stretch'] = draw_jsk_slider(
+            panel_x, start_y, slider_w, slider_h,
+            f"Stretch: {_preset_names[min(stretch_preset, 4)]}", stretch_preset, 0, 4, (140, 120, 190))
+        start_y += slider_h + margin
+
+        if stretch_preset == 1:
+            control_rects['gx_str_ghs_D'] = draw_jsk_slider(
+                panel_x, start_y, slider_w, slider_h,
+                f"D (intensite): {ghs_D/10:.1f}", ghs_D, -10, 100, (130, 150, 180))
+            start_y += slider_h + margin
+            control_rects['gx_str_ghs_b'] = draw_jsk_slider(
+                panel_x, start_y, slider_w, slider_h,
+                f"b (local): {ghs_b/10:.1f}", ghs_b, -300, 100, (120, 140, 190))
+            start_y += slider_h + margin
+            control_rects['gx_str_ghs_SP'] = draw_jsk_slider(
+                panel_x, start_y, slider_w, slider_h,
+                f"SP (sym): {ghs_SP/100:.2f}", ghs_SP, 0, 100, (170, 130, 140))
+            start_y += slider_h + margin
+            control_rects['gx_str_ghs_LP'] = draw_jsk_slider(
+                panel_x, start_y, slider_w, slider_h,
+                f"LP (ombres): {ghs_LP/100:.2f}", ghs_LP, 0, 100, (150, 110, 180))
+            start_y += slider_h + margin
+            control_rects['gx_str_ghs_HP'] = draw_jsk_slider(
+                panel_x, start_y, slider_w, slider_h,
+                f"HP (hautes l.): {ghs_HP/100:.2f}", ghs_HP, 0, 100, (170, 110, 160))
+            start_y += slider_h + margin
+
+        elif stretch_preset == 2:
+            control_rects['gx_str_asinh_factor'] = draw_jsk_slider(
+                panel_x, start_y, slider_w, slider_h,
+                f"Facteur: {stretch_factor/10:.1f}", stretch_factor, 0, 1500, (190, 150, 130))
+            start_y += slider_h + margin
+            control_rects['gx_str_clip_low'] = draw_jsk_slider(
+                panel_x, start_y, slider_w, slider_h,
+                f"Clip bas: {stretch_p_low/10:.1f}%", stretch_p_low, 0, 2, (170, 130, 130))
+            start_y += slider_h + margin
+            control_rects['gx_str_clip_high'] = draw_jsk_slider(
+                panel_x, start_y, slider_w, slider_h,
+                f"Clip haut: {stretch_p_high/100:.2f}%", stretch_p_high, 9950, 10000, (130, 170, 150))
+            start_y += slider_h + margin
+
+        elif stretch_preset == 3:
+            control_rects['gx_img_log_factor'] = draw_jsk_slider(
+                panel_x, start_y, slider_w, slider_h,
+                f"Facteur Log: {log_factor}", log_factor, 0, 1000, (150, 170, 100))
+            start_y += slider_h + margin
+            control_rects['gx_str_clip_low'] = draw_jsk_slider(
+                panel_x, start_y, slider_w, slider_h,
+                f"Clip bas: {stretch_p_low/10:.1f}%", stretch_p_low, 0, 2, (170, 130, 130))
+            start_y += slider_h + margin
+            control_rects['gx_str_clip_high'] = draw_jsk_slider(
+                panel_x, start_y, slider_w, slider_h,
+                f"Clip haut: {stretch_p_high/100:.2f}%", stretch_p_high, 9950, 10000, (130, 170, 150))
+            start_y += slider_h + margin
+
+        elif stretch_preset == 4:
+            control_rects['gx_img_mtf_shadows'] = draw_jsk_slider(
+                panel_x, start_y, slider_w, slider_h,
+                f"Shadows: {mtf_shadows/100:.2f}", mtf_shadows, 0, 50, (100, 120, 180))
+            start_y += slider_h + margin
+            control_rects['gx_img_mtf_midtone'] = draw_jsk_slider(
+                panel_x, start_y, slider_w, slider_h,
+                f"Midtone: {mtf_midtone/100:.2f}", mtf_midtone, 1, 99, (80, 140, 200))
+            start_y += slider_h + margin
+            control_rects['gx_img_mtf_highlights'] = draw_jsk_slider(
+                panel_x, start_y, slider_w, slider_h,
+                f"Highlights: {mtf_highlights/100:.2f}", mtf_highlights, 50, 100, (120, 170, 210))
+            start_y += slider_h + margin
+
+    # =====================================================
+    # ONGLET 4 : Filtres post-stack (partagés avec LS/Lucky)
+    # =====================================================
+    elif galaxy_settings_tab == 4:
+        slider_h = 22
+        margin   = 2
+        # CLAHE
+        windowSurfaceObj.blit(
+            _font_cache[ck_sect].render("CLAHE (contraste local)", True, (160, 140, 220)),
+            (panel_x + 2, start_y))
+        start_y += 16
+        control_rects['gx_clahe_en'] = draw_jsk_slider(
+            panel_x, start_y, slider_w, slider_h,
+            f"CLAHE: {'ON' if ls_lucky_clahe_en else 'OFF'}",
+            ls_lucky_clahe_en, 0, 1, (100, 80, 170))
+        start_y += slider_h + margin
+        control_rects['gx_clahe_str'] = draw_jsk_slider(
+            panel_x, start_y, slider_w, slider_h,
+            f"Force: {ls_lucky_clahe_str/10:.1f}",
+            ls_lucky_clahe_str, 5, 40, (100, 80, 170))
+        start_y += slider_h + margin
+        control_rects['gx_clahe_tile'] = draw_jsk_slider(
+            panel_x, start_y, slider_w, slider_h,
+            f"Tile: {ls_lucky_clahe_tile}px",
+            ls_lucky_clahe_tile, 4, 32, (100, 80, 170))
+        start_y += slider_h + margin + 2
+
+        # USM
+        windowSurfaceObj.blit(
+            _font_cache[ck_sect].render("Unsharp Mask", True, (200, 150, 120)),
+            (panel_x + 2, start_y))
+        start_y += 16
+        control_rects['gx_usm_en'] = draw_jsk_slider(
+            panel_x, start_y, slider_w, slider_h,
+            f"USM: {'ON' if ls_lucky_usm_en else 'OFF'}",
+            ls_lucky_usm_en, 0, 1, (180, 130, 90))
+        start_y += slider_h + margin
+        control_rects['gx_usm_sigma'] = draw_jsk_slider(
+            panel_x, start_y, slider_w, slider_h,
+            f"Sigma: {ls_lucky_usm_sigma/10:.1f}",
+            ls_lucky_usm_sigma, 5, 50, (180, 130, 90))
+        start_y += slider_h + margin
+        control_rects['gx_usm_amount'] = draw_jsk_slider(
+            panel_x, start_y, slider_w, slider_h,
+            f"Amount: {ls_lucky_usm_amount/10:.1f}",
+            ls_lucky_usm_amount, 5, 50, (180, 130, 90))
+        start_y += slider_h + margin + 2
+
+        # Déconvolution
+        windowSurfaceObj.blit(
+            _font_cache[ck_sect].render("Déconvolution", True, (160, 150, 220)),
+            (panel_x + 2, start_y))
+        start_y += 16
+        _deconv_mode = 1 if ls_lucky_lr_en else (2 if ls_lucky_mm_en else (3 if ls_lucky_wpsf_en else 0))
+        _deconv_labels = {0: 'OFF', 1: 'Lucy-Rich.', 2: 'MM-ADMM', 3: 'WavePSF RL'}
+        _deconv_color  = {0: (80, 70, 100), 1: (170, 100, 80), 2: (90, 110, 190), 3: (80, 150, 130)}
+        _dc = _deconv_color[_deconv_mode]
+        control_rects['gx_deconv_mode'] = draw_jsk_slider(
+            panel_x, start_y, slider_w, slider_h,
+            f"Mode: {_deconv_labels[_deconv_mode]}",
+            _deconv_mode, 0, 3, _dc)
+        start_y += slider_h + margin
+        if _deconv_mode == 1:
+            control_rects['gx_lr_iter'] = draw_jsk_slider(
+                panel_x, start_y, slider_w, slider_h,
+                f"Iter: {ls_lucky_lr_iter}",
+                ls_lucky_lr_iter, 5, 60, (170, 100, 80))
+            start_y += slider_h + margin
+            control_rects['gx_lr_sigma'] = draw_jsk_slider(
+                panel_x, start_y, slider_w, slider_h,
+                f"Sigma: {ls_lucky_lr_sigma/10:.1f}",
+                ls_lucky_lr_sigma, 5, 30, (170, 100, 80))
+            start_y += slider_h + margin
+        elif _deconv_mode == 2:
+            control_rects['gx_mm_iter'] = draw_jsk_slider(
+                panel_x, start_y, slider_w, slider_h,
+                f"Iter: {ls_lucky_mm_iter}",
+                ls_lucky_mm_iter, 5, 30, (90, 110, 190))
+            start_y += slider_h + margin
+            control_rects['gx_mm_sigma'] = draw_jsk_slider(
+                panel_x, start_y, slider_w, slider_h,
+                f"Sigma: {ls_lucky_mm_sigma/10:.1f}",
+                ls_lucky_mm_sigma, 3, 15, (90, 110, 190))
+            start_y += slider_h + margin
+            control_rects['gx_mm_lambda'] = draw_jsk_slider(
+                panel_x, start_y, slider_w, slider_h,
+                f"\u03bb TV: {ls_lucky_mm_lambda/100:.2f}",
+                ls_lucky_mm_lambda, 1, 15, (90, 110, 190))
+            start_y += slider_h + margin
+        elif _deconv_mode == 3:
+            _wc = (80, 150, 130)
+            control_rects['gx_wpsf_iter'] = draw_jsk_slider(
+                panel_x, start_y, slider_w, slider_h,
+                f"Iter RL: {ls_lucky_wpsf_iter}",
+                ls_lucky_wpsf_iter, 5, 50, _wc)
+            start_y += slider_h + margin
+            control_rects['gx_wpsf_aperture'] = draw_jsk_slider(
+                panel_x, start_y, slider_w, slider_h,
+                f"Diam. {ls_wpsf_aperture}mm",
+                ls_wpsf_aperture, 50, 1000, _wc)
+            start_y += slider_h + margin
+            control_rects['gx_wpsf_obstruction'] = draw_jsk_slider(
+                panel_x, start_y, slider_w, slider_h,
+                f"Obstr. {ls_wpsf_obstruction}%",
+                ls_wpsf_obstruction, 0, 50, _wc)
+            start_y += slider_h + margin
+            control_rects['gx_wpsf_pixel_scale'] = draw_jsk_slider(
+                panel_x, start_y, slider_w, slider_h,
+                f"Échelle {ls_wpsf_pixel_scale/100:.2f}\"/px",
+                ls_wpsf_pixel_scale, 5, 200, _wc)
+            start_y += slider_h + margin
+            control_rects['gx_wpsf_seeing'] = draw_jsk_slider(
+                panel_x, start_y, slider_w, slider_h,
+                f"Seeing {ls_wpsf_seeing/10:.1f}\"" if ls_wpsf_seeing > 0 else "Seeing OFF",
+                ls_wpsf_seeing, 0, 30, _wc)
+            start_y += slider_h + margin
+            control_rects['gx_wpsf_defocus'] = draw_jsk_slider(
+                panel_x, start_y, slider_w, slider_h,
+                f"Defocus {ls_wpsf_defocus/100:+.2f}\u03bb",
+                ls_wpsf_defocus, -100, 100, _wc)
+            start_y += slider_h + margin
+            control_rects['gx_wpsf_astig_x'] = draw_jsk_slider(
+                panel_x, start_y, slider_w, slider_h,
+                f"Astig\u00d7 {ls_wpsf_astig_x/100:+.2f}\u03bb",
+                ls_wpsf_astig_x, -100, 100, _wc)
+            start_y += slider_h + margin
+            control_rects['gx_wpsf_astig_y'] = draw_jsk_slider(
+                panel_x, start_y, slider_w, slider_h,
+                f"Astig+ {ls_wpsf_astig_y/100:+.2f}\u03bb",
+                ls_wpsf_astig_y, -100, 100, _wc)
+            start_y += slider_h + margin
+            control_rects['gx_wpsf_spherical'] = draw_jsk_slider(
+                panel_x, start_y, slider_w, slider_h,
+                f"Sph\u00e9r. {ls_wpsf_spherical/100:+.2f}\u03bb",
+                ls_wpsf_spherical, -100, 100, _wc)
+            start_y += slider_h + margin
+
+        start_y += 4
+        # Balance couleur post-stack
+        windowSurfaceObj.blit(
+            _font_cache[ck_sect].render("Balance couleur", True, (180, 150, 220)),
+            (panel_x + 2, start_y))
+        start_y += 16
+        control_rects['gx_post_red'] = draw_jsk_slider(
+            panel_x, start_y, slider_w, slider_h,
+            f"Rouge: {ls_post_red}%", ls_post_red, 50, 200, (200, 80, 80))
+        start_y += slider_h + margin
+        control_rects['gx_post_green'] = draw_jsk_slider(
+            panel_x, start_y, slider_w, slider_h,
+            f"Vert: {ls_post_green}%", ls_post_green, 50, 200, (80, 200, 80))
+        start_y += slider_h + margin
+        control_rects['gx_post_blue'] = draw_jsk_slider(
+            panel_x, start_y, slider_w, slider_h,
+            f"Bleu: {ls_post_blue}%", ls_post_blue, 50, 200, (80, 80, 200))
+        start_y += slider_h + margin
+        control_rects['gx_post_sat'] = draw_jsk_slider(
+            panel_x, start_y, slider_w, slider_h,
+            f"Saturation: {ls_post_sat}%", ls_post_sat, 0, 300, (180, 140, 200))
+        start_y += slider_h + margin
+        control_rects['gx_post_brightness'] = draw_jsk_slider(
+            panel_x, start_y, slider_w, slider_h,
+            f"Brightness: {ls_post_brightness:+d}", ls_post_brightness, -100, 100, (160, 160, 200))
+        start_y += slider_h + margin
+
+    elif galaxy_settings_tab == 5:
+        # ── Onglet Structure Galactique (GalaxyEnhancer) ─────────────────────
+        slider_h = 22
+        margin   = 2
+        _tc  = (80, 210, 190)    # teal clair — titres de section
+        _ce  = (50, 170, 150)    # teal — enable
+        _cp  = (60, 140, 190)    # bleu-teal — preset
+        _cenh = (80, 180, 155)   # teal — enhancement
+        _cusm = (60, 150, 200)   # bleu — USM
+        _csr  = (130, 160, 80)   # olive — star reduction
+        _csk  = (110, 140, 60)   # olive sombre — star kernel
+        _cns  = (80, 120, 160)   # bleu-gris — n_scales
+
+        # ── Activation ───────────────────────────────────────────────────────
+        windowSurfaceObj.blit(
+            _font_cache[ck_sect].render("Structure galactique", True, _tc),
+            (panel_x + 2, start_y))
+        start_y += 16
+        _enh_label = "ON " if galaxy_filter_en else "OFF"
+        control_rects['gx_struct_en'] = draw_jsk_slider(
+            panel_x, start_y, slider_w, slider_h,
+            f"Filtre: {_enh_label}", galaxy_filter_en, 0, 1, _ce)
+        start_y += slider_h + margin + 4
+
+        # ── Preset ───────────────────────────────────────────────────────────
+        _pnames = [p['name'] for p in GALAXY_FILTER_PRESETS]
+        _pname  = _pnames[galaxy_filter_preset] if galaxy_filter_preset < len(_pnames) else '?'
+        control_rects['gx_struct_preset'] = draw_jsk_slider(
+            panel_x, start_y, slider_w, slider_h,
+            f"Type: {_pname}", galaxy_filter_preset, 0, len(GALAXY_FILTER_PRESETS) - 1, _cp)
+        start_y += slider_h + margin + 4
+
+        # ── Frangi + gamma boost ──────────────────────────────────────────────
+        windowSurfaceObj.blit(
+            _font_cache[ck_sect].render("Enhancement (Frangi+gamma)", True, _tc),
+            (panel_x + 2, start_y))
+        start_y += 16
+        control_rects['gx_struct_enh'] = draw_jsk_slider(
+            panel_x, start_y, slider_w, slider_h,
+            f"Intensité: {galaxy_filter_enh / 10.0:.1f}",
+            galaxy_filter_enh, 0, 40, _cenh)
+        start_y += slider_h + margin
+
+        # ── USM multi-échelle ─────────────────────────────────────────────────
+        windowSurfaceObj.blit(
+            _font_cache[ck_sect].render("Détails (USM multi-échelle)", True, _tc),
+            (panel_x + 2, start_y))
+        start_y += 16
+        control_rects['gx_struct_usm'] = draw_jsk_slider(
+            panel_x, start_y, slider_w, slider_h,
+            f"Détails: {galaxy_filter_usm / 10.0:.1f}",
+            galaxy_filter_usm, 0, 40, _cusm)
+        start_y += slider_h + margin + 4
+
+        # ── Star reduction ────────────────────────────────────────────────────
+        windowSurfaceObj.blit(
+            _font_cache[ck_sect].render("Réduction étoiles", True, _tc),
+            (panel_x + 2, start_y))
+        start_y += 16
+        control_rects['gx_struct_star_r'] = draw_jsk_slider(
+            panel_x, start_y, slider_w, slider_h,
+            f"Force: {galaxy_filter_star_r}%",
+            galaxy_filter_star_r, 0, 100, _csr)
+        start_y += slider_h + margin
+        control_rects['gx_struct_star_k'] = draw_jsk_slider(
+            panel_x, start_y, slider_w, slider_h,
+            f"Taille étoiles: {galaxy_filter_star_k}px",
+            galaxy_filter_star_k, 3, 15, _csk)
+        start_y += slider_h + margin + 4
+
+        # ── Qualité / vitesse ─────────────────────────────────────────────────
+        windowSurfaceObj.blit(
+            _font_cache[ck_sect].render("Qualité / vitesse", True, _tc),
+            (panel_x + 2, start_y))
+        start_y += 16
+        control_rects['gx_struct_nscales'] = draw_jsk_slider(
+            panel_x, start_y, slider_w, slider_h,
+            f"Échelles: {galaxy_filter_n_scales}",
+            galaxy_filter_n_scales, 2, 6, _cns)
+        start_y += slider_h + margin
+
+    return control_rects
+
+
+# --- Galaxy main interface orchestrator ---
+
+def draw_galaxy_interface(screen_width, screen_height):
+    """
+    Dessine tous les éléments de l'interface Galaxy au-dessus du preview/stack.
+    """
+    global _galaxy_slider_rects, galaxy_settings_visible, galaxy_active, galaxy_livestack
+    global galaxy_paused, galaxy_hdr_bits_clip, galaxy_binning
+
+    has_stack = False
+    if galaxy_livestack is not None:
+        try:
+            _st = galaxy_livestack.get_stats()
+            has_stack = _st.get('accepted_frames', 0) > 0
+        except Exception:
+            pass
+
+    draw_galaxy_settings_icon(screen_width, screen_height, galaxy_settings_visible == 1)
+    draw_galaxy_start_stop_button(screen_width, screen_height, galaxy_active)
+    draw_galaxy_save_fit_button(screen_width, screen_height, has_stack or galaxy_paused)
+    draw_galaxy_save_png_button(screen_width, screen_height)
+    draw_galaxy_exit_button(screen_width, screen_height)
+    draw_galaxy_reset_button(screen_width, screen_height)
+    draw_galaxy_pause_button(screen_width, screen_height, galaxy_paused, galaxy_active)
+    draw_galaxy_gain_expo_zoom(screen_width, screen_height)
+    draw_galaxy_binning_button(screen_width, screen_height, galaxy_binning == 1)
+
+    if (galaxy_active or galaxy_paused) and galaxy_livestack is not None:
+        try:
+            stats = galaxy_livestack.get_stats()
+            draw_galaxy_stats_bar(screen_width, screen_height, stats,
+                                  is_paused=galaxy_paused,
+                                  hdr_bits=galaxy_hdr_bits_clip)
+        except Exception:
+            pass
+
+    if galaxy_settings_visible == 1:
+        _galaxy_slider_rects = draw_galaxy_controls(screen_width, screen_height)
+    else:
+        _galaxy_slider_rects = {}
+
+
+# =============================================================================
+# MODE FICHIERS — interface de traitement de fichiers images
+# =============================================================================
+
+def draw_files_settings_icon(screen_width, screen_height, active=False):
+    global windowSurfaceObj, _font_cache
+    icon_size = 50; margin = 15
+    bg = (20, 55, 30) if active else (15, 35, 20)
+    border = (60, 180, 90) if active else (35, 90, 50)
+    r = pygame.Rect(margin, margin, icon_size, icon_size)
+    pygame.draw.rect(windowSurfaceObj, bg, r, border_radius=8)
+    pygame.draw.rect(windowSurfaceObj, border, r, 2, border_radius=8)
+    ck = 22
+    if ck not in _font_cache: _font_cache[ck] = pygame.font.Font(None, ck)
+    s = _font_cache[ck].render("SET", True, (100, 220, 130))
+    windowSurfaceObj.blit(s, s.get_rect(center=r.center))
+    return r
+
+
+def draw_files_start_stop_button(screen_width, screen_height, is_running=False):
+    global windowSurfaceObj, _font_cache
+    icon_size = 50; margin = 15
+    r = pygame.Rect(margin + icon_size + margin, margin, icon_size, icon_size)
+    if is_running:
+        bg, border, tc, lbl = (120, 40, 40), (220, 80, 80), (255, 180, 180), "STOP"
+    else:
+        bg, border, tc, lbl = (20, 55, 30), (60, 160, 80), (120, 240, 140), "START"
+    pygame.draw.rect(windowSurfaceObj, bg, r, border_radius=8)
+    pygame.draw.rect(windowSurfaceObj, border, r, 2, border_radius=8)
+    ck = 20
+    if ck not in _font_cache: _font_cache[ck] = pygame.font.Font(None, ck)
+    s = _font_cache[ck].render(lbl, True, tc)
+    windowSurfaceObj.blit(s, s.get_rect(center=r.center))
+    return r
+
+
+def draw_files_save_fit_button(screen_width, screen_height, has_stack=False):
+    global windowSurfaceObj, _font_cache
+    icon_size = 50; margin = 15
+    icon_x = screen_width - icon_size - margin
+    bg = (20, 50, 30) if has_stack else (15, 22, 18)
+    border = (60, 160, 80) if has_stack else (30, 55, 38)
+    tc = (120, 230, 140) if has_stack else (50, 80, 55)
+    r = pygame.Rect(icon_x, margin, icon_size, icon_size)
+    pygame.draw.rect(windowSurfaceObj, bg, r, border_radius=8)
+    pygame.draw.rect(windowSurfaceObj, border, r, 2, border_radius=8)
+    ck = 19
+    if ck not in _font_cache: _font_cache[ck] = pygame.font.Font(None, ck)
+    f = _font_cache[ck]
+    cx, cy = r.centerx, r.centery
+    windowSurfaceObj.blit(f.render("SAVE", True, tc), f.render("SAVE", True, tc).get_rect(centerx=cx, centery=cy-8))
+    windowSurfaceObj.blit(f.render("FIT", True, tc),  f.render("FIT", True, tc).get_rect(centerx=cx, centery=cy+8))
+    return r
+
+
+def draw_files_save_png_button(screen_width, screen_height):
+    global windowSurfaceObj, _font_cache, files_last_filtered_array
+    icon_size = 50; margin = 15
+    icon_x = screen_width - 2 * icon_size - 2 * margin
+    has_img = files_last_filtered_array is not None
+    bg, border, tc = ((20, 45, 28), (50, 130, 65), (110, 200, 130)) if has_img else ((14, 20, 16), (28, 45, 32), (55, 75, 60))
+    r = pygame.Rect(icon_x, margin, icon_size, icon_size)
+    pygame.draw.rect(windowSurfaceObj, bg, r, border_radius=8)
+    pygame.draw.rect(windowSurfaceObj, border, r, 2, border_radius=8)
+    ck = 18
+    if ck not in _font_cache: _font_cache[ck] = pygame.font.Font(None, ck)
+    f = _font_cache[ck]
+    cx, cy = r.centerx, r.centery
+    windowSurfaceObj.blit(f.render("SAVE", True, tc), f.render("SAVE", True, tc).get_rect(centerx=cx, centery=cy-8))
+    windowSurfaceObj.blit(f.render("PNG", True, tc),  f.render("PNG", True, tc).get_rect(centerx=cx, centery=cy+8))
+    return r
+
+
+def draw_files_exit_button(screen_width, screen_height):
+    global windowSurfaceObj, _font_cache
+    icon_size = 50; margin = 15
+    r = pygame.Rect(margin, screen_height - icon_size - margin, icon_size, icon_size)
+    pygame.draw.rect(windowSurfaceObj, (60, 35, 35), r, border_radius=8)
+    pygame.draw.rect(windowSurfaceObj, (140, 70, 70), r, 2, border_radius=8)
+    ck = 22
+    if ck not in _font_cache: _font_cache[ck] = pygame.font.Font(None, ck)
+    s = _font_cache[ck].render("EXIT", True, (220, 150, 150))
+    windowSurfaceObj.blit(s, s.get_rect(center=r.center))
+    return r
+
+
+def draw_files_reset_button(screen_width, screen_height):
+    global windowSurfaceObj, _font_cache
+    icon_size = 50; margin = 15
+    r = pygame.Rect(margin + icon_size + margin, screen_height - icon_size - margin, icon_size, icon_size)
+    pygame.draw.rect(windowSurfaceObj, (20, 45, 28), r, border_radius=8)
+    pygame.draw.rect(windowSurfaceObj, (50, 130, 65), r, 2, border_radius=8)
+    ck = 19
+    if ck not in _font_cache: _font_cache[ck] = pygame.font.Font(None, ck)
+    f = _font_cache[ck]
+    cx, cy = r.centerx, r.centery
+    windowSurfaceObj.blit(f.render("RST", True, (130, 220, 150)),   f.render("RST", True, (130, 220, 150)).get_rect(centerx=cx, centery=cy-8))
+    windowSurfaceObj.blit(f.render("STACK", True, (100, 180, 120)), f.render("STACK", True, (100, 180, 120)).get_rect(centerx=cx, centery=cy+8))
+    return r
+
+
+def draw_files_pause_button(screen_width, screen_height, is_paused=False, is_active=False):
+    global windowSurfaceObj, _font_cache
+    icon_size = 50; margin = 15
+    ix = margin + 2 * (icon_size + margin)
+    iy = screen_height - icon_size - margin
+    r = pygame.Rect(ix, iy, icon_size, icon_size)
+    if is_paused:
+        bg, border, tc, l1, l2 = (60, 50, 10), (180, 150, 30), (255, 210, 70), "▶", "RES."
+    elif is_active:
+        bg, border, tc, l1, l2 = (20, 50, 28), (55, 150, 70), (140, 230, 160), "II", "PAUSE"
+    else:
+        bg, border, tc, l1, l2 = (18, 22, 18), (35, 45, 38), (65, 80, 68), "II", "PAUSE"
+    pygame.draw.rect(windowSurfaceObj, bg, r, border_radius=8)
+    pygame.draw.rect(windowSurfaceObj, border, r, 2, border_radius=8)
+    ck = 18
+    if ck not in _font_cache: _font_cache[ck] = pygame.font.Font(None, ck)
+    f = _font_cache[ck]
+    cx, cy = r.centerx, r.centery
+    windowSurfaceObj.blit(f.render(l1, True, tc), f.render(l1, True, tc).get_rect(centerx=cx, centery=cy-8))
+    windowSurfaceObj.blit(f.render(l2, True, tc), f.render(l2, True, tc).get_rect(centerx=cx, centery=cy+8))
+    return r
+
+
+def draw_files_progress_info(screen_width, screen_height):
+    """Affiche le répertoire courant et la progression N/total au centre-haut."""
+    global windowSurfaceObj, _font_cache, files_dir, files_list, files_index, files_active
+    slider_w = 400; slider_h = 26
+    sx = (screen_width - slider_w) // 2
+    sy = 14
+    ck = 20
+    if ck not in _font_cache: _font_cache[ck] = pygame.font.Font(None, ck)
+    f = _font_cache[ck]
+    # Afficher le répertoire (tronqué)
+    _dir_str = files_dir
+    if len(_dir_str) > 38:
+        _dir_str = "..." + _dir_str[-35:]
+    _total = len(files_list)
+    _done  = min(files_index, _total)
+    _prog_str = f"{_done}/{_total}" if _total > 0 else "Aucun fichier"
+    # Fond semi-transparent
+    _bg = pygame.Surface((slider_w, 56), pygame.SRCALPHA)
+    _bg.fill((10, 25, 14, 190))
+    windowSurfaceObj.blit(_bg, (sx, sy))
+    pygame.draw.rect(windowSurfaceObj, (40, 110, 55), (sx, sy, slider_w, 56), 1, border_radius=4)
+    windowSurfaceObj.blit(f.render(_dir_str, True, (80, 200, 100)),  (sx + 6, sy + 4))
+    windowSurfaceObj.blit(f.render(_prog_str, True, (150, 240, 170)), (sx + 6, sy + 28))
+    # Barre de progression
+    if _total > 0:
+        _pw = int((slider_w - 12) * _done / _total)
+        pygame.draw.rect(windowSurfaceObj, (20, 40, 24), (sx + 6, sy + 46, slider_w - 12, 6), border_radius=3)
+        if _pw > 0:
+            pygame.draw.rect(windowSurfaceObj, (60, 200, 90), (sx + 6, sy + 46, _pw, 6), border_radius=3)
+
+
+def draw_files_stats_bar(screen_width, screen_height, stats, is_paused=False):
+    global windowSurfaceObj, _font_cache
+    ck = 19
+    if ck not in _font_cache: _font_cache[ck] = pygame.font.Font(None, ck)
+    f = _font_cache[ck]
+    _acc = stats.get('accepted_frames', 0)
+    _tot = stats.get('total_frames', 0)
+    _rej = stats.get('rejected_frames', 0)
+    _lbl = f"FICHIERS: {_acc}/{_tot} acceptées  Rejetées: {_rej}"
+    if is_paused:
+        _lbl += "  [PAUSE]"
+    _s = f.render(_lbl, True, (100, 220, 130))
+    windowSurfaceObj.blit(_s, _s.get_rect(centerx=screen_width // 2, y=screen_height - 28))
+
+
+def _draw_files_tab_bar(panel_x, panel_w, y):
+    global windowSurfaceObj, _font_cache, files_settings_tab
+    _labels = ["Fich.", "Stack", "Str.", "Filtres", "Struct."]
+    n = len(_labels); tab_h = 24; tab_w = panel_w // n
+    rects = {}
+    ck = 15
+    if ck not in _font_cache: _font_cache[ck] = pygame.font.Font(None, ck)
+    f = _font_cache[ck]
+    for i, lbl in enumerate(_labels):
+        active = (files_settings_tab == i)
+        bg     = (20, 55, 30) if active else (12, 22, 14)
+        border = (60, 180, 80) if active else (28, 65, 38)
+        tc     = (140, 240, 160) if active else (65, 110, 75)
+        r = pygame.Rect(panel_x + i * tab_w, y, tab_w - 2, tab_h)
+        pygame.draw.rect(windowSurfaceObj, bg, r, border_radius=4)
+        pygame.draw.rect(windowSurfaceObj, border, r, 1, border_radius=4)
+        windowSurfaceObj.blit(f.render(lbl, True, tc), f.render(lbl, True, tc).get_rect(center=r.center))
+        rects[f'fx_tab_{i}'] = r
+    return rects, y + tab_h + 4
+
+
+def draw_files_controls(screen_width, screen_height):
+    """Panneau de réglages FILES — partage les globals galaxy pour le pipeline."""
+    global windowSurfaceObj, _font_cache, files_settings_tab, files_dir
+    global galaxy_stack_method, galaxy_stack_kappa, galaxy_stack_iterations
+    global galaxy_enable_qc, galaxy_max_fwhm, galaxy_min_sharpness, galaxy_max_drift, galaxy_min_stars
+    global galaxy_alignment_mode, galaxy_gradient_removal
+    global galaxy_gradient_flat_strength, galaxy_gradient_poly_degree, galaxy_gradient_sigma
+    global stretch_preset, ghs_D, ghs_b, ghs_SP, ghs_LP, ghs_HP
+    global stretch_factor, stretch_p_low, stretch_p_high
+    global log_factor, mtf_shadows, mtf_midtone, mtf_highlights
+    global galaxy_color_enabled, galaxy_r_gain, galaxy_g_gain, galaxy_b_gain
+    global ls_lucky_clahe_en, ls_lucky_clahe_str, ls_lucky_clahe_tile
+    global ls_lucky_usm_en, ls_lucky_usm_sigma, ls_lucky_usm_amount
+    global ls_lucky_lr_en, ls_lucky_lr_iter, ls_lucky_lr_sigma
+    global ls_lucky_mm_en, ls_lucky_mm_iter, ls_lucky_mm_sigma, ls_lucky_mm_lambda
+    global ls_lucky_wpsf_en, ls_lucky_wpsf_iter
+    global ls_wpsf_aperture, ls_wpsf_obstruction, ls_wpsf_pixel_scale, ls_wpsf_seeing
+    global ls_wpsf_defocus, ls_wpsf_astig_x, ls_wpsf_astig_y, ls_wpsf_spherical
+    global ls_post_red, ls_post_green, ls_post_blue, ls_post_sat, ls_post_brightness
+    global debayer_vng, ls_bl_per_channel_enable, ls_bl_r, ls_bl_g1, ls_bl_g2, ls_bl_b
+    global isp_black_level, fix_bad_pixels, fix_bad_pixels_sigma
+    global galaxy_filter_en, galaxy_filter_preset, galaxy_filter_enh, galaxy_filter_usm
+    global galaxy_filter_star_r, galaxy_filter_star_k, galaxy_filter_n_scales
+    global GALAXY_FILTER_PRESETS
+
+    panel_w = 260; panel_m = 10
+    panel_x = screen_width - panel_w - panel_m
+    start_y = 80; slider_w = panel_w - 10; slider_h = 26; margin = 4
+    control_rects = {}
+
+    _ph = screen_height - start_y - 70
+    surf = pygame.Surface((panel_w, _ph), pygame.SRCALPHA)
+    surf.fill((12, 28, 16, 205))
+    windowSurfaceObj.blit(surf, (panel_x, start_y - 10))
+
+    ck_t = 24
+    if ck_t not in _font_cache: _font_cache[ck_t] = pygame.font.Font(None, ck_t)
+    ck_s = 19
+    if ck_s not in _font_cache: _font_cache[ck_s] = pygame.font.Font(None, ck_s)
+
+    windowSurfaceObj.blit(_font_cache[ck_t].render("FICHIERS", True, (100, 220, 130)), (panel_x, start_y - 15))
+    start_y += 16
+
+    tab_rects, start_y = _draw_files_tab_bar(panel_x, panel_w, start_y)
+    control_rects.update(tab_rects)
+
+    # ── Tab 0 : Sélection fichiers ─────────────────────────────────────────
+    if files_settings_tab == 0:
+        ck_s2 = 18
+        if ck_s2 not in _font_cache: _font_cache[ck_s2] = pygame.font.Font(None, ck_s2)
+        # Dossier courant
+        windowSurfaceObj.blit(_font_cache[ck_s].render("Dossier source", True, (80, 190, 100)), (panel_x + 2, start_y))
+        start_y += 16
+        _dn = files_dir if len(files_dir) <= 28 else "..." + files_dir[-25:]
+        windowSurfaceObj.blit(_font_cache[ck_s2].render(_dn, True, (150, 220, 160)), (panel_x + 4, start_y))
+        start_y += 18
+        # Bouton "Choisir dossier"
+        _br = pygame.Rect(panel_x + 4, start_y, slider_w - 8, 28)
+        pygame.draw.rect(windowSurfaceObj, (20, 60, 32), _br, border_radius=6)
+        pygame.draw.rect(windowSurfaceObj, (55, 160, 75), _br, 1, border_radius=6)
+        windowSurfaceObj.blit(_font_cache[ck_s].render("Choisir dossier", True, (100, 220, 130)),
+                              _font_cache[ck_s].render("Choisir dossier", True, (100, 220, 130)).get_rect(center=_br.center))
+        control_rects['fx_choose_dir'] = _br
+        start_y += 34
+        # Fichiers trouvés
+        _total = len(files_list)
+        _done  = min(files_index, _total)
+        windowSurfaceObj.blit(_font_cache[ck_s].render(f"{_total} fichier(s) trouvé(s)", True, (80, 200, 100)), (panel_x + 2, start_y))
+        start_y += 18
+        windowSurfaceObj.blit(_font_cache[ck_s].render(f"Traités: {_done}/{_total}", True, (120, 210, 140)), (panel_x + 2, start_y))
+        start_y += 22
+        # Bouton Rescanner
+        _rr = pygame.Rect(panel_x + 4, start_y, slider_w - 8, 28)
+        pygame.draw.rect(windowSurfaceObj, (16, 45, 24), _rr, border_radius=6)
+        pygame.draw.rect(windowSurfaceObj, (40, 120, 55), _rr, 1, border_radius=6)
+        windowSurfaceObj.blit(_font_cache[ck_s].render("Rescanner dossier", True, (80, 180, 100)),
+                              _font_cache[ck_s].render("Rescanner dossier", True, (80, 180, 100)).get_rect(center=_rr.center))
+        control_rects['fx_rescan'] = _rr
+        start_y += 34
+        # Alignement
+        windowSurfaceObj.blit(_font_cache[ck_s].render("Alignement", True, (80, 190, 100)), (panel_x + 2, start_y))
+        start_y += 16
+        _an = ['OFF', 'Translation']
+        control_rects['gx_alignment_mode'] = draw_jsk_slider(
+            panel_x, start_y, slider_w, slider_h,
+            f"Align: {_an[galaxy_alignment_mode]}", galaxy_alignment_mode, 0, 1, (50, 160, 80))
+        start_y += slider_h + margin
+        # Formats supportés
+        start_y += 6
+        windowSurfaceObj.blit(_font_cache[ck_s].render("Formats: DNG FITS SER PNG JPEG", True, (60, 130, 75)), (panel_x + 2, start_y))
+
+    # ── Tab 1 : Stack + QC ────────────────────────────────────────────────
+    elif files_settings_tab == 1:
+        _sm = ['Mean', 'Median', 'Kappa-σ', 'Winsor.', 'Wght']
+        windowSurfaceObj.blit(_font_cache[ck_s].render("Méthode de stacking", True, (80, 190, 100)), (panel_x + 2, start_y))
+        start_y += 16
+        control_rects['gx_stack_method'] = draw_jsk_slider(
+            panel_x, start_y, slider_w, slider_h,
+            f"Méthode: {_sm[min(galaxy_stack_method, 4)]}", galaxy_stack_method, 0, 4, (50, 160, 90))
+        start_y += slider_h + margin
+        if galaxy_stack_method >= 2:
+            control_rects['gx_stack_kappa'] = draw_jsk_slider(
+                panel_x, start_y, slider_w, slider_h,
+                f"Kappa: {galaxy_stack_kappa/10:.1f}", galaxy_stack_kappa, 10, 50, (60, 150, 85))
+            start_y += slider_h + margin
+            control_rects['gx_stack_iterations'] = draw_jsk_slider(
+                panel_x, start_y, slider_w, slider_h,
+                f"Itérations: {galaxy_stack_iterations}", galaxy_stack_iterations, 1, 10, (60, 150, 85))
+            start_y += slider_h + margin
+        start_y += 8
+        windowSurfaceObj.blit(_font_cache[ck_s].render("Contrôle qualité", True, (80, 190, 100)), (panel_x + 2, start_y))
+        start_y += 16
+        control_rects['gx_enable_qc'] = draw_jsk_slider(
+            panel_x, start_y, slider_w, slider_h,
+            f"QC: {'ON' if galaxy_enable_qc else 'OFF'}", galaxy_enable_qc, 0, 1, (70, 170, 95))
+        start_y += slider_h + margin
+        if galaxy_enable_qc:
+            control_rects['gx_max_fwhm'] = draw_jsk_slider(
+                panel_x, start_y, slider_w, slider_h,
+                f"FWHM max: {galaxy_max_fwhm/10:.1f}px", galaxy_max_fwhm, 0, 250, (55, 145, 75))
+            start_y += slider_h + margin
+            control_rects['gx_min_sharpness'] = draw_jsk_slider(
+                panel_x, start_y, slider_w, slider_h,
+                f"Sharp min: {galaxy_min_sharpness/1000:.3f}", galaxy_min_sharpness, 0, 150, (55, 145, 75))
+            start_y += slider_h + margin
+            control_rects['gx_max_drift'] = draw_jsk_slider(
+                panel_x, start_y, slider_w, slider_h,
+                f"Drift max: {galaxy_max_drift}px", galaxy_max_drift, 0, 5000, (55, 145, 75))
+            start_y += slider_h + margin
+            control_rects['gx_min_stars'] = draw_jsk_slider(
+                panel_x, start_y, slider_w, slider_h,
+                f"Étoiles min: {galaxy_min_stars}", galaxy_min_stars, 0, 50, (55, 145, 75))
+            start_y += slider_h + margin
+        start_y += 8
+        windowSurfaceObj.blit(_font_cache[ck_s].render("Gradient", True, (80, 190, 100)), (panel_x + 2, start_y))
+        start_y += 16
+        control_rects['gx_gradient'] = draw_jsk_slider(
+            panel_x, start_y, slider_w, slider_h,
+            f"Gradient BG: {'ON' if galaxy_gradient_removal else 'OFF'}", galaxy_gradient_removal, 0, 1, (60, 160, 90))
+        start_y += slider_h + margin
+        if galaxy_gradient_removal:
+            _pl = {1: 'Linéaire', 2: 'Quadrat.', 3: 'Cubique', 4: 'Quarti.'}
+            control_rects['gx_gradient_flat_strength'] = draw_jsk_slider(
+                panel_x, start_y, slider_w, slider_h,
+                f"Vignetage: {galaxy_gradient_flat_strength}%", galaxy_gradient_flat_strength, 0, 100, (50, 150, 100))
+            start_y += slider_h + margin
+            control_rects['gx_gradient_poly_degree'] = draw_jsk_slider(
+                panel_x, start_y, slider_w, slider_h,
+                f"Poly: {_pl.get(galaxy_gradient_poly_degree,'?')}", galaxy_gradient_poly_degree, 1, 4, (50, 150, 100))
+            start_y += slider_h + margin
+            control_rects['gx_gradient_sigma'] = draw_jsk_slider(
+                panel_x, start_y, slider_w, slider_h,
+                f"Sigma: {galaxy_gradient_sigma/10:.1f}", galaxy_gradient_sigma, 5, 50, (50, 150, 100))
+            start_y += slider_h + margin
+
+    # ── Tab 2 : Stretch ───────────────────────────────────────────────────
+    elif files_settings_tab == 2:
+        windowSurfaceObj.blit(_font_cache[ck_s].render("Canaux RVB", True, (80, 190, 100)), (panel_x + 2, start_y))
+        start_y += 16
+        _cc_col = (60, 200, 80) if galaxy_color_enabled else (100, 70, 70)
+        control_rects['gx_img_color_enabled'] = draw_jsk_slider(
+            panel_x, start_y, slider_w, slider_h,
+            f"Couleur: {'ON' if galaxy_color_enabled else 'OFF'}", galaxy_color_enabled, 0, 1, _cc_col)
+        start_y += slider_h + margin
+        if galaxy_color_enabled:
+            control_rects['gx_img_r_gain'] = draw_jsk_slider(
+                panel_x, start_y, slider_w, slider_h,
+                f"R: {galaxy_r_gain/100:.2f}x", galaxy_r_gain, 50, 200, (200, 80, 80))
+            start_y += slider_h + margin
+            control_rects['gx_img_g_gain'] = draw_jsk_slider(
+                panel_x, start_y, slider_w, slider_h,
+                f"G: {galaxy_g_gain/100:.2f}x", galaxy_g_gain, 50, 200, (80, 200, 80))
+            start_y += slider_h + margin
+            control_rects['gx_img_b_gain'] = draw_jsk_slider(
+                panel_x, start_y, slider_w, slider_h,
+                f"B: {galaxy_b_gain/100:.2f}x", galaxy_b_gain, 50, 200, (80, 120, 220))
+            start_y += slider_h + margin
+        start_y += 4
+        windowSurfaceObj.blit(_font_cache[ck_s].render("Stretch", True, (80, 190, 100)), (panel_x + 2, start_y))
+        start_y += 16
+        _pn = ['OFF', 'GHS', 'Arcsinh', 'Log', 'MTF']
+        control_rects['gx_img_stretch'] = draw_jsk_slider(
+            panel_x, start_y, slider_w, slider_h,
+            f"Stretch: {_pn[min(stretch_preset, 4)]}", stretch_preset, 0, 4, (60, 160, 90))
+        start_y += slider_h + margin
+        if stretch_preset == 1:
+            for _k, _lbl, _v, _mn, _mx in [
+                ('gx_str_ghs_D', f"D: {ghs_D/10:.1f}", ghs_D, -10, 100),
+                ('gx_str_ghs_b', f"b: {ghs_b/10:.1f}", ghs_b, -300, 100),
+                ('gx_str_ghs_SP', f"SP: {ghs_SP/100:.2f}", ghs_SP, 0, 100),
+                ('gx_str_ghs_LP', f"LP: {ghs_LP/100:.2f}", ghs_LP, 0, 100),
+                ('gx_str_ghs_HP', f"HP: {ghs_HP/100:.2f}", ghs_HP, 0, 100),
+            ]:
+                control_rects[_k] = draw_jsk_slider(panel_x, start_y, slider_w, slider_h, _lbl, _v, _mn, _mx, (60, 140, 180))
+                start_y += slider_h + margin
+        elif stretch_preset == 2:
+            control_rects['gx_str_asinh_factor'] = draw_jsk_slider(panel_x, start_y, slider_w, slider_h, f"Facteur: {stretch_factor/10:.1f}", stretch_factor, 0, 1500, (150, 140, 90))
+            start_y += slider_h + margin
+        elif stretch_preset == 3:
+            control_rects['gx_img_log_factor'] = draw_jsk_slider(panel_x, start_y, slider_w, slider_h, f"Facteur Log: {log_factor}", log_factor, 0, 1000, (120, 160, 80))
+            start_y += slider_h + margin
+        elif stretch_preset == 4:
+            for _k, _lbl, _v, _mn, _mx in [
+                ('gx_img_mtf_shadows',    f"Shadows: {mtf_shadows/100:.2f}",    mtf_shadows,    0, 50),
+                ('gx_img_mtf_midtone',    f"Midtone: {mtf_midtone/100:.2f}",    mtf_midtone,    1, 99),
+                ('gx_img_mtf_highlights', f"Highlights: {mtf_highlights/100:.2f}", mtf_highlights, 50, 100),
+            ]:
+                control_rects[_k] = draw_jsk_slider(panel_x, start_y, slider_w, slider_h, _lbl, _v, _mn, _mx, (80, 120, 200))
+                start_y += slider_h + margin
+
+    # ── Tab 3 : Filtres post-stack ────────────────────────────────────────
+    elif files_settings_tab == 3:
+        slider_h = 22; margin = 2
+        windowSurfaceObj.blit(_font_cache[ck_s].render("CLAHE (contraste local)", True, (80, 190, 100)), (panel_x + 2, start_y))
+        start_y += 16
+        control_rects['gx_clahe_en'] = draw_jsk_slider(panel_x, start_y, slider_w, slider_h, f"CLAHE: {'ON' if ls_lucky_clahe_en else 'OFF'}", ls_lucky_clahe_en, 0, 1, (60, 150, 80))
+        start_y += slider_h + margin
+        control_rects['gx_clahe_str'] = draw_jsk_slider(panel_x, start_y, slider_w, slider_h, f"Force: {ls_lucky_clahe_str/10:.1f}", ls_lucky_clahe_str, 5, 40, (60, 150, 80))
+        start_y += slider_h + margin
+        control_rects['gx_clahe_tile'] = draw_jsk_slider(panel_x, start_y, slider_w, slider_h, f"Tile: {ls_lucky_clahe_tile}px", ls_lucky_clahe_tile, 4, 32, (60, 150, 80))
+        start_y += slider_h + margin + 2
+        windowSurfaceObj.blit(_font_cache[ck_s].render("Unsharp Mask", True, (170, 130, 80)), (panel_x + 2, start_y))
+        start_y += 16
+        control_rects['gx_usm_en'] = draw_jsk_slider(panel_x, start_y, slider_w, slider_h, f"USM: {'ON' if ls_lucky_usm_en else 'OFF'}", ls_lucky_usm_en, 0, 1, (150, 120, 60))
+        start_y += slider_h + margin
+        control_rects['gx_usm_sigma'] = draw_jsk_slider(panel_x, start_y, slider_w, slider_h, f"Sigma: {ls_lucky_usm_sigma/10:.1f}", ls_lucky_usm_sigma, 5, 50, (150, 120, 60))
+        start_y += slider_h + margin
+        control_rects['gx_usm_amount'] = draw_jsk_slider(panel_x, start_y, slider_w, slider_h, f"Intensité: {ls_lucky_usm_amount/10:.1f}", ls_lucky_usm_amount, 0, 50, (150, 120, 60))
+        start_y += slider_h + margin + 2
+        _dm_names = ['OFF', 'Lucy-Rich.', 'Multi-Max', 'WavePSF']
+        _dm = (0 if not ls_lucky_lr_en and not ls_lucky_mm_en and not ls_lucky_wpsf_en
+               else 1 if ls_lucky_lr_en else 2 if ls_lucky_mm_en else 3)
+        windowSurfaceObj.blit(_font_cache[ck_s].render("Déconvolution", True, (130, 140, 180)), (panel_x + 2, start_y))
+        start_y += 16
+        control_rects['gx_deconv_mode'] = draw_jsk_slider(panel_x, start_y, slider_w, slider_h, f"Mode: {_dm_names[_dm]}", _dm, 0, 3, (90, 110, 180))
+        start_y += slider_h + margin
+        if _dm == 3:
+            _wc = (60, 150, 130)
+            control_rects['gx_wpsf_iter'] = draw_jsk_slider(panel_x, start_y, slider_w, slider_h, f"Iter RL: {ls_lucky_wpsf_iter}", ls_lucky_wpsf_iter, 5, 50, _wc)
+            start_y += slider_h + margin
+            control_rects['gx_wpsf_aperture'] = draw_jsk_slider(panel_x, start_y, slider_w, slider_h, f"Diam. {ls_wpsf_aperture}mm", ls_wpsf_aperture, 50, 1000, _wc)
+            start_y += slider_h + margin
+            control_rects['gx_wpsf_obstruction'] = draw_jsk_slider(panel_x, start_y, slider_w, slider_h, f"Obstr. {ls_wpsf_obstruction}%", ls_wpsf_obstruction, 0, 50, _wc)
+            start_y += slider_h + margin
+            control_rects['gx_wpsf_pixel_scale'] = draw_jsk_slider(panel_x, start_y, slider_w, slider_h, f"Échelle {ls_wpsf_pixel_scale/100:.2f}\"/px", ls_wpsf_pixel_scale, 5, 200, _wc)
+            start_y += slider_h + margin
+            control_rects['gx_wpsf_seeing'] = draw_jsk_slider(panel_x, start_y, slider_w, slider_h, f"Seeing {ls_wpsf_seeing/10:.1f}\"" if ls_wpsf_seeing > 0 else "Seeing OFF", ls_wpsf_seeing, 0, 30, _wc)
+            start_y += slider_h + margin
+        start_y += 4
+        windowSurfaceObj.blit(_font_cache[ck_s].render("Balance couleur", True, (160, 140, 200)), (panel_x + 2, start_y))
+        start_y += 16
+        for _k, _lbl, _v, _mn, _mx, _c in [
+            ('gx_post_red',        f"Rouge: {ls_post_red}%",          ls_post_red,        50, 200, (200, 80,  80)),
+            ('gx_post_green',      f"Vert: {ls_post_green}%",         ls_post_green,      50, 200, (80,  200, 80)),
+            ('gx_post_blue',       f"Bleu: {ls_post_blue}%",          ls_post_blue,       50, 200, (80,  80,  200)),
+            ('gx_post_sat',        f"Sat: {ls_post_sat}%",            ls_post_sat,        0,  300, (180, 140, 200)),
+            ('gx_post_brightness', f"Bright: {ls_post_brightness:+d}", ls_post_brightness, -100, 100, (160, 160, 200)),
+        ]:
+            control_rects[_k] = draw_jsk_slider(panel_x, start_y, slider_w, slider_h, _lbl, _v, _mn, _mx, _c)
+            start_y += slider_h + margin
+
+    # ── Tab 4 : Structure galactique ─────────────────────────────────────
+    elif files_settings_tab == 4:
+        slider_h = 22; margin = 2
+        _tc = (80, 210, 190); _ce = (50, 170, 150); _cp = (60, 140, 190)
+        _cenh = (80, 180, 155); _cusm = (60, 150, 200); _csr = (130, 160, 80)
+        _csk = (110, 140, 60); _cns = (80, 120, 160)
+        windowSurfaceObj.blit(_font_cache[ck_s].render("Structure galactique", True, _tc), (panel_x + 2, start_y))
+        start_y += 16
+        control_rects['gx_struct_en'] = draw_jsk_slider(panel_x, start_y, slider_w, slider_h,
+            f"Filtre: {'ON' if galaxy_filter_en else 'OFF'}", galaxy_filter_en, 0, 1, _ce)
+        start_y += slider_h + margin + 4
+        _pnames = [p['name'] for p in GALAXY_FILTER_PRESETS]
+        _pname  = _pnames[galaxy_filter_preset] if galaxy_filter_preset < len(_pnames) else '?'
+        control_rects['gx_struct_preset'] = draw_jsk_slider(panel_x, start_y, slider_w, slider_h,
+            f"Type: {_pname}", galaxy_filter_preset, 0, len(GALAXY_FILTER_PRESETS) - 1, _cp)
+        start_y += slider_h + margin + 4
+        windowSurfaceObj.blit(_font_cache[ck_s].render("Enhancement (Frangi+gamma)", True, _tc), (panel_x + 2, start_y))
+        start_y += 16
+        control_rects['gx_struct_enh'] = draw_jsk_slider(panel_x, start_y, slider_w, slider_h,
+            f"Intensité: {galaxy_filter_enh/10:.1f}", galaxy_filter_enh, 0, 40, _cenh)
+        start_y += slider_h + margin
+        windowSurfaceObj.blit(_font_cache[ck_s].render("Détails (USM multi-échelle)", True, _tc), (panel_x + 2, start_y))
+        start_y += 16
+        control_rects['gx_struct_usm'] = draw_jsk_slider(panel_x, start_y, slider_w, slider_h,
+            f"Détails: {galaxy_filter_usm/10:.1f}", galaxy_filter_usm, 0, 40, _cusm)
+        start_y += slider_h + margin + 4
+        windowSurfaceObj.blit(_font_cache[ck_s].render("Réduction étoiles", True, _tc), (panel_x + 2, start_y))
+        start_y += 16
+        control_rects['gx_struct_star_r'] = draw_jsk_slider(panel_x, start_y, slider_w, slider_h,
+            f"Force: {galaxy_filter_star_r}%", galaxy_filter_star_r, 0, 100, _csr)
+        start_y += slider_h + margin
+        control_rects['gx_struct_star_k'] = draw_jsk_slider(panel_x, start_y, slider_w, slider_h,
+            f"Taille: {galaxy_filter_star_k}px", galaxy_filter_star_k, 3, 15, _csk)
+        start_y += slider_h + margin + 4
+        windowSurfaceObj.blit(_font_cache[ck_s].render("Qualité / vitesse", True, _tc), (panel_x + 2, start_y))
+        start_y += 16
+        control_rects['gx_struct_nscales'] = draw_jsk_slider(panel_x, start_y, slider_w, slider_h,
+            f"Échelles: {galaxy_filter_n_scales}", galaxy_filter_n_scales, 2, 6, _cns)
+        start_y += slider_h + margin
+
+    return control_rects
+
+
+def draw_files_browser(screen_width, screen_height):
+    """
+    Overlay de navigation de dossiers.
+    Affiche les sous-dossiers du répertoire courant + bouton parent.
+    """
+    global windowSurfaceObj, _font_cache, files_dir, files_browser_scroll
+    _bw = 500; _bh = 400
+    _bx = (screen_width - _bw) // 2
+    _by = (screen_height - _bh) // 2
+    # Fond
+    _bg = pygame.Surface((_bw, _bh), pygame.SRCALPHA)
+    _bg.fill((8, 22, 12, 235))
+    windowSurfaceObj.blit(_bg, (_bx, _by))
+    pygame.draw.rect(windowSurfaceObj, (50, 160, 70), (_bx, _by, _bw, _bh), 2, border_radius=8)
+    ck = 20
+    if ck not in _font_cache: _font_cache[ck] = pygame.font.Font(None, ck)
+    ck2 = 18
+    if ck2 not in _font_cache: _font_cache[ck2] = pygame.font.Font(None, ck2)
+    f  = _font_cache[ck]
+    f2 = _font_cache[ck2]
+    rects = {}
+    y = _by + 10
+    # Titre + chemin courant
+    windowSurfaceObj.blit(f.render("Choisir dossier", True, (100, 220, 130)), (_bx + 10, y)); y += 24
+    _dn = files_dir if len(files_dir) <= 50 else "..." + files_dir[-47:]
+    windowSurfaceObj.blit(f2.render(_dn, True, (150, 210, 160)), (_bx + 10, y)); y += 22
+    # Bouton parent
+    _pr = pygame.Rect(_bx + 10, y, _bw - 20, 28)
+    pygame.draw.rect(windowSurfaceObj, (25, 65, 35), _pr, border_radius=5)
+    pygame.draw.rect(windowSurfaceObj, (60, 160, 75), _pr, 1, border_radius=5)
+    windowSurfaceObj.blit(f2.render("↑  Dossier parent", True, (120, 230, 140)), (_bx + 18, y + 6))
+    rects['fb_parent'] = _pr
+    y += 34
+    # Liste des sous-dossiers
+    try:
+        _entries = sorted([
+            d for d in os.listdir(files_dir)
+            if os.path.isdir(os.path.join(files_dir, d)) and not d.startswith('.')
+        ])
+    except Exception:
+        _entries = []
+    _item_h = 30; _max_vis = (_bh - (y - _by) - 50) // _item_h
+    _scroll  = max(0, min(files_browser_scroll, max(0, len(_entries) - _max_vis)))
+    files_browser_scroll = _scroll
+    for i, dn in enumerate(_entries[_scroll: _scroll + _max_vis]):
+        _ir = pygame.Rect(_bx + 10, y, _bw - 20, _item_h - 2)
+        pygame.draw.rect(windowSurfaceObj, (15, 40, 20), _ir, border_radius=4)
+        pygame.draw.rect(windowSurfaceObj, (35, 90, 48), _ir, 1, border_radius=4)
+        windowSurfaceObj.blit(f2.render(f"📁 {dn}", True, (110, 210, 130)), (_bx + 18, y + 7))
+        rects[f'fb_dir_{_scroll + i}'] = (_ir, os.path.join(files_dir, dn))
+        y += _item_h
+    # Bouton Choisir ce dossier
+    y = _by + _bh - 44
+    _sr = pygame.Rect(_bx + 10, y, (_bw - 30) // 2, 32)
+    pygame.draw.rect(windowSurfaceObj, (20, 80, 35), _sr, border_radius=6)
+    pygame.draw.rect(windowSurfaceObj, (60, 200, 80), _sr, 1, border_radius=6)
+    windowSurfaceObj.blit(f.render("Sélectionner", True, (100, 240, 130)),
+                          f.render("Sélectionner", True, (100, 240, 130)).get_rect(center=_sr.center))
+    rects['fb_select'] = _sr
+    # Bouton Annuler
+    _cr = pygame.Rect(_bx + 20 + (_bw - 30) // 2, y, (_bw - 30) // 2, 32)
+    pygame.draw.rect(windowSurfaceObj, (55, 28, 28), _cr, border_radius=6)
+    pygame.draw.rect(windowSurfaceObj, (130, 60, 60), _cr, 1, border_radius=6)
+    windowSurfaceObj.blit(f.render("Annuler", True, (220, 140, 140)),
+                          f.render("Annuler", True, (220, 140, 140)).get_rect(center=_cr.center))
+    rects['fb_cancel'] = _cr
+    return rects
+
+
+def draw_files_interface(screen_width, screen_height):
+    """Dessine tous les éléments de l'interface FILES."""
+    global _files_slider_rects, files_settings_visible, files_active, files_livestack
+    global files_paused, files_browser_visible
+
+    _has_stack = False
+    if files_livestack is not None:
+        try:
+            _has_stack = files_livestack.get_stats().get('accepted_frames', 0) > 0
+        except Exception:
+            pass
+
+    draw_files_settings_icon(screen_width, screen_height, files_settings_visible == 1)
+    draw_files_start_stop_button(screen_width, screen_height, files_active)
+    draw_files_save_fit_button(screen_width, screen_height, _has_stack or files_paused)
+    draw_files_save_png_button(screen_width, screen_height)
+    draw_files_exit_button(screen_width, screen_height)
+    draw_files_reset_button(screen_width, screen_height)
+    draw_files_pause_button(screen_width, screen_height, files_paused, files_active)
+    draw_files_progress_info(screen_width, screen_height)
+
+    if (files_active or files_paused) and files_livestack is not None:
+        try:
+            draw_files_stats_bar(screen_width, screen_height,
+                                 files_livestack.get_stats(), is_paused=files_paused)
+        except Exception:
+            pass
+
+    if files_settings_visible == 1:
+        _files_slider_rects = draw_files_controls(screen_width, screen_height)
+    else:
+        _files_slider_rects = {}
+
+    if files_browser_visible:
+        _files_browser_rects = draw_files_browser(screen_width, screen_height)
+    else:
+        _files_browser_rects = {}
+    return _files_browser_rects
+
+
+def handle_files_slider_click(mx, my, control_rects):
+    """Gère les clics sur le panneau FILES. Retourne True si géré."""
+    global files_settings_tab, files_last_filtered_array
+    for name, rect in control_rects.items():
+        if not rect.collidepoint(mx, my):
+            continue
+        # Onglets FILES
+        if name.startswith('fx_tab_'):
+            files_settings_tab = int(name.split('_')[-1])
+            return True
+        # Contrôles partagés avec galaxy → déléguer
+        _handled = handle_galaxy_slider_click(mx, my, control_rects)
+        if _handled:
+            # Invalider le cache pour forcer un recalcul en mode pause
+            files_last_filtered_array = None
+        return _handled
+    return False
+
+
+# ── is_click helpers pour FILES ──────────────────────────────────────────────
+def _files_btn_rect(screen_width, screen_height, slot):
+    """Retourne le Rect d'un bouton FILES standard par slot (0=SET,1=START,...)."""
+    icon_size = 50; margin = 15
+    if slot == 'set':
+        return pygame.Rect(margin, margin, icon_size, icon_size)
+    if slot == 'start':
+        return pygame.Rect(margin + icon_size + margin, margin, icon_size, icon_size)
+    if slot == 'fit':
+        return pygame.Rect(screen_width - icon_size - margin, margin, icon_size, icon_size)
+    if slot == 'png':
+        return pygame.Rect(screen_width - 2*icon_size - 2*margin, margin, icon_size, icon_size)
+    if slot == 'exit':
+        return pygame.Rect(margin, screen_height - icon_size - margin, icon_size, icon_size)
+    if slot == 'rst':
+        return pygame.Rect(margin + icon_size + margin, screen_height - icon_size - margin, icon_size, icon_size)
+    if slot == 'pause':
+        return pygame.Rect(margin + 2*(icon_size + margin), screen_height - icon_size - margin, icon_size, icon_size)
+    return None
+
+def is_click_on_files_settings(mx, my): r = _files_btn_rect(0, 0, 'set');   return r is not None and r.collidepoint(mx, my)
+def is_click_on_files_start(mx, my):    r = _files_btn_rect(0, 0, 'start'); return r is not None and r.collidepoint(mx, my)
+def is_click_on_files_save_fit(mx, my, sw, sh): r = _files_btn_rect(sw, sh, 'fit'); return r is not None and r.collidepoint(mx, my)
+def is_click_on_files_save_png(mx, my, sw, sh): r = _files_btn_rect(sw, sh, 'png'); return r is not None and r.collidepoint(mx, my)
+def is_click_on_files_exit(mx, my, sw, sh):  r = _files_btn_rect(sw, sh, 'exit');  return r is not None and r.collidepoint(mx, my)
+def is_click_on_files_reset(mx, my, sw, sh): r = _files_btn_rect(sw, sh, 'rst');   return r is not None and r.collidepoint(mx, my)
+def is_click_on_files_pause(mx, my, sw, sh): r = _files_btn_rect(sw, sh, 'pause'); return r is not None and r.collidepoint(mx, my)
+
+
+def handle_galaxy_slider_click(mx, my, control_rects):
+    """Gère le clic sur un slider du panneau GALAXY. Retourne True si géré."""
+    global galaxy_settings_tab, galaxy_hdr_bits_clip, galaxy_hdr_weights
+    global galaxy_stack_method, galaxy_stack_kappa, galaxy_stack_iterations
+    global galaxy_enable_qc, galaxy_max_fwhm, galaxy_min_sharpness, galaxy_max_drift, galaxy_min_stars
+    global galaxy_preview_refresh, galaxy_gradient_removal, galaxy_alignment_mode
+    global stretch_preset, stretch_factor, stretch_p_low, stretch_p_high
+    global ghs_D, ghs_b, ghs_SP, ghs_LP, ghs_HP
+    global log_factor, mtf_shadows, mtf_midtone, mtf_highlights
+    global isp_brightness, isp_contrast, isp_saturation
+    global isp_black_level, debayer_vng, ls_bl_per_channel_enable
+    global ls_bl_r, ls_bl_g1, ls_bl_g2, ls_bl_b
+    global fix_bad_pixels, fix_bad_pixels_sigma
+    global ls_lucky_clahe_en, ls_lucky_clahe_str, ls_lucky_clahe_tile
+    global ls_lucky_usm_en, ls_lucky_usm_sigma, ls_lucky_usm_amount
+    global ls_lucky_lr_en, ls_lucky_lr_iter, ls_lucky_lr_sigma
+    global ls_lucky_mm_en, ls_lucky_mm_iter, ls_lucky_mm_sigma, ls_lucky_mm_lambda
+    global ls_lucky_wpsf_en, ls_lucky_wpsf_iter
+    global ls_wpsf_aperture, ls_wpsf_pixel_scale, ls_wpsf_seeing
+    global ls_post_red, ls_post_green, ls_post_blue, ls_post_sat, ls_post_brightness
+    global galaxy_paused, galaxy_pre_filter_array, galaxy_last_filtered_array
+    global galaxy_livestack
+    global galaxy_gradient_flat_strength, galaxy_gradient_poly_degree, galaxy_gradient_sigma
+    global galaxy_color_enabled, galaxy_r_gain, galaxy_g_gain, galaxy_b_gain
+    global galaxy_filter_en, galaxy_filter_preset, galaxy_filter_enh
+    global galaxy_filter_usm, galaxy_filter_star_r, galaxy_filter_star_k, galaxy_filter_n_scales
+    global galaxy_save_raws
+
+    for name, rect in control_rects.items():
+        if rect.collidepoint(mx, my):
+            ratio = max(0.0, min(1.0, (mx - rect.x) / rect.width))
+
+            # --- Tab switch ---
+            if name.startswith('gx_tab_'):
+                galaxy_settings_tab = int(name[-1])
+
+            # --- Tab 0: Capture ---
+            elif name == 'gx_alignment_mode':
+                galaxy_alignment_mode = 1 if ratio > 0.5 else 0
+                if galaxy_livestack is not None:
+                    _am = "translation" if galaxy_alignment_mode == 1 else "none"
+                    galaxy_livestack.configure(alignment_mode=_am)
+            elif name == 'gx_preview_refresh':
+                galaxy_preview_refresh = max(1, min(10, int(ratio * 9) + 1))
+                if galaxy_livestack is not None:
+                    galaxy_livestack.configure(preview_refresh=galaxy_preview_refresh)
+            elif name == 'gx_raw_debayer':
+                debayer_vng = 1 if ratio > 0.5 else 0
+            elif name == 'gx_raw_bl_mode':
+                ls_bl_per_channel_enable = max(0, min(2, int(ratio * 2 + 0.5)))
+            elif name == 'gx_raw_black_level':
+                if ls_bl_per_channel_enable == 0:
+                    isp_black_level = int(ratio * 500)
+            elif name == 'gx_raw_bl_r':
+                ls_bl_r = int(ratio * 512)
+            elif name == 'gx_raw_bl_g1':
+                ls_bl_g1 = int(ratio * 512)
+            elif name == 'gx_raw_bl_g2':
+                ls_bl_g2 = int(ratio * 512)
+            elif name == 'gx_raw_bl_b':
+                ls_bl_b = int(ratio * 512)
+            elif name == 'gx_raw_fix_bad':
+                fix_bad_pixels = 1 if ratio > 0.5 else 0
+            elif name == 'gx_raw_fix_sig':
+                fix_bad_pixels_sigma = max(10, int(10 + ratio * 90 + 0.5))
+            elif name == 'gx_save_raws':
+                galaxy_save_raws = 1 if ratio > 0.5 else 0
+                print(f"[GALAXY] Sauvegarde RAW: {'ON' if galaxy_save_raws else 'OFF'}")
+
+            # --- Tab 1: HDR ---
+            elif name == 'gx_hdr_clip':
+                galaxy_hdr_bits_clip = max(0, min(3, int(ratio * 3 + 0.5)))
+            elif name.startswith('gx_hdr_w'):
+                idx = int(name[-1])
+                if idx < len(galaxy_hdr_weights):
+                    galaxy_hdr_weights[idx] = max(0, min(100, int(ratio * 100)))
+
+            # --- Tab 2: Stacking + QC ---
+            elif name == 'gx_stack_method':
+                galaxy_stack_method = max(0, min(4, int(ratio * 4 + 0.5)))
+                if galaxy_livestack is not None:
+                    _method_names = ['mean', 'median', 'kappa_sigma', 'winsorized', 'weighted']
+                    galaxy_livestack.configure(
+                        stacking_method=_method_names[galaxy_stack_method])
+            elif name == 'gx_stack_kappa':
+                galaxy_stack_kappa = max(10, min(50, int(10 + ratio * 40 + 0.5)))
+                if galaxy_livestack is not None:
+                    galaxy_livestack.configure(kappa=galaxy_stack_kappa / 10.0)
+            elif name == 'gx_stack_iterations':
+                galaxy_stack_iterations = max(1, min(10, int(ratio * 9) + 1))
+                if galaxy_livestack is not None:
+                    galaxy_livestack.configure(iterations=galaxy_stack_iterations)
+            elif name == 'gx_enable_qc':
+                galaxy_enable_qc = 1 if ratio > 0.5 else 0
+                if galaxy_livestack is not None:
+                    galaxy_livestack.configure(enable_qc=bool(galaxy_enable_qc))
+            elif name == 'gx_max_fwhm':
+                galaxy_max_fwhm = int(ratio * 250)
+                if galaxy_livestack is not None:
+                    galaxy_livestack.configure(max_fwhm=galaxy_max_fwhm/10.0 if galaxy_max_fwhm > 0 else 999.0)
+            elif name == 'gx_min_sharpness':
+                galaxy_min_sharpness = int(ratio * 150)
+                if galaxy_livestack is not None:
+                    galaxy_livestack.configure(min_sharpness=galaxy_min_sharpness/1000.0 if galaxy_min_sharpness > 0 else 0.0)
+            elif name == 'gx_max_drift':
+                galaxy_max_drift = int(ratio * 5000)
+                if galaxy_livestack is not None:
+                    galaxy_livestack.configure(max_drift=float(galaxy_max_drift) if galaxy_max_drift > 0 else 999999.0)
+            elif name == 'gx_min_stars':
+                galaxy_min_stars = max(0, min(50, int(ratio * 50)))
+                if galaxy_livestack is not None:
+                    galaxy_livestack.configure(min_stars=int(galaxy_min_stars))
+            elif name == 'gx_gradient':
+                galaxy_gradient_removal = 1 if ratio > 0.5 else 0
+                if galaxy_livestack is not None:
+                    galaxy_livestack.configure(gradient_removal=bool(galaxy_gradient_removal))
+            elif name == 'gx_gradient_flat_strength':
+                galaxy_gradient_flat_strength = int(ratio * 100)
+                if galaxy_livestack is not None:
+                    galaxy_livestack.configure(gradient_removal_flat_strength=galaxy_gradient_flat_strength)
+            elif name == 'gx_gradient_poly_degree':
+                galaxy_gradient_poly_degree = max(1, min(4, int(1 + ratio * 3 + 0.5)))
+                if galaxy_livestack is not None:
+                    galaxy_livestack.configure(gradient_removal_poly_degree=galaxy_gradient_poly_degree)
+            elif name == 'gx_gradient_sigma':
+                galaxy_gradient_sigma = max(5, min(50, int(5 + ratio * 45 + 0.5)))
+                if galaxy_livestack is not None:
+                    galaxy_livestack.configure(gradient_removal_sigma=galaxy_gradient_sigma / 10.0)
+
+            # --- Tab 3: Image / Stretch ---
+            elif name == 'gx_img_color_enabled':
+                galaxy_color_enabled = 1 if ratio >= 0.5 else 0
+            elif name == 'gx_img_r_gain':
+                galaxy_r_gain = max(50, min(200, int(50 + ratio * 150 + 0.5)))
+            elif name == 'gx_img_g_gain':
+                galaxy_g_gain = max(50, min(200, int(50 + ratio * 150 + 0.5)))
+            elif name == 'gx_img_b_gain':
+                galaxy_b_gain = max(50, min(200, int(50 + ratio * 150 + 0.5)))
+            elif name == 'gx_img_stretch':
+                stretch_preset = max(0, min(4, int(ratio * 4 + 0.5)))
+                if galaxy_livestack is not None:
+                    galaxy_livestack.configure(png_stretch=['off', 'ghs', 'asinh', 'log', 'mtf'][stretch_preset])
+            elif name == 'gx_str_ghs_D':
+                ghs_D = max(-10, min(100, int(-10 + ratio * 110 + 0.5)))
+                if galaxy_livestack is not None:
+                    galaxy_livestack.configure(ghs_D=ghs_D / 10.0)
+            elif name == 'gx_str_ghs_b':
+                ghs_b = max(-300, min(100, int(-300 + ratio * 400 + 0.5)))
+                if galaxy_livestack is not None:
+                    galaxy_livestack.configure(ghs_b=ghs_b / 10.0)
+            elif name == 'gx_str_ghs_SP':
+                ghs_SP = int(ratio * 100 + 0.5)
+                if galaxy_livestack is not None:
+                    galaxy_livestack.configure(ghs_SP=ghs_SP / 100.0)
+            elif name == 'gx_str_ghs_LP':
+                ghs_LP = int(ratio * 100 + 0.5)
+                if galaxy_livestack is not None:
+                    galaxy_livestack.configure(ghs_LP=ghs_LP / 100.0)
+            elif name == 'gx_str_ghs_HP':
+                ghs_HP = int(ratio * 100 + 0.5)
+                if galaxy_livestack is not None:
+                    galaxy_livestack.configure(ghs_HP=ghs_HP / 100.0)
+            elif name == 'gx_str_asinh_factor':
+                stretch_factor = int(ratio * 1500 + 0.5)
+                if galaxy_livestack is not None:
+                    galaxy_livestack.configure(png_factor=stretch_factor / 10.0)
+            elif name == 'gx_str_clip_low':
+                stretch_p_low = max(0, min(2, int(ratio * 2 + 0.5)))
+                if galaxy_livestack is not None:
+                    galaxy_livestack.configure(png_clip_low=stretch_p_low / 10.0)
+            elif name == 'gx_str_clip_high':
+                stretch_p_high = max(9950, min(10000, int(9950 + ratio * 50 + 0.5)))
+                if galaxy_livestack is not None:
+                    galaxy_livestack.configure(png_clip_high=stretch_p_high / 100.0)
+            elif name == 'gx_img_log_factor':
+                log_factor = int(ratio * 1000)
+                if galaxy_livestack is not None:
+                    galaxy_livestack.configure(log_factor=float(log_factor))
+            elif name == 'gx_img_mtf_shadows':
+                mtf_shadows = int(ratio * 50)
+                if galaxy_livestack is not None:
+                    galaxy_livestack.configure(mtf_shadows=mtf_shadows / 100.0)
+            elif name == 'gx_img_mtf_midtone':
+                mtf_midtone = max(1, int(ratio * 99))
+                if galaxy_livestack is not None:
+                    galaxy_livestack.configure(mtf_midtone=mtf_midtone / 100.0)
+            elif name == 'gx_img_mtf_highlights':
+                mtf_highlights = int(50 + ratio * 50)
+                if galaxy_livestack is not None:
+                    galaxy_livestack.configure(mtf_highlights=mtf_highlights / 100.0)
+
+            # --- Tab 4: Filtres ---
+            elif name == 'gx_clahe_en':
+                ls_lucky_clahe_en = 1 if ratio > 0.5 else 0
+            elif name == 'gx_clahe_str':
+                ls_lucky_clahe_str = max(5, min(40, int(5 + ratio * 35 + 0.5)))
+            elif name == 'gx_clahe_tile':
+                ls_lucky_clahe_tile = max(4, min(32, int(4 + ratio * 28 + 0.5)))
+            elif name == 'gx_usm_en':
+                ls_lucky_usm_en = 1 if ratio > 0.5 else 0
+            elif name == 'gx_usm_sigma':
+                ls_lucky_usm_sigma = max(5, min(50, int(5 + ratio * 45 + 0.5)))
+            elif name == 'gx_usm_amount':
+                ls_lucky_usm_amount = max(5, min(50, int(5 + ratio * 45 + 0.5)))
+            elif name == 'gx_deconv_mode':
+                _dm = max(0, min(3, int(ratio * 3 + 0.5)))
+                ls_lucky_lr_en   = 1 if _dm == 1 else 0
+                ls_lucky_mm_en   = 1 if _dm == 2 else 0
+                ls_lucky_wpsf_en = 1 if _dm == 3 else 0
+            elif name == 'gx_lr_iter':
+                ls_lucky_lr_iter = max(5, min(60, int(5 + ratio * 55 + 0.5)))
+            elif name == 'gx_lr_sigma':
+                ls_lucky_lr_sigma = max(5, min(30, int(5 + ratio * 25 + 0.5)))
+            elif name == 'gx_mm_iter':
+                ls_lucky_mm_iter = max(5, min(30, int(5 + ratio * 25 + 0.5)))
+            elif name == 'gx_mm_sigma':
+                ls_lucky_mm_sigma = max(3, min(15, int(3 + ratio * 12 + 0.5)))
+            elif name == 'gx_mm_lambda':
+                ls_lucky_mm_lambda = max(1, min(15, int(1 + ratio * 14 + 0.5)))
+            elif name == 'gx_wpsf_iter':
+                ls_lucky_wpsf_iter = max(5, min(50, int(5 + ratio * 45 + 0.5)))
+            elif name == 'gx_wpsf_aperture':
+                ls_wpsf_aperture = max(50, min(1000, int(50 + ratio * 950 + 0.5)))
+            elif name == 'gx_wpsf_obstruction':
+                ls_wpsf_obstruction = max(0, min(50, int(ratio * 50 + 0.5)))
+            elif name == 'gx_wpsf_pixel_scale':
+                ls_wpsf_pixel_scale = max(5, min(200, int(5 + ratio * 195 + 0.5)))
+            elif name == 'gx_wpsf_seeing':
+                ls_wpsf_seeing = max(0, min(30, int(ratio * 30 + 0.5)))
+            elif name == 'gx_wpsf_defocus':
+                ls_wpsf_defocus = max(-100, min(100, int(-100 + ratio * 200 + 0.5)))
+            elif name == 'gx_wpsf_astig_x':
+                ls_wpsf_astig_x = max(-100, min(100, int(-100 + ratio * 200 + 0.5)))
+            elif name == 'gx_wpsf_astig_y':
+                ls_wpsf_astig_y = max(-100, min(100, int(-100 + ratio * 200 + 0.5)))
+            elif name == 'gx_wpsf_spherical':
+                ls_wpsf_spherical = max(-100, min(100, int(-100 + ratio * 200 + 0.5)))
+            elif name == 'gx_post_red':
+                ls_post_red = max(50, min(200, int(50 + ratio * 150 + 0.5)))
+            elif name == 'gx_post_green':
+                ls_post_green = max(50, min(200, int(50 + ratio * 150 + 0.5)))
+            elif name == 'gx_post_blue':
+                ls_post_blue = max(50, min(200, int(50 + ratio * 150 + 0.5)))
+            elif name == 'gx_post_sat':
+                ls_post_sat = max(0, min(300, int(ratio * 300 + 0.5)))
+            elif name == 'gx_post_brightness':
+                ls_post_brightness = max(-100, min(100, int(-100 + ratio * 200 + 0.5)))
+
+            # --- Tab 5: Structure galactique ---
+            elif name == 'gx_struct_en':
+                galaxy_filter_en = 1 if ratio > 0.5 else 0
+            elif name == 'gx_struct_preset':
+                _n_presets = len(GALAXY_FILTER_PRESETS)
+                galaxy_filter_preset = int(ratio * (_n_presets - 1) + 0.5)
+                # Sync paramètres depuis preset (sans écraser les réglages fins)
+                _p = GALAXY_FILTER_PRESETS[galaxy_filter_preset]
+                galaxy_filter_enh      = int(_p['enhancement']    * 10 + 0.5)
+                galaxy_filter_usm      = int(_p['usm_strength']   * 10 + 0.5)
+                galaxy_filter_star_r   = int(_p['star_reduction'] * 100 + 0.5)
+                galaxy_filter_star_k   = int(_p['star_kernel'])
+                galaxy_filter_n_scales = int(_p['n_scales'])
+            elif name == 'gx_struct_enh':
+                galaxy_filter_enh = max(0, min(40, int(ratio * 40 + 0.5)))
+            elif name == 'gx_struct_usm':
+                galaxy_filter_usm = max(0, min(40, int(ratio * 40 + 0.5)))
+            elif name == 'gx_struct_star_r':
+                galaxy_filter_star_r = max(0, min(100, int(ratio * 100 + 0.5)))
+            elif name == 'gx_struct_star_k':
+                galaxy_filter_star_k = max(3, min(15, int(3 + ratio * 12 + 0.5)))
+            elif name == 'gx_struct_nscales':
+                galaxy_filter_n_scales = max(2, min(6, int(2 + ratio * 4 + 0.5)))
+
+            # Re-appliquer filtres si en pause
+            if name.startswith(('gx_clahe', 'gx_usm', 'gx_deconv', 'gx_lr_', 'gx_mm_',
+                               'gx_wpsf_', 'gx_post_', 'gx_img_r_', 'gx_img_g_', 'gx_img_b_',
+                               'gx_img_color_', 'gx_struct_')) and galaxy_paused and galaxy_pre_filter_array is not None:
+                try:
+                    galaxy_last_filtered_array = apply_lucky_post_stack_filters(
+                        galaxy_pre_filter_array.copy(), color_correction=True)
+                except Exception:
+                    pass
+
+            return True
+    return False
 
 
 # ============================================================================
@@ -6957,6 +9318,10 @@ def apply_lucky_post_stack_filters(img, color_correction=False):
     global ls_wpsf_aperture, ls_wpsf_obstruction, ls_wpsf_pixel_scale, ls_wpsf_seeing
     global ls_wpsf_defocus, ls_wpsf_astig_x, ls_wpsf_astig_y, ls_wpsf_spherical
     global ls_post_red, ls_post_green, ls_post_blue, ls_post_sat, ls_post_brightness
+    global _wpsf_cache
+    global galaxy_filter_en, galaxy_filter_preset, galaxy_filter_enh
+    global galaxy_filter_usm, galaxy_filter_star_r, galaxy_filter_star_k, galaxy_filter_n_scales
+    global galaxy_enhancer
 
     if img is None:
         return img
@@ -6964,7 +9329,7 @@ def apply_lucky_post_stack_filters(img, color_correction=False):
     _color_active = color_correction and (img.ndim == 3) and (
         ls_post_red != 100 or ls_post_green != 100 or ls_post_blue != 100 or ls_post_sat != 100)
     _brightness_active = color_correction and (ls_post_brightness != 0)
-    if not ls_lucky_clahe_en and not ls_lucky_usm_en and not ls_lucky_lr_en and not ls_lucky_mm_en and not ls_lucky_wpsf_en and not _color_active and not _brightness_active:
+    if not ls_lucky_clahe_en and not ls_lucky_usm_en and not ls_lucky_lr_en and not ls_lucky_mm_en and not ls_lucky_wpsf_en and not _color_active and not _brightness_active and not galaxy_filter_en:
         return img
 
     is_color = (img.ndim == 3)
@@ -7085,57 +9450,67 @@ def apply_lucky_post_stack_filters(img, color_correction=False):
 
     # ── Déconvolution WavePSF Richardson-Lucy (PSF optique Fourier + Zernike) ──
     # PSF calculée depuis les aberrations du front d'onde du télescope.
-    # RL itératif en domaine fréquentiel (scipy.fft) — qualité max, pas de contrainte temps.
+    # RL itératif en domaine fréquentiel (scipy.fft workers=-1 = tous cœurs).
     elif ls_lucky_wpsf_en:
         from scipy.fft import rfft2 as _rfft2, irfft2 as _irfft2
         from libastrostack.wavefront_psf import compute_wavefront_psf as _compute_wpsf
         niters = int(ls_lucky_wpsf_iter)
-        try:
-            psf, _fwhm = _compute_wpsf(
-                aperture_D_mm     = float(ls_wpsf_aperture),
-                obstruction_ratio = ls_wpsf_obstruction / 100.0,
-                pixel_scale_arcsec= ls_wpsf_pixel_scale  / 100.0,
-                seeing_arcsec     = ls_wpsf_seeing        / 10.0,
-                z_defocus         = ls_wpsf_defocus        / 100.0,
-                z_astig_x         = ls_wpsf_astig_x        / 100.0,
-                z_astig_y         = ls_wpsf_astig_y        / 100.0,
-                z_spherical       = ls_wpsf_spherical       / 100.0,
-            )
-        except Exception:
-            psf = None
-        if psf is not None and psf.sum() > 0:
-            img_f = gray.astype(np.float32) / 255.0
-            sh = img_f.shape
-            # Embarquer la PSF centrée dans un tableau de la taille de l'image,
-            # puis la translater pour que son centre soit à [0,0] (convention FFT).
-            kh, kw = psf.shape
-            psf_full = np.zeros(sh, dtype=np.float32)
-            cy_im, cx_im = sh[0] // 2, sh[1] // 2
-            ky, kx = kh // 2, kw // 2
-            y0 = cy_im - ky; y1 = y0 + kh
-            x0 = cx_im - kx; x1 = x0 + kw
-            # Garder uniquement la partie qui tient dans l'image
-            if y0 >= 0 and y1 <= sh[0] and x0 >= 0 and x1 <= sh[1]:
-                psf_full[y0:y1, x0:x1] = psf
+        img_f = gray.astype(np.float32) / 255.0
+        sh    = img_f.shape
+
+        # Cache PSF+H : ne recalcule que si les paramètres optiques ont changé
+        _cache_key = (ls_wpsf_aperture, ls_wpsf_obstruction, ls_wpsf_pixel_scale,
+                      ls_wpsf_seeing, ls_wpsf_defocus, ls_wpsf_astig_x,
+                      ls_wpsf_astig_y, ls_wpsf_spherical, sh)
+        if _cache_key not in _wpsf_cache:
+            try:
+                psf, _fwhm = _compute_wpsf(
+                    aperture_D_mm     = float(ls_wpsf_aperture),
+                    obstruction_ratio = ls_wpsf_obstruction / 100.0,
+                    pixel_scale_arcsec= ls_wpsf_pixel_scale  / 100.0,
+                    seeing_arcsec     = ls_wpsf_seeing        / 10.0,
+                    z_defocus         = ls_wpsf_defocus        / 100.0,
+                    z_astig_x         = ls_wpsf_astig_x        / 100.0,
+                    z_astig_y         = ls_wpsf_astig_y        / 100.0,
+                    z_spherical       = ls_wpsf_spherical       / 100.0,
+                )
+            except Exception:
+                psf = None
+            if psf is not None and psf.sum() > 0:
+                kh, kw = psf.shape
+                psf_full = np.zeros(sh, dtype=np.float32)
+                cy_im, cx_im = sh[0] // 2, sh[1] // 2
+                ky, kx = kh // 2, kw // 2
+                y0 = cy_im - ky; y1 = y0 + kh
+                x0 = cx_im - kx; x1 = x0 + kw
+                if y0 >= 0 and y1 <= sh[0] and x0 >= 0 and x1 <= sh[1]:
+                    psf_full[y0:y1, x0:x1] = psf
+                else:
+                    py0 = max(0, -y0); py1 = py0 + min(kh, sh[0] - max(0, y0))
+                    px0 = max(0, -x0); px1 = px0 + min(kw, sh[1] - max(0, x0))
+                    iy0 = max(0, y0);  iy1 = iy0 + (py1 - py0)
+                    ix0 = max(0, x0);  ix1 = ix0 + (px1 - px0)
+                    psf_full[iy0:iy1, ix0:ix1] = psf[py0:py1, px0:px1]
+                psf_full = np.roll(np.roll(psf_full, -(cy_im - ky), axis=0),
+                                   -(cx_im - kx), axis=1)
+                H      = _rfft2(psf_full, workers=-1)
+                H_conj = np.conj(H)
+                _wpsf_cache.clear()   # garder 1 seule entrée (économie mémoire)
+                _wpsf_cache[_cache_key] = (H, H_conj)
             else:
-                # Découpage si PSF trop grande
-                py0 = max(0, -y0); py1 = py0 + min(kh, sh[0] - max(0, y0))
-                px0 = max(0, -x0); px1 = px0 + min(kw, sh[1] - max(0, x0))
-                iy0 = max(0, y0);  iy1 = iy0 + (py1 - py0)
-                ix0 = max(0, x0);  ix1 = ix0 + (px1 - px0)
-                psf_full[iy0:iy1, ix0:ix1] = psf[py0:py1, px0:px1]
-            # Décaler vers [0,0] (centre FFT)
-            psf_full = np.roll(np.roll(psf_full, -(cy_im - ky), axis=0), -(cx_im - kx), axis=1)
-            # Pré-calculer FFT de la PSF et de son miroir (transposé = flippé pour sym.)
-            H      = _rfft2(psf_full)
-            H_conj = np.conj(H)
-            # RL itératif en domaine fréquentiel
+                _wpsf_cache[_cache_key] = None
+
+        cached = _wpsf_cache.get(_cache_key)
+        if cached is not None:
+            H, H_conj = cached
+            # RL itératif — scipy.fft workers=-1 : tous les cœurs du Pi 5 (×1.9 vs 1 cœur)
             estimate = img_f.copy()
             for _ in range(niters):
-                blurred    = np.real(_irfft2(H * _rfft2(estimate), s=sh))
+                blurred    = np.real(_irfft2(H * _rfft2(estimate, workers=-1),
+                                             s=sh, workers=-1))
                 blurred    = np.clip(blurred, 1e-7, None)
-                ratio_img  = img_f / blurred
-                correction = np.real(_irfft2(H_conj * _rfft2(ratio_img), s=sh))
+                correction = np.real(_irfft2(H_conj * _rfft2(img_f / blurred, workers=-1),
+                                             s=sh, workers=-1))
                 estimate   = np.clip(estimate * correction, 0.0, 1.0)
             gray = np.clip(estimate * 255.0, 0, 255).astype(np.uint8)
 
@@ -7155,6 +9530,18 @@ def apply_lucky_post_stack_filters(img, color_correction=False):
                 result = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
         if ls_post_brightness != 0:
             result = np.clip(result.astype(np.int16) + ls_post_brightness, 0, 255).astype(np.uint8)
+        # ── Galaxy Structure Enhancer (après toutes les déconvolutions) ───────
+        if galaxy_filter_en and galaxy_enhancer is not None:
+            galaxy_enhancer.configure(
+                enabled       = True,
+                galaxy_type   = int(galaxy_filter_preset),
+                enhancement   = galaxy_filter_enh   / 10.0,
+                usm_strength  = galaxy_filter_usm   / 10.0,
+                star_reduction= galaxy_filter_star_r / 100.0,
+                star_kernel   = int(galaxy_filter_star_k),
+                n_scales      = int(galaxy_filter_n_scales),
+            )
+            result = galaxy_enhancer.process(result)
         return result
     if _brightness_active:
         return np.clip(gray.astype(np.int16) + ls_post_brightness, 0, 255).astype(np.uint8)
@@ -10218,7 +12605,7 @@ def draw_home_left_modes(sw, sh):
     global windowSurfaceObj, _font_cache
     rects = {}
     btn_w, btn_h, step = 78, 32, 42
-    start_y = sh // 2 - (4 * btn_h + 3 * (step - btn_h)) // 2
+    start_y = sh // 2 - (4 * step + btn_h) // 2  # 5 modes (0..4)
 
     ck = 18
     if ck not in _font_cache:
@@ -10228,8 +12615,9 @@ def draw_home_left_modes(sw, sh):
     modes = [
         ('mode_livestack', "LIVE",    "STACK", (50, 80, 120)),
         ('mode_lucky',     None,      None,    None),          # traité séparément
-        ('mode_stretch',   "STRETCH", "",      (60, 80, 60)),
+        ('mode_galaxy',    "GALAXY",  "",      (80, 40, 100)),
         ('mode_focus',     "FOCUS",   "",      (80, 70, 40)),
+        ('mode_files',     "FICH.",   "IERS",  (30, 75, 45)),
     ]
     for i, (key, line1, line2, bg) in enumerate(modes):
         by = start_y + i * step
@@ -11172,6 +13560,16 @@ def handle_home_click(mx, my):
     global picam2, capture_thread, custom_sspeed, sspeed, restart
     global focus_gain, focus_exposure_us, focus_zoom_focus
     global lucky_raw_interface_mode, lucky_raw_active, raw_lucky_stacker
+    global galaxy_interface_mode, galaxy_settings_visible, galaxy_active, galaxy_livestack
+    global galaxy_saved_gain, galaxy_saved_exposure, galaxy_saved_zoom
+    global galaxy_saved_vwidth, galaxy_saved_vheight, galaxy_saved_use_native
+    global galaxy_gain, galaxy_exposure_us, galaxy_zoom
+    global _galaxy_slider_rects, _galaxy_slider_dragging, _galaxy_ge_dragging
+    global files_interface_mode, files_settings_visible, files_browser_visible
+    global files_settings_tab, _files_slider_rects, _files_slider_dragging
+    global files_dir, files_list, files_index, files_active, files_paused
+    global files_livestack, files_last_filtered_array, files_pre_filter_array, files_pre_stretch_array
+    global files_browser_scroll
 
     import math
 
@@ -11191,10 +13589,13 @@ def handle_home_click(mx, my):
                 if r.collidepoint(mx, my):
                     ratio = max(0.0, min(1.0, (mx - sx) / slider_w))
                     if i == 0:  # Gain
-                        gain = max(1, min(300, int(1 + ratio * 299)))
+                        _gmax = _HOME_GAIN_SCALES[max(0, min(home_gain_scale_idx, len(_HOME_GAIN_SCALES)-1))]
+                        gain = max(1, min(_gmax, int(1 + ratio * (_gmax - 1))))
                         apply_controls_immediately(gain_value=gain)
                     elif i == 1:  # Expo (log)
-                        min_exp_us, max_exp_us = 1000, 1000000
+                        min_exp_us = 1000
+                        _emax_ms = _HOME_EXPO_SCALES_MS[max(0, min(home_expo_scale_idx, len(_HOME_EXPO_SCALES_MS)-1))]
+                        max_exp_us = _emax_ms * 1000
                         log_min, log_max = math.log10(min_exp_us), math.log10(max_exp_us)
                         custom_sspeed = max(min_exp_us, min(max_exp_us, int(10 ** (log_min + ratio * (log_max - log_min)))))
                         apply_controls_immediately(exposure_time=custom_sspeed)
@@ -11467,14 +13868,64 @@ def handle_home_click(mx, my):
                 print("[HOME] Mode interface Lucky Stack RAW Bayer activé")
             return True
 
-        elif key == 'mode_stretch':
-            # Entrer dans le mode stretch preview
-            stretch_mode = 1 - stretch_mode
-            if stretch_mode == 1:
-                display_modes = pygame.display.list_modes()
-                _mw, _mh = display_modes[0] if display_modes and display_modes != -1 else (1024, 600)
-                windowSurfaceObj = pygame.display.set_mode((_mw, _mh), pygame.FULLSCREEN, 24)
-            print(f"[HOME] Stretch mode: {stretch_mode}")
+        elif key == 'mode_galaxy':
+            # Entrer dans le mode GALAXY (HDR LiveStack)
+            galaxy_interface_mode = 1
+            galaxy_settings_visible = 0
+            galaxy_saved_gain = gain
+            galaxy_saved_exposure = custom_sspeed if custom_sspeed > 0 else sspeed
+            galaxy_saved_zoom = zoom
+            galaxy_saved_vwidth = vwidth
+            galaxy_saved_vheight = vheight
+            galaxy_saved_use_native = use_native_sensor_mode
+            galaxy_gain = max(0, gain if gain > 0 else 10)
+            _init_expo = custom_sspeed if custom_sspeed > 0 else sspeed
+            galaxy_exposure_us = min(60000000, _init_expo if _init_expo > 0 else 10000000)
+            galaxy_zoom = zoom
+            # Auto-bump échelle gain si galaxy_gain dépasse le max courant
+            _gmax_cur = _HOME_GAIN_SCALES[max(0, min(home_gain_scale_idx, len(_HOME_GAIN_SCALES)-1))]
+            if galaxy_gain > _gmax_cur:
+                for _si, _sg in enumerate(_HOME_GAIN_SCALES):
+                    if _sg >= galaxy_gain:
+                        home_gain_scale_idx = _si
+                        break
+                else:
+                    home_gain_scale_idx = len(_HOME_GAIN_SCALES) - 1
+            # Auto-bump échelle expo si galaxy_exposure_us dépasse le max courant
+            _emax_cur_us = _HOME_EXPO_SCALES_MS[max(0, min(home_expo_scale_idx, len(_HOME_EXPO_SCALES_MS)-1))] * 1000
+            if galaxy_exposure_us > _emax_cur_us:
+                for _si, _se_ms in enumerate(_HOME_EXPO_SCALES_MS):
+                    if _se_ms * 1000 >= galaxy_exposure_us:
+                        home_expo_scale_idx = _si
+                        break
+                else:
+                    home_expo_scale_idx = len(_HOME_EXPO_SCALES_MS) - 1
+            stretch_mode = 1
+            stretch_adjust_mode = 0
+            _galaxy_slider_rects = {}
+            _galaxy_slider_dragging = False
+            _galaxy_ge_dragging = None
+            # Forcer RAW12
+            if raw_format < 2:
+                raw_format = 2
+            # Appliquer binning selon galaxy_binning
+            if galaxy_binning == 1:
+                vwidth = 1920
+                vheight = 1080
+                use_native_sensor_mode = 0
+            else:
+                vwidth = igw
+                vheight = igh
+                use_native_sensor_mode = 1
+            kill_preview_process()
+            preview()
+            apply_controls_immediately(
+                gain_value=galaxy_gain if galaxy_gain > 0 else None,
+                exposure_time=galaxy_exposure_us)
+            display_modes = pygame.display.list_modes()
+            _mw, _mh = display_modes[0] if display_modes and display_modes != -1 else (1024, 600)
+            windowSurfaceObj = pygame.display.set_mode((_mw, _mh), pygame.FULLSCREEN, 24)
+            print("[HOME] Mode GALAXY activé (HDR LiveStack)")
             return True
 
         elif key == 'mode_focus':
@@ -11495,6 +13946,22 @@ def handle_home_click(mx, my):
                 _focus_last_star_surf  = None
                 _apply_focus_controls()
             print(f"[HOME] Focus mode: {focus_mode}")
+            return True
+
+        elif key == 'mode_files':
+            # Entrer dans le mode FICHIERS
+            files_interface_mode = 1
+            files_settings_visible = 0
+            files_browser_visible = False
+            files_settings_tab = 0
+            _files_slider_rects = {}
+            _files_slider_dragging = False
+            # Pas de reconfiguration caméra ni stretch_mode — on n'utilise pas la caméra
+            # Scanner le répertoire courant
+            _files_scan_dir()
+            # Ne pas appeler pygame.display.set_mode() ici : l'écran est déjà en fullscreen
+            # et réinitialiser le display peut générer un événement QUIT
+            print(f"[HOME] Mode FICHIERS activé — {len(files_list)} fichiers dans {files_dir}")
             return True
 
         elif key == 'mode_jsk':
@@ -14977,6 +17444,53 @@ def _build_stretch_lut_u8(preset, vmin, vmax, **params):
     return np.clip(stretched * 255.0, 0, 255).astype(np.uint8)
 
 
+_STRETCH_LUT_F32_N = 65536   # résolution LUT float32 (≈ 0.004 LSB/entrée)
+
+def _build_stretch_lut_f32(preset, p_low, p_high, **params):
+    """
+    Construit une LUT float32 (65 536 entrées couvrant [p_low, p_high]) pour les
+    arrays float32 RAW12/16.
+
+    Retourne un vecteur float32 y_lut[0..N-1] ; l'indexation se fait via :
+        idx = clip(((arr - p_low) / (p_high - p_low) * (N-1)).astype(int32), 0, N-1)
+        out = y_lut[idx]
+
+    Le calcul sur 65 536 points coûte < 1 ms ; l'indexation entière sur
+    1090×1928×3 ≈ 6 M pixels est ×2-3 plus rapide que les opérations directes
+    arcsinh/GHS/MTF (arcsinh vectorisé, GHS float64).
+    """
+    from libastrostack.stretch import stretch_ghs as _ghs_fn
+    n = _STRETCH_LUT_F32_N
+    rng = max(float(p_high - p_low), 1e-6)
+    xn = np.linspace(0.0, 1.0, n, dtype=np.float64)
+
+    if preset == 1:   # GHS
+        stretched = _ghs_fn(xn,
+                            D=params['D'], b=params['b'], SP=params['SP'],
+                            LP=params['LP'], HP=params['HP'],
+                            clip_low=0.0, clip_high=100.0, normalize_output=True)
+    elif preset == 2:  # Arcsinh
+        factor = max(params['factor'], 0.01)
+        af = np.arcsinh(factor)
+        stretched = np.arcsinh(xn * factor) / (af if af > 1e-10 else 1.0)
+    elif preset == 3:  # Log
+        f = max(params['log_factor'], 0.01)
+        stretched = np.log1p(xn * f) / np.log1p(f)
+    elif preset == 4:  # MTF
+        s, hv, m = params['mtf_shadows'], params['mtf_highlights'], params['mtf_midtone']
+        xc = np.clip((xn - s) / max(hv - s, 1e-6), 0.0, 1.0)
+        denom = (2 * m - 1) * xc - m
+        with np.errstate(divide='ignore', invalid='ignore'):
+            stretched = np.where(np.abs(denom) > 1e-10, (m - 1) * xc / denom, 0.0)
+        stretched = np.where(xc == 0.0, 0.0, stretched)
+        stretched = np.where(xc == 1.0, 1.0, stretched)
+        stretched = np.clip(stretched, 0.0, 1.0)
+    else:
+        stretched = xn
+
+    return np.clip(stretched * 255.0, 0.0, 255.0).astype(np.float32)
+
+
 def astro_stretch(array):
     """
     Applique un étirement astro selon le preset sélectionné
@@ -15026,121 +17540,42 @@ def astro_stretch(array):
             return cv2.LUT(array, lut)
         return array
 
-    elif stretch_preset == 1:
-        # GHS stretch - Phase 2 (algorithme conforme Siril/PixInsight)
-        D = ghs_D / 10.0       # 0-50 -> 0.0-5.0
-        b = ghs_b / 10.0       # -50 à 150 -> -5.0 à 15.0
-        SP = ghs_SP / 100.0    # 0-100 -> 0.0-1.0
-        LP = ghs_LP / 100.0    # 0-100 -> 0.0-1.0
-        HP = ghs_HP / 100.0    # 0-100 -> 0.0-1.0
-        return ghs_stretch(array, D, b, SP, LP, HP)
+    # ── Chemin rapide float32 : LUT 65536 entrées + indexation entière ───────
+    # GHS/Arcsinh/Log/MTF calculés sur 65 536 points (<1 ms), puis
+    # idx = clip((arr-plow)*scale).astype(int32) + y_lut[idx] : ×2-3 vs direct.
+    elif np.issubdtype(array.dtype, np.floating):
+        p_low_pct  = stretch_p_low  / 10.0
+        p_high_pct = stretch_p_high / 100.0
 
-    elif stretch_preset == 2:
-        # Arcsinh stretch - VERSION AMÉLIORÉE: Préserve le bit depth (float32 ou uint8)
-
-        # Détection du type d'entrée pour préserver le bit depth
-        input_dtype = array.dtype
-        input_is_float = np.issubdtype(input_dtype, np.floating)
-
-        # Convertir en float pour les calculs
-        img_float = array.astype(np.float32)
-
-        # Calculer les percentiles pour éviter l'effet des pixels chauds
-        # stretch_p_low divisé par 10 (stocké x10), stretch_p_high divisé par 100 (stocké x100)
-        p_low = np.percentile(img_float, stretch_p_low / 10.0)
-        p_high = np.percentile(img_float, stretch_p_high / 100.0)
-
-        # Éviter la division par zéro
-        if p_high - p_low < 1:
-            return array
-
-        # Normaliser entre 0 et 1
-        img_normalized = (img_float - p_low) / (p_high - p_low)
-        img_normalized = np.clip(img_normalized, 0, 1)
-
-        # Appliquer une transformation asinh pour accentuer les détails faibles
-        # asinh est plus doux que sqrt et préserve mieux les détails
-        # Utilise le facteur configurable (divisé par 10 car stocké x10)
-        factor = stretch_factor / 10.0
-
-        # Protection contre division par zéro si factor est trop petit
-        if factor > 0.01:
-            arcsinh_factor = np.arcsinh(factor)
-            if arcsinh_factor > 1e-10:
-                img_stretched = np.arcsinh(img_normalized * factor) / arcsinh_factor
+        if stretch_preset == 1:   # GHS : pas de clip percentile externe
+            p_low_f, p_high_f = 0.0, 255.0
+            lut_params = dict(D=ghs_D/10.0, b=ghs_b/10.0, SP=ghs_SP/100.0,
+                              LP=ghs_LP/100.0, HP=ghs_HP/100.0)
+        elif stretch_preset == 4:  # MTF : percentiles fixes 0.5 / 99.5
+            flat = array.ravel()
+            p_low_f  = float(np.percentile(flat, 0.5))
+            p_high_f = float(np.percentile(flat, 99.5))
+            if p_high_f - p_low_f < 0.01:
+                return array
+            lut_params = dict(mtf_shadows=mtf_shadows/100.0,
+                              mtf_midtone=mtf_midtone/100.0,
+                              mtf_highlights=mtf_highlights/100.0)
+        else:                      # Arcsinh (2) ou Log (3)
+            flat = array.ravel()
+            p_low_f  = float(np.percentile(flat, p_low_pct))
+            p_high_f = float(np.percentile(flat, p_high_pct))
+            if p_high_f - p_low_f < 0.01:
+                return array
+            if stretch_preset == 2:
+                lut_params = dict(factor=stretch_factor/10.0)
             else:
-                img_stretched = img_normalized  # Pas de stretch si factor trop petit
-        else:
-            img_stretched = img_normalized  # Pas de stretch si factor <= 0.01
+                lut_params = dict(log_factor=float(log_factor))
 
-        # Reconvertir dans le type d'origine (préserve bit depth comme GHS)
-        if input_is_float:
-            # Retourner float32 [0-255] pour préserver la dynamique RAW12/16
-            img_stretched = (img_stretched * 255.0).astype(np.float32)
-        else:
-            # Retourner uint8 [0-255] pour compatibilité pygame avec YUV420
-            img_stretched = (img_stretched * 255.0).astype(np.uint8)
-
-        return img_stretched
-
-    elif stretch_preset == 3:
-        # Log stretch
-        input_dtype = array.dtype
-        input_is_float = np.issubdtype(input_dtype, np.floating)
-        img_float = array.astype(np.float32)
-
-        p_low = np.percentile(img_float, stretch_p_low / 10.0)
-        p_high = np.percentile(img_float, stretch_p_high / 100.0)
-        if p_high - p_low < 1:
-            return array
-
-        img_norm = np.clip((img_float - p_low) / (p_high - p_low), 0, 1)
-
-        factor = float(log_factor)
-        if factor > 0.01:
-            log_denom = np.log1p(factor)
-            if log_denom > 1e-10:
-                img_stretched = np.log1p(img_norm * factor) / log_denom
-            else:
-                img_stretched = img_norm
-        else:
-            img_stretched = img_norm
-
-        if input_is_float:
-            return (img_stretched * 255.0).astype(np.float32)
-        else:
-            return (img_stretched * 255.0).astype(np.uint8)
-
-    elif stretch_preset == 4:
-        # MTF stretch (Midtone Transfer Function PixInsight)
-        input_dtype = array.dtype
-        input_is_float = np.issubdtype(input_dtype, np.floating)
-        img_float = array.astype(np.float32)
-
-        p_low = np.percentile(img_float, 0.5)
-        p_high = np.percentile(img_float, 99.5)
-        if p_high - p_low < 1:
-            return array
-
-        img_norm = np.clip((img_float - p_low) / (p_high - p_low), 0, 1)
-
-        s = mtf_shadows / 100.0
-        h = mtf_highlights / 100.0
-        m = mtf_midtone / 100.0
-        img_clip = np.clip((img_norm - s) / max(h - s, 1e-6), 0, 1)
-
-        # Formule MTF PixInsight : M(x, m) = (m-1)*x / ((2m-1)*x - m)
-        denom = (2 * m - 1) * img_clip - m
-        mask = np.abs(denom) > 1e-10
-        stretched = np.where(mask, (m - 1) * img_clip / denom, 0.0)
-        stretched = np.where(img_clip == 0, 0.0, stretched)
-        stretched = np.where(img_clip == 1, 1.0, stretched)
-        stretched = np.clip(stretched, 0, 1)
-
-        if input_is_float:
-            return (stretched * 255.0).astype(np.float32)
-        else:
-            return (stretched * 255.0).astype(np.uint8)
+        y_lut = _build_stretch_lut_f32(stretch_preset, p_low_f, p_high_f, **lut_params)
+        n = _STRETCH_LUT_F32_N
+        scale = (n - 1) / max(p_high_f - p_low_f, 1e-6)
+        idx = np.clip(((array.ravel() - p_low_f) * scale).astype(np.int32), 0, n - 1)
+        return y_lut[idx].reshape(array.shape)
 
     else:
         return array
@@ -15224,7 +17659,7 @@ def preview():
         # Détecter si recréation nécessaire (changements majeurs de config)
         # Note: raw_format et v3_hdr nécessitent recréation car ils changent le stream RAW (SRGGB12/16) et HdrMode
         # Note: stacking_active change nécessite recréation pour basculer entre stream 'raw' et 'main'
-        current_stacking_active = livestack_active or luckystack_active or lucky_raw_active
+        current_stacking_active = livestack_active or luckystack_active or lucky_raw_active or galaxy_active
         prev_stacking_active = preview.prev_config.get('stacking_active', False)
 
         need_recreation = (
@@ -15871,7 +18306,7 @@ def preview():
             'awb': awb,
             'raw_format': raw_format,
             'v3_hdr': v3_hdr,
-            'stacking_active': livestack_active or luckystack_active
+            'stacking_active': livestack_active or luckystack_active or galaxy_active
         }
 
         restart = 0
@@ -16653,6 +19088,318 @@ while True:
                     _jsk_slider_rects = draw_jsk_controls(max_width, max_height, None)
                 pygame.display.update()
 
+            # === GALAXY MODE: HDR Mean (RAW Bayer) → LiveStack ===
+            if galaxy_interface_mode == 1:
+                gx_raw_input = None
+
+                if frame_from_thread is not None:
+                    raw_array = frame_from_thread
+                    if len(raw_array.shape) == 2:
+                        # Dépaquetage RAW (pattern JSK)
+                        if raw_array.dtype == np.uint8:
+                            raw_uint16 = raw_array.view(np.uint16)
+                            pixel_width = raw_stream_size[0]
+                            gx_raw_input = raw_uint16[:, :pixel_width]
+                        elif raw_array.dtype == np.uint16:
+                            pixel_width = raw_stream_size[0]
+                            if raw_array.shape[1] > pixel_width:
+                                gx_raw_input = raw_array[:, :pixel_width]
+                            else:
+                                gx_raw_input = raw_array
+                        else:
+                            gx_raw_input = raw_array
+
+                        # Normaliser vers 12-bit (CSI-2 ×16)
+                        if gx_raw_input is not None and gx_raw_input.max() > 4095:
+                            gx_raw_input = (gx_raw_input >> 4).astype(np.uint16)
+                    else:
+                        if capture_thread is not None:
+                            capture_thread.set_capture_params({'type': 'raw'})
+                # Toujours empêcher le traitement normal quand galaxy est actif
+                frame_from_thread = None
+
+                # Dimensions écran fullscreen
+                display_modes = pygame.display.list_modes()
+                if display_modes and display_modes != -1:
+                    max_width, max_height = display_modes[0]
+                else:
+                    screen_info = pygame.display.Info()
+                    max_width, max_height = screen_info.current_w, screen_info.current_h
+
+                # Initialiser le thread pool et le cache preview
+                if not hasattr(pygame, '_gx_proc'):
+                    import concurrent.futures as _cfe
+                    pygame._gx_proc = {
+                        'executor': _cfe.ThreadPoolExecutor(max_workers=1),
+                        'future': None,
+                        'last_display': None,
+                        'preview_future': None,
+                        'preview_cache': None,
+                    }
+                _gxp = pygame._gx_proc
+
+                # --- Fonction locale de debayer (partagée preview/stacking) ---
+                def _gx_debayer(raw_in):
+                    if galaxy_hdr_bits_clip > 0:
+                        _hdr = hdr_mean_raw_bayer(raw_in, galaxy_hdr_bits_clip, galaxy_hdr_weights)
+                    else:
+                        _hdr = raw_in.astype(np.float32)
+                    _bl_t = None
+                    _bl_a = False
+                    if ls_bl_per_channel_enable == 1:
+                        _bl_a = True
+                    elif ls_bl_per_channel_enable == 2:
+                        _bl_t = (ls_bl_r, ls_bl_g1, ls_bl_g2, ls_bl_b)
+                    _bl_g = isp_black_level if ls_bl_per_channel_enable == 0 else 0
+                    return debayer_raw_array(
+                        _hdr.astype(np.uint16), raw_formats[raw_format],
+                        red_gain=(red/10), blue_gain=(blue/10),
+                        fix_bad_pixels=bool(fix_bad_pixels),
+                        sigma_threshold=fix_bad_pixels_sigma/10.0,
+                        min_adu_threshold=fix_bad_pixels_min_adu/10.0,
+                        bl_per_channel=_bl_t, bl_auto_estimate=_bl_a,
+                        use_vng=bool(debayer_vng), global_black_level=_bl_g)
+
+                # --- Thread preview : debayer + normalise → uint8 (non bloquant) ---
+                def _gx_preview_worker(raw_copy):
+                    rgb = _gx_debayer(raw_copy)
+                    # Normaliser float32 [0-65535] → uint8 [0-255]
+                    out = np.clip(rgb * (255.0 / max(rgb.max(), 1.0)), 0, 255).astype(np.uint8)
+                    if stretch_preset != 0:
+                        out = astro_stretch(out)
+                    if out.dtype != np.uint8:
+                        out = np.clip(out, 0, 255).astype(np.uint8)
+                    return out
+
+                # --- Thread stacking : debayer → livestack → uint8 ---
+                def _gx_stack_worker(raw_copy, ls_obj):
+                    if galaxy_save_raws:
+                        try:
+                            from pathlib import Path as _Path
+                            from astropy.io import fits as _fits
+                            _raw_dir = _Path(str(ls_obj.output_dir)) / "raws"
+                            _raw_dir.mkdir(parents=True, exist_ok=True)
+                            _idx = _gxp.get('raw_save_count', 0)
+                            _gxp['raw_save_count'] = _idx + 1
+                            _hdu = _fits.PrimaryHDU(raw_copy.astype(np.uint16))
+                            _hdu.writeto(str(_raw_dir / f"raw_{_idx:05d}.fits"), overwrite=True)
+                        except Exception as _e:
+                            print(f"[GALAXY RAW SAVE] {_e}")
+                    rgb = _gx_debayer(raw_copy)
+                    ls_obj.process_frame(rgb)
+                    # Récupérer le stack linéaire brut — PAS get_preview_for_display()
+                    # car cette fonction applique déjà stretch + EMA vmin (soustraction fond de ciel)
+                    # ce qui écrête progressivement les noirs. Le stretch est géré par le loop
+                    # d'affichage via astro_stretch() une seule fois.
+                    stacked = None
+                    try:
+                        if ls_obj.session is not None and ls_obj.session.stacker is not None:
+                            _raw = ls_obj.session.stacker.get_result()
+                            if _raw is not None:
+                                _raw = _raw.copy()
+                                _mx = float(_raw.max())
+                                if _mx > 0:
+                                    # EMA du vmax pour normalisation stable frame à frame
+                                    _ema = _gxp.get('vmax_ema', 0.0)
+                                    _gxp['vmax_ema'] = _mx if _ema <= 0 else 0.25 * _mx + 0.75 * _ema
+                                    # Normaliser à [0,1] (même espace que session.get_preview_png)
+                                    _norm = np.clip(_raw * (1.0 / max(_gxp['vmax_ema'], 1e-6)), 0.0, 1.0)
+                                    # Retrait de gradient si activé — même position que dans
+                                    # session.get_preview_png() : après norm, avant stretch
+                                    _gx_sess = ls_obj.session
+                                    if getattr(getattr(_gx_sess, 'config', None), 'gradient_removal', False):
+                                        _gx_cfg = _gx_sess.config
+                                        _norm = _gx_sess._remove_gradient(
+                                            _norm,
+                                            n_tiles=getattr(_gx_cfg, 'gradient_removal_tiles', 8),
+                                            flat_strength=getattr(_gx_cfg, 'gradient_removal_flat_strength', 0),
+                                            poly_degree=getattr(_gx_cfg, 'gradient_removal_poly_degree', 2),
+                                            grid_sigma=getattr(_gx_cfg, 'gradient_removal_sigma', 2.0),
+                                        )
+                                    stacked = np.clip(_norm * 255.0, 0, 255).astype(np.uint8)
+                    except Exception:
+                        pass
+                    if stacked is None:
+                        return None
+                    return stacked
+
+                # === STACKING ACTIF : soumettre au LiveStack ===
+                if galaxy_active and gx_raw_input is not None and galaxy_livestack is not None:
+                    # Récupérer le résultat précédent si prêt
+                    if _gxp['future'] is not None and _gxp['future'].done():
+                        try:
+                            _res = _gxp['future'].result()
+                            if _res is not None:
+                                _gxp['last_display'] = _res
+                        except Exception as _ex:
+                            print(f"[GALAXY THREAD] {_ex}")
+                        _gxp['future'] = None
+
+                    if _gxp['future'] is None:
+                        _gxp['future'] = _gxp['executor'].submit(
+                            _gx_stack_worker, gx_raw_input.copy(), galaxy_livestack)
+
+                # === PREVIEW (avant START) : debayer non bloquant ===
+                elif not galaxy_active and not galaxy_paused and gx_raw_input is not None:
+                    # Récupérer le résultat preview si prêt
+                    if _gxp['preview_future'] is not None and _gxp['preview_future'].done():
+                        try:
+                            _pres = _gxp['preview_future'].result()
+                            if _pres is not None:
+                                _gxp['preview_cache'] = _pres
+                        except Exception as _ex:
+                            print(f"[GALAXY PREVIEW] {_ex}")
+                        _gxp['preview_future'] = None
+
+                    # Soumettre un nouveau debayer preview si le thread est libre
+                    if _gxp['preview_future'] is None:
+                        _gxp['preview_future'] = _gxp['executor'].submit(
+                            _gx_preview_worker, gx_raw_input.copy())
+
+                # === Choix de l'image à afficher ===
+                _gx_display = None
+
+                if galaxy_paused and galaxy_pre_stretch_array is not None:
+                    # Re-stretch/re-filter interactif en pause
+                    stacked_array = galaxy_pre_stretch_array.copy()
+                    if stretch_preset != 0:
+                        stacked_array = astro_stretch(stacked_array)
+                    if stacked_array.dtype != np.uint8:
+                        stacked_array = np.clip(stacked_array, 0, 255).astype(np.uint8)
+                    if galaxy_color_enabled and (galaxy_r_gain != 100 or galaxy_g_gain != 100 or galaxy_b_gain != 100):
+                        _fa = stacked_array.astype(np.float32)
+                        _fa[:,:,0] = np.clip(_fa[:,:,0] * galaxy_r_gain / 100.0, 0, 255)
+                        _fa[:,:,1] = np.clip(_fa[:,:,1] * galaxy_g_gain / 100.0, 0, 255)
+                        _fa[:,:,2] = np.clip(_fa[:,:,2] * galaxy_b_gain / 100.0, 0, 255)
+                        stacked_array = _fa.astype(np.uint8)
+                    galaxy_pre_filter_array = stacked_array.copy()
+                    stacked_array = apply_lucky_post_stack_filters(stacked_array, color_correction=True)
+                    galaxy_last_filtered_array = stacked_array.copy()
+                    _gx_display = stacked_array
+
+                elif galaxy_active and _gxp['last_display'] is not None:
+                    _gx_display = _gxp['last_display']
+                    galaxy_pre_stretch_array = _gx_display.copy()
+                    stacked_array = _gx_display.copy()
+                    if stretch_preset != 0:
+                        stacked_array = astro_stretch(stacked_array)
+                    if stacked_array.dtype != np.uint8:
+                        stacked_array = np.clip(stacked_array, 0, 255).astype(np.uint8)
+                    if galaxy_color_enabled and (galaxy_r_gain != 100 or galaxy_g_gain != 100 or galaxy_b_gain != 100):
+                        _fa = stacked_array.astype(np.float32)
+                        _fa[:,:,0] = np.clip(_fa[:,:,0] * galaxy_r_gain / 100.0, 0, 255)
+                        _fa[:,:,1] = np.clip(_fa[:,:,1] * galaxy_g_gain / 100.0, 0, 255)
+                        _fa[:,:,2] = np.clip(_fa[:,:,2] * galaxy_b_gain / 100.0, 0, 255)
+                        stacked_array = _fa.astype(np.uint8)
+                    galaxy_pre_filter_array = stacked_array.copy()
+                    stacked_array = apply_lucky_post_stack_filters(stacked_array, color_correction=True)
+                    galaxy_last_filtered_array = stacked_array.copy()
+                    _gx_display = stacked_array
+
+                elif not galaxy_active and _gxp.get('preview_cache') is not None:
+                    # Afficher le dernier preview débayérisé (non bloquant)
+                    _gx_display = _gxp['preview_cache']
+
+                if _gx_display is not None:
+                    if len(_gx_display.shape) == 3:
+                        transposed = np.swapaxes(_gx_display, 0, 1)
+                        image = pygame.surfarray.make_surface(transposed)
+                    else:
+                        image = pygame.surfarray.make_surface(_gx_display.T)
+                    image = pygame.transform.scale(image, (max_width, max_height))
+                    windowSurfaceObj.blit(image, (0, 0))
+                else:
+                    windowSurfaceObj.fill((0, 0, 0))
+
+                draw_galaxy_interface(max_width, max_height)
+                pygame.display.update()
+
+            # ===== MODE FICHIERS =====
+            if files_interface_mode == 1:
+                # Empêcher le display normal (comme galaxy_interface_mode)
+                frame_from_thread = None
+                # Dimensions écran fullscreen
+                _fx_dm = pygame.display.list_modes()
+                if _fx_dm and _fx_dm != -1:
+                    max_width, max_height = _fx_dm[0]
+                else:
+                    _fx_si = pygame.display.Info()
+                    max_width, max_height = _fx_si.current_w, _fx_si.current_h
+
+                # Init executor (une seule fois)
+                if not hasattr(pygame, '_fx_proc'):
+                    import concurrent.futures as _cfe2
+                    pygame._fx_proc = {
+                        'executor': _cfe2.ThreadPoolExecutor(max_workers=1),
+                        'future':       None,
+                        'last_display': None,
+                    }
+                _fxp = pygame._fx_proc
+
+                # Récupérer résultat du thread précédent
+                if _fxp['future'] is not None and _fxp['future'].done():
+                    try:
+                        _fres = _fxp['future'].result()
+                        if _fres is not None:
+                            _fxp['last_display'] = _fres
+                    except Exception as _fe:
+                        if show_cmds == 1:
+                            print(f"[FILES THREAD] {_fe}")
+                    _fxp['future'] = None
+                    # Avancer dans la liste
+                    files_index += 1
+                    if files_index >= len(files_list):
+                        files_active = False
+                        print(f"[FILES] Traitement terminé: {files_index} fichier(s)")
+
+                # Soumettre le fichier suivant si thread libre et stacking actif
+                if files_active and _fxp['future'] is None and files_index < len(files_list):
+                    _fxp['future'] = _fxp['executor'].submit(
+                        _files_load_and_stack, files_list[files_index], files_livestack)
+
+                # Sélectionner l'image à afficher
+                _fx_display = None
+                if files_paused and files_pre_stretch_array is not None:
+                    # Mode pause : re-appliquer stretch + filtres interactivement
+                    # (seulement si les sliders ont changé — détecté par files_last_filtered_array)
+                    if files_last_filtered_array is None:
+                        _fpre = files_pre_stretch_array.copy()
+                        if stretch_preset != 0:
+                            _fpre = astro_stretch(_fpre)
+                        if _fpre.dtype != np.uint8:
+                            _fpre = np.clip(_fpre, 0, 255).astype(np.uint8)
+                        files_pre_filter_array = _fpre
+                        _fx_display = apply_lucky_post_stack_filters(_fpre, color_correction=True)
+                        files_last_filtered_array = _fx_display.copy()
+                    else:
+                        _fx_display = files_last_filtered_array
+                elif _fxp['last_display'] is not None:
+                    # Recalculer seulement si un nouveau résultat est arrivé du thread
+                    _fx_new = _fxp.get('_last_shown') is not _fxp['last_display']
+                    if _fx_new:
+                        _fxp['_last_shown'] = _fxp['last_display']
+                        _fd = _fxp['last_display']
+                        files_pre_stretch_array = _fd.copy()
+                        if stretch_preset != 0:
+                            _fd = astro_stretch(_fd)
+                        if _fd.dtype != np.uint8:
+                            _fd = np.clip(_fd, 0, 255).astype(np.uint8)
+                        files_pre_filter_array = _fd.copy()
+                        _fd = apply_lucky_post_stack_filters(_fd, color_correction=True)
+                        files_last_filtered_array = _fd.copy()
+                    _fx_display = files_last_filtered_array
+
+                if _fx_display is not None:
+                    _ft = np.swapaxes(_fx_display, 0, 1)
+                    _fi = pygame.surfarray.make_surface(_ft)
+                    _fi = pygame.transform.scale(_fi, (max_width, max_height))
+                    windowSurfaceObj.blit(_fi, (0, 0))
+                else:
+                    windowSurfaceObj.fill((0, 0, 0))
+
+                _fbr = draw_files_interface(max_width, max_height)
+                pygame.display.update()
+
             # Si une frame est disponible, la traiter et l'afficher
             # Sinon, on saute juste le traitement (l'interface reste réactive)
             if frame_from_thread is not None:
@@ -16729,7 +19476,7 @@ while True:
 
                     # Boost de contraste: UNIQUEMENT pour le mode stretch preview (pas pour stacking)
                     # Le stacking nécessite des données linéaires brutes du capteur
-                    if isp_enable == 0 and not (livestack_active or luckystack_active or lucky_raw_active):
+                    if isp_enable == 0 and not (livestack_active or luckystack_active or lucky_raw_active or galaxy_active):
                         midpoint = 32768.0
                         contrast_factor = 1.15
                         brightness_offset = 2048
@@ -17396,8 +20143,8 @@ while True:
                     windowSurfaceObj.blit(image, (0, 0))
 
                     # Afficher les contrôles de réglage stretch si en mode stretch
-                    # Ne PAS afficher pendant le stacking (livestack ou luckystack) ni pendant l'interface Lucky
-                    if stretch_mode == 1 and not livestack_active and not luckystack_active and not lucky_interface_mode and not lucky_raw_interface_mode:
+                    # Ne PAS afficher pendant le stacking (livestack ou luckystack) ni pendant l'interface Lucky/Galaxy
+                    if stretch_mode == 1 and not livestack_active and not luckystack_active and not lucky_interface_mode and not lucky_raw_interface_mode and galaxy_interface_mode == 0 and files_interface_mode == 0:
                         if ls_interface_mode == 1:
                             # Mode interface LS : boutons/sliders LS au-dessus du preview
                             draw_ls_interface(max_width, max_height)
@@ -17500,8 +20247,8 @@ while True:
             windowSurfaceObj.blit(image, (0,0))
 
             # Afficher les contrôles de réglage stretch si en mode stretch (rpicam-vid)
-            # Ne PAS afficher pendant le stacking (livestack ou luckystack) ni pendant l'interface Lucky
-            if stretch_mode == 1 and not livestack_active and not luckystack_active and not lucky_interface_mode and not lucky_raw_interface_mode:
+            # Ne PAS afficher pendant le stacking (livestack ou luckystack) ni pendant l'interface Lucky/Galaxy
+            if stretch_mode == 1 and not livestack_active and not luckystack_active and not lucky_interface_mode and not lucky_raw_interface_mode and galaxy_interface_mode == 0:
                 if ls_interface_mode == 1:
                     draw_ls_interface(max_width, max_height)
                 else:
@@ -17661,7 +20408,7 @@ while True:
                     _jsk_slider_rects = draw_jsk_controls(max_width, max_height, None)
 
     # Ne pas afficher les overlays en mode stretch ou JSK LIVE
-    if (zoom > 0 or foc_man == 1 or focus_mode == 1 or histogram > 0) and stretch_mode == 0 and jsk_live_mode == 0 and collimation_mode == 0 and moon_mode == 0 and sun_mode == 0:
+    if (zoom > 0 or foc_man == 1 or focus_mode == 1 or histogram > 0) and stretch_mode == 0 and jsk_live_mode == 0 and collimation_mode == 0 and moon_mode == 0 and sun_mode == 0 and galaxy_interface_mode == 0 and files_interface_mode == 0:
         # Utiliser array3d au lieu de pixels3d pour ne pas verrouiller la surface
         # Cela améliore grandement la fluidité de l'affichage en mode focus et histogram
         image2 = pygame.surfarray.array3d(image)
@@ -17904,7 +20651,8 @@ while True:
     # Masqué en home screen (overlay prend la place)
     _home_active = (moon_mode == 0 and sun_mode == 0 and jsk_live_mode == 0 and
                     collimation_mode == 0 and stretch_mode == 0 and
-                    ls_interface_mode == 0 and lucky_interface_mode == 0)
+                    ls_interface_mode == 0 and lucky_interface_mode == 0 and
+                    galaxy_interface_mode == 0 and files_interface_mode == 0)
 
     # === HOME SCREEN OVERLAY ===
     if _home_active:
@@ -17964,7 +20712,7 @@ while True:
         _home_pending_capture = -1
 
     # *** CETTE PARTIE EST CRUCIALE : Mode preview (zoom == 0) — masqué en home screen ***
-    if zoom == 0 and moon_mode == 0 and sun_mode == 0 and jsk_live_mode == 0 and not _home_active:
+    if zoom == 0 and moon_mode == 0 and sun_mode == 0 and jsk_live_mode == 0 and galaxy_interface_mode == 0 and files_interface_mode == 0 and not _home_active:
         #pygame.draw.rect(windowSurfaceObj,blackColor,Rect(0,0,int(preview_width/4.5),int(preview_height/8)),0)
         # Ne pas afficher le texte en mode stretch
         if stretch_mode == 0:
@@ -18023,7 +20771,7 @@ while True:
       # === MOON / JSK LIVE: gestion du drag des sliders (MOUSEBUTTONDOWN + MOUSEMOTION) ===
       elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
         # === HOME SCREEN : Drag sliders gain/expo/zoom ===
-        if focus_mode == 0 and moon_mode == 0 and sun_mode == 0 and jsk_live_mode == 0 and collimation_mode == 0 and stretch_mode == 0 and ls_interface_mode == 0 and lucky_interface_mode == 0:
+        if focus_mode == 0 and moon_mode == 0 and sun_mode == 0 and jsk_live_mode == 0 and collimation_mode == 0 and stretch_mode == 0 and ls_interface_mode == 0 and lucky_interface_mode == 0 and galaxy_interface_mode == 0 and files_interface_mode == 0:
             mx, my = event.pos
             display_modes = pygame.display.list_modes()
             _fs_w, _fs_h = display_modes[0] if display_modes and display_modes != -1 else (1024, 600)
@@ -18053,7 +20801,7 @@ while True:
             if _matched_home:
                 continue
         # Focus overlay drag start
-        if focus_mode == 1 and _focus_overlay_rects and moon_mode == 0 and sun_mode == 0 and jsk_live_mode == 0 and collimation_mode == 0:
+        if focus_mode == 1 and _focus_overlay_rects and moon_mode == 0 and sun_mode == 0 and jsk_live_mode == 0 and collimation_mode == 0 and galaxy_interface_mode == 0 and files_interface_mode == 0:
             mx, my = event.pos
             import math as _math_foc
             for _fkey in ('focus_gain', 'focus_expo', 'focus_zoom', 'focus_hist', 'focus_frq'):
@@ -18476,6 +21224,42 @@ while True:
                 continue
             else:
                 _lucky_slider_dragging = False
+        # Drag sliders Gain/Expo/Zoom GALAXY interface
+        if _galaxy_ge_dragging is not None and galaxy_interface_mode == 1:
+            buttons = pygame.mouse.get_pressed()
+            if buttons[0]:
+                mx, my = event.pos
+                display_modes = pygame.display.list_modes()
+                if display_modes and display_modes != -1:
+                    _fs_w, _fs_h = display_modes[0]
+                else:
+                    _si = pygame.display.Info()
+                    _fs_w, _fs_h = _si.current_w, _si.current_h
+                if _galaxy_ge_dragging == 'gain':
+                    new_g = is_click_on_galaxy_gain_slider(mx, my, _fs_w, _fs_h)
+                    if new_g is not None:
+                        galaxy_gain = new_g
+                        if not galaxy_active:
+                            apply_controls_immediately(gain_value=galaxy_gain if galaxy_gain > 0 else None)
+                elif _galaxy_ge_dragging == 'expo':
+                    new_e = is_click_on_galaxy_expo_slider(mx, my, _fs_w, _fs_h)
+                    if new_e is not None:
+                        galaxy_exposure_us = new_e
+                        if not galaxy_active:
+                            apply_controls_immediately(exposure_time=galaxy_exposure_us)
+                elif _galaxy_ge_dragging == 'zoom':
+                    new_z = is_click_on_galaxy_zoom_slider(mx, my, _fs_w, _fs_h)
+                    if new_z is not None:
+                        galaxy_zoom = new_z
+                continue
+        if _galaxy_slider_dragging and galaxy_interface_mode == 1 and galaxy_settings_visible == 1 and _galaxy_slider_rects:
+            buttons = pygame.mouse.get_pressed()
+            if buttons[0]:
+                mx, my = event.pos
+                handle_galaxy_slider_click(mx, my, _galaxy_slider_rects)
+                continue
+            else:
+                _galaxy_slider_dragging = False
         # === COLLIMATION MANUEL : mise à jour du drag en cours ===
         if _colim_dragging and collimation_mode == 1 and collimation_manual_mode == 1:
             if event.buttons[0]:
@@ -18549,7 +21333,7 @@ while True:
             continue
         if _home_passthrough:
             _home_passthrough = False  # laisser passer vers les anciens handlers
-        elif moon_mode == 0 and sun_mode == 0 and jsk_live_mode == 0 and collimation_mode == 0 and stretch_mode == 0 and ls_interface_mode == 0 and lucky_interface_mode == 0:
+        elif moon_mode == 0 and sun_mode == 0 and jsk_live_mode == 0 and collimation_mode == 0 and stretch_mode == 0 and ls_interface_mode == 0 and lucky_interface_mode == 0 and galaxy_interface_mode == 0 and files_interface_mode == 0:
             if focus_mode == 1:
                 handle_focus_overlay_click(mousex, mousey)
             else:
@@ -18610,6 +21394,33 @@ while True:
             _lucky_slider_dragging = False
             if (lucky_interface_mode == 1 or lucky_raw_interface_mode == 1) and lucky_settings_visible == 1 and _lucky_slider_rects:
                 handle_lucky_slider_click(mousex, mousey, _lucky_slider_rects)
+            continue
+        # Fin du drag GALAXY gain/expo/zoom
+        if _galaxy_ge_dragging is not None:
+            _prev_galaxy_drag = _galaxy_ge_dragging
+            _galaxy_ge_dragging = None
+            if _prev_galaxy_drag == 'zoom' and not galaxy_active and zoom != galaxy_zoom:
+                zoom = galaxy_zoom
+                sync_video_resolution_with_zoom()
+                display_modes = pygame.display.list_modes()
+                _dw, _dh = display_modes[0] if display_modes and display_modes != -1 else (fs_width, fs_height)
+                windowSurfaceObj.fill((0, 0, 0))
+                _ck_r = 36
+                if _ck_r not in _font_cache:
+                    _font_cache[_ck_r] = pygame.font.Font(None, _ck_r)
+                _msg_r = _font_cache[_ck_r].render("Reconfiguration caméra...", True, (200, 200, 200))
+                windowSurfaceObj.blit(_msg_r, _msg_r.get_rect(center=(_dw // 2, _dh // 2)))
+                pygame.display.update()
+                kill_preview_process()
+                preview()
+                apply_controls_immediately(
+                    gain_value=galaxy_gain if galaxy_gain > 0 else None,
+                    exposure_time=galaxy_exposure_us)
+            continue
+        if _galaxy_slider_dragging:
+            _galaxy_slider_dragging = False
+            if galaxy_interface_mode == 1 and galaxy_settings_visible == 1 and _galaxy_slider_rects:
+                handle_galaxy_slider_click(mousex, mousey, _galaxy_slider_rects)
             continue
         # Fin du drag Moon
         if _moon_ge_dragging is not None:
@@ -18742,6 +21553,460 @@ while True:
                 print(f"[LUCKYSTACK] Caméra reconfigurée en mode normal")
 
             continue
+
+        # ===== GESTION DES CLICS EN MODE GALAXY INTERFACE =====
+        if galaxy_interface_mode == 1:
+            display_modes = pygame.display.list_modes()
+            if display_modes and display_modes != -1:
+                fs_width, fs_height = display_modes[0]
+            else:
+                screen_info = pygame.display.Info()
+                fs_width, fs_height = screen_info.current_w, screen_info.current_h
+
+            # SET → toggle panneau réglages
+            if is_click_on_galaxy_settings(mousex, mousey):
+                galaxy_settings_visible = 1 - galaxy_settings_visible
+                _galaxy_slider_rects = {}
+                _galaxy_slider_dragging = False
+                continue
+
+            # SAVE FIT
+            if is_click_on_galaxy_save_fit(mousex, mousey, fs_width):
+                if galaxy_livestack is not None:
+                    try:
+                        if raw_format >= 2:
+                            save_with_external_processing(galaxy_livestack, raw_format_name=raw_formats[raw_format])
+                        else:
+                            galaxy_livestack.save(raw_format_name=raw_formats[raw_format])
+                        print("[GALAXY] Stack FITS sauvegardé")
+                    except Exception as e:
+                        print(f"[GALAXY] Erreur sauvegarde FITS: {e}")
+                continue
+
+            # SAVE PNG
+            if is_click_on_galaxy_save_png(mousex, mousey, fs_width):
+                if galaxy_last_filtered_array is not None:
+                    save_ls_filtered_png(galaxy_last_filtered_array)
+                else:
+                    print("[GALAXY PNG] Aucune image disponible")
+                continue
+
+            # PAUSE / REPRISE
+            if is_click_on_galaxy_pause(mousex, mousey, fs_height):
+                if galaxy_active:
+                    galaxy_paused = True
+                    galaxy_active = False
+                    if galaxy_livestack is not None:
+                        galaxy_livestack.pause()
+                    apply_controls_immediately(
+                        gain_value=galaxy_gain if galaxy_gain > 0 else None,
+                        exposure_time=galaxy_exposure_us)
+                    print("[GALAXY] Stack en PAUSE")
+                elif galaxy_paused:
+                    galaxy_paused = False
+                    if galaxy_livestack is not None:
+                        galaxy_livestack.resume()
+                    apply_controls_immediately(
+                        gain_value=galaxy_gain if galaxy_gain > 0 else None,
+                        exposure_time=galaxy_exposure_us)
+                    galaxy_active = True
+                    print("[GALAXY] Stack REPRIS")
+                continue
+
+            # RESET
+            if is_click_on_galaxy_reset(mousex, mousey, fs_height):
+                if galaxy_active:
+                    galaxy_active = False
+                    if galaxy_livestack is not None:
+                        galaxy_livestack.stop()
+                if galaxy_livestack is not None:
+                    galaxy_livestack.reset()
+                galaxy_paused = False
+                galaxy_last_filtered_array = None
+                galaxy_pre_filter_array = None
+                galaxy_pre_stretch_array = None
+                if hasattr(pygame, '_gx_proc'):
+                    pygame._gx_proc['last_display'] = None
+                print("[GALAXY] Session réinitialisée")
+                continue
+
+            # START / STOP
+            if is_click_on_galaxy_start_stop(mousex, mousey):
+                if galaxy_active:
+                    # STOP
+                    galaxy_active = False
+                    if galaxy_livestack is not None:
+                        galaxy_livestack.stop()
+                    print("[GALAXY] Stack arrêté")
+                else:
+                    # START — créer et configurer la session
+                    _cam_expo = galaxy_exposure_us
+                    _cam_gain = galaxy_gain
+                    if use_picamera2 and picam2 is not None:
+                        try:
+                            picam2.set_controls({
+                                "ExposureTime": int(_cam_expo),
+                                "AnalogueGain": float(_cam_gain) if _cam_gain > 0 else 1.0,
+                            })
+                        except Exception as _ce:
+                            print(f"[GALAXY] Erreur caméra: {_ce}")
+
+                    _cam_params = {
+                        'exposure': _cam_expo,
+                        'gain': _cam_gain,
+                        'red': red / 10,
+                        'blue': blue / 10,
+                        'raw_format': raw_formats[raw_format]
+                    }
+                    galaxy_livestack = create_advanced_livestack_session(_cam_params)
+                    galaxy_livestack.output_dir = get_dated_save_dir("/home/admin/stacks/galaxy")
+                    _method_names = ['mean', 'median', 'kappa_sigma', 'winsorized', 'weighted']
+                    galaxy_livestack.configure(
+                        stacking_method=_method_names[galaxy_stack_method],
+                        kappa=galaxy_stack_kappa / 10.0,
+                        iterations=galaxy_stack_iterations,
+                        alignment_mode="translation" if galaxy_alignment_mode == 1 else "none",
+                        enable_qc=bool(galaxy_enable_qc),
+                        max_fwhm=galaxy_max_fwhm / 10.0 if galaxy_max_fwhm > 0 else 999.0,
+                        min_sharpness=galaxy_min_sharpness / 1000.0 if galaxy_min_sharpness > 0 else 0.0,
+                        max_drift=float(galaxy_max_drift) if galaxy_max_drift > 0 else 999999.0,
+                        min_stars=int(galaxy_min_stars),
+                        planetary_enable=False,
+                        lucky_enable=False,
+                        png_stretch=['off', 'ghs', 'asinh', 'log', 'mtf'][min(stretch_preset, 4)],
+                        png_factor=stretch_factor / 10.0,
+                        png_clip_low=0.0 if stretch_preset == 1 else stretch_p_low / 10.0,
+                        png_clip_high=100.0 if stretch_preset == 1 else stretch_p_high / 100.0,
+                        ghs_D=ghs_D / 10.0, ghs_b=ghs_b / 10.0,
+                        ghs_SP=ghs_SP / 100.0, ghs_LP=ghs_LP / 100.0, ghs_HP=ghs_HP / 100.0,
+                        log_factor=float(log_factor),
+                        mtf_midtone=mtf_midtone / 100.0,
+                        mtf_shadows=mtf_shadows / 100.0,
+                        mtf_highlights=mtf_highlights / 100.0,
+                        preview_refresh=galaxy_preview_refresh,
+                    )
+                    galaxy_livestack.configure(
+                        isp_enable=False,
+                        video_format='raw12',
+                        raw_black_level=0,
+                        gradient_removal=bool(galaxy_gradient_removal),
+                        gradient_removal_flat_strength=galaxy_gradient_flat_strength,
+                        gradient_removal_poly_degree=galaxy_gradient_poly_degree,
+                        gradient_removal_sigma=galaxy_gradient_sigma / 10.0,
+                        awb_auto=False,
+                    )
+                    galaxy_livestack.reset()
+                    galaxy_livestack.start()
+                    galaxy_active = True
+                    galaxy_paused = False
+                    galaxy_last_filtered_array = None
+                    galaxy_pre_filter_array = None
+                    galaxy_pre_stretch_array = None
+                    # Réinitialiser l'EMA vmax du worker pour nouvelle session
+                    if hasattr(pygame, '_gx_proc'):
+                        pygame._gx_proc['vmax_ema'] = 0.0
+                        pygame._gx_proc['raw_save_count'] = 0
+                    print("[GALAXY] Stack démarré (HDR LiveStack)")
+                continue
+
+            # BINNING toggle
+            if is_click_on_galaxy_binning(mousex, mousey, fs_width, fs_height):
+                galaxy_binning = 1 - galaxy_binning
+                if galaxy_binning == 1:
+                    vwidth = 1920
+                    vheight = 1080
+                    use_native_sensor_mode = 0
+                else:
+                    vwidth = igw
+                    vheight = igh
+                    use_native_sensor_mode = 1
+                # Clear caches
+                if hasattr(pygame, '_gx_proc'):
+                    pygame._gx_proc['preview_cache'] = None
+                    pygame._gx_proc['last_display'] = None
+                kill_preview_process()
+                preview()
+                apply_controls_immediately(
+                    gain_value=galaxy_gain if galaxy_gain > 0 else None,
+                    exposure_time=galaxy_exposure_us)
+                print(f"[GALAXY] Binning: {'ON (1928×1090)' if galaxy_binning else 'OFF (' + str(igw) + '×' + str(igh) + ')'}")
+                continue
+
+            # EXIT
+            if is_click_on_galaxy_exit(mousex, mousey, fs_height):
+                if galaxy_active:
+                    galaxy_active = False
+                    if galaxy_livestack is not None:
+                        galaxy_livestack.stop()
+                galaxy_interface_mode = 0
+                galaxy_settings_visible = 0
+                galaxy_paused = False
+                _galaxy_slider_rects = {}
+                _galaxy_slider_dragging = False
+                _galaxy_ge_dragging = None
+                stretch_mode = 0
+                stretch_adjust_mode = 0
+
+                # Restaurer paramètres caméra sauvegardés
+                vwidth = galaxy_saved_vwidth
+                vheight = galaxy_saved_vheight
+                use_native_sensor_mode = galaxy_saved_use_native
+                zoom = galaxy_saved_zoom
+                gain = galaxy_saved_gain
+                kill_preview_process()
+                preview()
+                apply_controls_immediately(
+                    gain_value=galaxy_saved_gain if galaxy_saved_gain > 0 else None,
+                    exposure_time=galaxy_saved_exposure)
+
+                # Restaurer affichage
+                display_modes = pygame.display.list_modes()
+                _hw, _hh = display_modes[0] if display_modes and display_modes != -1 else (1024, 600)
+                windowSurfaceObj = pygame.display.set_mode((_hw, _hh), pygame.FULLSCREEN, 24)
+                windowSurfaceObj.fill((0, 0, 0))
+                menu = 0
+                print("[GALAXY] Mode GALAXY désactivé")
+                continue
+
+            # Sliders Gain / Expo / Zoom
+            new_g = is_click_on_galaxy_gain_slider(mousex, mousey, fs_width, fs_height)
+            if new_g is not None:
+                galaxy_gain = new_g
+                if not galaxy_active:
+                    apply_controls_immediately(gain_value=galaxy_gain if galaxy_gain > 0 else None)
+                _galaxy_ge_dragging = 'gain'
+                continue
+            new_e = is_click_on_galaxy_expo_slider(mousex, mousey, fs_width, fs_height)
+            if new_e is not None:
+                galaxy_exposure_us = new_e
+                if not galaxy_active:
+                    apply_controls_immediately(exposure_time=galaxy_exposure_us)
+                _galaxy_ge_dragging = 'expo'
+                continue
+            new_z = is_click_on_galaxy_zoom_slider(mousex, mousey, fs_width, fs_height)
+            if new_z is not None:
+                galaxy_zoom = new_z
+                _galaxy_ge_dragging = 'zoom'
+                continue
+
+            # Sliders panneau réglages
+            if galaxy_settings_visible == 1 and _galaxy_slider_rects:
+                if handle_galaxy_slider_click(mousex, mousey, _galaxy_slider_rects):
+                    _galaxy_slider_dragging = True
+                    continue
+
+            continue  # Rester en mode Galaxy
+
+        # ===== GESTION DES CLICS EN MODE FICHIERS =====
+        if files_interface_mode == 1:
+            display_modes = pygame.display.list_modes()
+            if display_modes and display_modes != -1:
+                fs_width, fs_height = display_modes[0]
+            else:
+                _si = pygame.display.Info()
+                fs_width, fs_height = _si.current_w, _si.current_h
+
+            # Browser overlay actif → intercepter tous les clics
+            if files_browser_visible:
+                _fbr = draw_files_browser(fs_width, fs_height)
+                for _bk, _bv in _fbr.items():
+                    if _bk == 'fb_cancel':
+                        if _bv.collidepoint(mousex, mousey):
+                            files_browser_visible = False
+                            continue
+                    elif _bk == 'fb_select':
+                        if _bv.collidepoint(mousex, mousey):
+                            files_browser_visible = False
+                            _files_scan_dir()
+                            continue
+                    elif _bk == 'fb_parent':
+                        if _bv.collidepoint(mousex, mousey):
+                            files_dir = os.path.dirname(files_dir) or files_dir
+                            files_browser_scroll = 0
+                            continue
+                    elif _bk.startswith('fb_dir_'):
+                        _rect, _dpath = _bv
+                        if _rect.collidepoint(mousex, mousey):
+                            files_dir = _dpath
+                            files_browser_scroll = 0
+                            continue
+                continue
+
+            # SET → toggle panneau réglages
+            if is_click_on_files_settings(mousex, mousey):
+                files_settings_visible = 1 - files_settings_visible
+                continue
+
+            # START / STOP
+            if is_click_on_files_start(mousex, mousey):
+                if files_active:
+                    # STOP
+                    files_active = False
+                    print("[FILES] Traitement arrêté")
+                elif files_paused:
+                    # REPRISE depuis pause
+                    files_paused = False
+                    files_active = True
+                    print("[FILES] Traitement repris")
+                else:
+                    # START : créer la session et lancer
+                    if not files_list:
+                        _files_scan_dir()
+                    if files_list:
+                        _fx_cam_params = {
+                            'width': 1928, 'height': 1090,
+                            'format': 'RGB888', 'sensor_mode': 0,
+                        }
+                        files_livestack = create_advanced_livestack_session(_fx_cam_params)
+                        files_livestack.output_dir = get_dated_save_dir("/home/admin/stacks/files")
+                        _fx_methods = ['mean', 'median', 'kappa_sigma', 'winsorized', 'weighted']
+                        files_livestack.configure(
+                            stacking_method=_fx_methods[min(galaxy_stack_method, 4)],
+                            kappa=galaxy_stack_kappa / 10.0,
+                            iterations=galaxy_stack_iterations,
+                            alignment_mode="translation" if galaxy_alignment_mode == 1 else "none",
+                            enable_qc=bool(galaxy_enable_qc),
+                            max_fwhm=galaxy_max_fwhm / 10.0 if galaxy_max_fwhm > 0 else 999.0,
+                            min_sharpness=galaxy_min_sharpness / 1000.0 if galaxy_min_sharpness > 0 else 0.0,
+                            max_drift=float(galaxy_max_drift) if galaxy_max_drift > 0 else 999999.0,
+                            min_stars=int(galaxy_min_stars),
+                            planetary_enable=False,
+                            lucky_enable=False,
+                            png_stretch=['off', 'ghs', 'asinh', 'log', 'mtf'][min(stretch_preset, 4)],
+                            png_factor=stretch_factor / 10.0,
+                            png_clip_low=0.0 if stretch_preset == 1 else stretch_p_low / 10.0,
+                            png_clip_high=100.0 if stretch_preset == 1 else stretch_p_high / 100.0,
+                            ghs_D=ghs_D / 10.0, ghs_b=ghs_b / 10.0,
+                            ghs_SP=ghs_SP / 100.0, ghs_LP=ghs_LP / 100.0, ghs_HP=ghs_HP / 100.0,
+                            log_factor=float(log_factor),
+                            mtf_midtone=mtf_midtone / 100.0,
+                            mtf_shadows=mtf_shadows / 100.0,
+                            mtf_highlights=mtf_highlights / 100.0,
+                            gradient_removal=bool(galaxy_gradient_removal),
+                            gradient_removal_tiles=8,
+                            gradient_removal_flat_strength=galaxy_gradient_flat_strength,
+                            gradient_removal_poly_degree=galaxy_gradient_poly_degree,
+                            gradient_removal_sigma=galaxy_gradient_sigma / 10.0,
+                            isp_enable=False,
+                        )
+                        files_livestack.reset()
+                        files_livestack._files_vmax_ema = 0.0
+                        files_livestack.start()
+                        files_active = True
+                        files_paused = False
+                        files_index = 0
+                        if not hasattr(pygame, '_fx_proc'):
+                            import concurrent.futures as _cfe3
+                            pygame._fx_proc = {
+                                'executor': _cfe3.ThreadPoolExecutor(max_workers=1),
+                                'future': None, 'last_display': None,
+                            }
+                        else:
+                            pygame._fx_proc['future'] = None
+                            pygame._fx_proc['last_display'] = None
+                        print(f"[FILES] Démarrage: {len(files_list)} fichier(s)")
+                    else:
+                        print("[FILES] Aucun fichier trouvé dans", files_dir)
+                continue
+
+            # SAVE FIT
+            if is_click_on_files_save_fit(mousex, mousey, fs_width, fs_height):
+                if files_livestack is not None:
+                    try:
+                        if raw_format >= 2:
+                            save_with_external_processing(files_livestack, filename="files_stack",
+                                                          raw_format_name=raw_formats[raw_format])
+                        else:
+                            files_livestack.save(filename="files_stack")
+                        print("[FILES] Stack FITS sauvegardé")
+                    except Exception as _fe:
+                        print(f"[FILES] Erreur save FIT: {_fe}")
+                continue
+
+            # SAVE PNG
+            if is_click_on_files_save_png(mousex, mousey, fs_width, fs_height):
+                if files_last_filtered_array is not None:
+                    try:
+                        import cv2 as _cv2
+                        _png_dir = get_dated_save_dir("/home/admin/stacks/files")
+                        _png_path = os.path.join(str(_png_dir), f"files_preview_{files_index:04d}.png")
+                        _cv2.imwrite(_png_path, _cv2.cvtColor(files_last_filtered_array, _cv2.COLOR_RGB2BGR))
+                        print(f"[FILES] PNG sauvegardé: {_png_path}")
+                    except Exception as _fe:
+                        print(f"[FILES] Erreur save PNG: {_fe}")
+                continue
+
+            # PAUSE / REPRISE
+            if is_click_on_files_pause(mousex, mousey, fs_width, fs_height):
+                if files_active:
+                    files_active = False
+                    files_paused = True
+                    print("[FILES] Pause")
+                elif files_paused:
+                    files_paused = False
+                    files_active = True
+                    print("[FILES] Reprise")
+                continue
+
+            # RESET
+            if is_click_on_files_reset(mousex, mousey, fs_width, fs_height):
+                files_active = False
+                files_paused = False
+                files_index = 0
+                if files_livestack is not None:
+                    try:
+                        files_livestack.stop()
+                        files_livestack.reset()
+                        files_livestack._files_vmax_ema = 0.0
+                    except Exception:
+                        pass
+                if hasattr(pygame, '_fx_proc'):
+                    pygame._fx_proc['future'] = None
+                    pygame._fx_proc['last_display'] = None
+                files_last_filtered_array = None
+                files_pre_stretch_array   = None
+                files_pre_filter_array    = None
+                print("[FILES] Stack réinitialisé")
+                continue
+
+            # EXIT
+            if is_click_on_files_exit(mousex, mousey, fs_width, fs_height):
+                files_active = False
+                files_paused = False
+                if files_livestack is not None:
+                    try:
+                        files_livestack.stop()
+                    except Exception:
+                        pass
+                files_interface_mode = 0
+                files_settings_visible = 0
+                files_browser_visible = False
+                _files_slider_rects = {}
+                stretch_mode = 0
+                display_modes = pygame.display.list_modes()
+                _hw, _hh = display_modes[0] if display_modes and display_modes != -1 else (1024, 600)
+                windowSurfaceObj = pygame.display.set_mode((_hw, _hh), pygame.FULLSCREEN, 24)
+                windowSurfaceObj.fill((0, 0, 0))
+                menu = 0
+                print("[FILES] Mode FICHIERS désactivé")
+                continue
+
+            # Panneau réglages
+            if files_settings_visible == 1 and _files_slider_rects:
+                # Boutons spéciaux tab 0
+                if 'fx_choose_dir' in _files_slider_rects:
+                    if _files_slider_rects['fx_choose_dir'].collidepoint(mousex, mousey):
+                        files_browser_visible = True
+                        continue
+                if 'fx_rescan' in _files_slider_rects:
+                    if _files_slider_rects['fx_rescan'].collidepoint(mousex, mousey):
+                        _files_scan_dir()
+                        continue
+                if handle_files_slider_click(mousex, mousey, _files_slider_rects):
+                    _files_slider_dragging = True
+                    continue
+
+            continue  # Rester en mode FILES
 
         # ===== GESTION DES CLICS EN MODE LS INTERFACE =====
         if ls_interface_mode == 1:
@@ -18982,10 +22247,14 @@ while True:
                         video_format=_vfmt_map.get(raw_format, 'yuv420'),
                         raw_black_level=0,
                         gradient_removal=bool(ls_gradient_removal) if raw_format >= 2 else False,
+                        gradient_removal_flat_strength=ls_gradient_flat_strength if raw_format >= 2 else 0,
+                        gradient_removal_poly_degree=ls_gradient_poly_degree if raw_format >= 2 else 2,
+                        gradient_removal_sigma=ls_gradient_sigma if raw_format >= 2 else 2.0,
                         awb_auto=bool(ls_raw_awb_auto) if raw_format >= 2 else False,
                     )
                     livestack.camera_params['raw_format'] = raw_formats[raw_format]
                     livestack.reset()
+                    livestack._ls_vmax_ema = 0.0   # Reset normalisation EMA vmax
                     livestack.start()
                     livestack_active = True
                     # Mémoriser l'exposition cible pour rejeter les frames résiduelles
@@ -19505,7 +22774,7 @@ while True:
                 windowSurfaceObj.fill((0, 0, 0))
                 menu = 0
                 pygame.display.update()
-                if raw_format >= 2 and not (livestack_active or luckystack_active):
+                if raw_format >= 2 and not (livestack_active or luckystack_active or galaxy_active):
                     if capture_thread is not None:
                         capture_thread.set_capture_params({'type': 'main'})
                         if show_cmds == 1:
@@ -19513,8 +22782,8 @@ while True:
                 continue
 
             # Vérifier si clic sur le bouton STACK (entre dans le mode interface LS)
-            # Ne s'applique pas si livestack ou luckystack déjà actif
-            if not livestack_active and not luckystack_active and is_click_on_livestack_button(mousex, mousey, fs_width):
+            # Ne s'applique pas si livestack ou luckystack ou galaxy déjà actif
+            if not livestack_active and not luckystack_active and not galaxy_active and is_click_on_livestack_button(mousex, mousey, fs_width):
                 # Entrer dans le mode interface LS (sans lancer le stack directement)
                 ls_interface_mode = 1
                 ls_settings_visible = 0
@@ -19582,7 +22851,7 @@ while True:
             pygame.display.update()
 
             # Si on était en mode RAW preview (sans stacking), revenir en mode ISP normal
-            if raw_format >= 2 and not (livestack_active or luckystack_active):
+            if raw_format >= 2 and not (livestack_active or luckystack_active or galaxy_active):
                 if capture_thread is not None:
                     capture_thread.set_capture_params({'type': 'main'})
                     if show_cmds == 1:
@@ -22695,7 +25964,7 @@ while True:
                 _msg_rect = _msg.get_rect(center=(max_width // 2, max_height // 2))
                 windowSurfaceObj.blit(_msg, _msg_rect)
                 pygame.display.update()
-            elif moon_mode == 0 and sun_mode == 0 and jsk_live_mode == 0 and collimation_mode == 0:
+            elif moon_mode == 0 and sun_mode == 0 and jsk_live_mode == 0 and collimation_mode == 0 and galaxy_interface_mode == 0 and files_interface_mode == 0:
                 # Mode home screen : message centré + nettoyer le flag de suppression
                 _home_suppress_oldui = False
                 _hw2, _hh2 = windowSurfaceObj.get_size()
