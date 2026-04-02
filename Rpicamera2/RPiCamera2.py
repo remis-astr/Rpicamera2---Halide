@@ -2329,7 +2329,7 @@ galaxy_min_sharpness = 70       # x1000
 galaxy_max_drift = 2500
 galaxy_min_stars = 10
 
-galaxy_alignment_mode = 1       # 0=OFF, 1=Translation
+galaxy_alignment_mode = 1       # 0=OFF, 1=Translation, 2=Rotation
 galaxy_binning = 1              # 1=binning ON (1928×1090), 0=natif (3856×2180)
 
 # Gradient removal (pour RAW)
@@ -2348,7 +2348,7 @@ galaxy_save_raws = 0        # 0=OFF, 1=ON — Sauvegarder chaque frame RAW (FITS
 # ─── Mode FICHIERS ────────────────────────────────────────────────────────────
 files_interface_mode  = 0       # 0=OFF, 1=interface active
 files_settings_visible = 0      # 0=masqué, 1=panneau affiché
-files_settings_tab    = 0       # 0=Fich. 1=Stack 2=Str. 3=Filtres 4=Struct.
+files_settings_tab    = 0       # 0=Fich. 1=Stack 2=Str. 3=Filtres 4=Décnv. 5=Struct.
 files_active   = False          # True = traitement en cours
 files_paused   = False          # True = en pause
 files_livestack = None          # Instance RPiCameraLiveStackAdvanced
@@ -7592,11 +7592,11 @@ def draw_galaxy_controls(screen_width, screen_height):
             (panel_x + 2, start_y))
         start_y += 16
 
-        _align_names = ['OFF', 'Translation']
-        _align_idx = galaxy_alignment_mode
+        _align_names = ['OFF', 'Transl.', 'Rotation']
+        _align_idx = min(galaxy_alignment_mode, 2)
         control_rects['gx_alignment_mode'] = draw_jsk_slider(
             panel_x, start_y, slider_w, slider_h,
-            f"Align: {_align_names[_align_idx]}", _align_idx, 0, 1, (120, 90, 170))
+            f"Align: {_align_names[_align_idx]}", _align_idx, 0, 2, (120, 90, 170))
         start_y += slider_h + margin
 
         control_rects['gx_preview_refresh'] = draw_jsk_slider(
@@ -8352,7 +8352,7 @@ def draw_files_stats_bar(screen_width, screen_height, stats, is_paused=False):
 
 def _draw_files_tab_bar(panel_x, panel_w, y):
     global windowSurfaceObj, _font_cache, files_settings_tab
-    _labels = ["Fich.", "Stack", "Str.", "Filtres", "Struct."]
+    _labels = ["Fich.", "Stack", "Str.", "Filtres", "Décnv.", "Struct."]
     n = len(_labels); tab_h = 24; tab_w = panel_w // n
     rects = {}
     ck = 15
@@ -8453,10 +8453,10 @@ def draw_files_controls(screen_width, screen_height):
         # Alignement
         windowSurfaceObj.blit(_font_cache[ck_s].render("Alignement", True, (80, 190, 100)), (panel_x + 2, start_y))
         start_y += 16
-        _an = ['OFF', 'Translation']
+        _an = ['OFF', 'Transl.', 'Rotation']
         control_rects['gx_alignment_mode'] = draw_jsk_slider(
             panel_x, start_y, slider_w, slider_h,
-            f"Align: {_an[galaxy_alignment_mode]}", galaxy_alignment_mode, 0, 1, (50, 160, 80))
+            f"Align: {_an[min(galaxy_alignment_mode, 2)]}", galaxy_alignment_mode, 0, 2, (50, 160, 80))
         start_y += slider_h + margin
         # Formats supportés
         start_y += 6
@@ -8600,26 +8600,6 @@ def draw_files_controls(screen_width, screen_height):
         start_y += slider_h + margin
         control_rects['gx_usm_amount'] = draw_jsk_slider(panel_x, start_y, slider_w, slider_h, f"Intensité: {ls_lucky_usm_amount/10:.1f}", ls_lucky_usm_amount, 0, 50, (150, 120, 60))
         start_y += slider_h + margin + 2
-        _dm_names = ['OFF', 'Lucy-Rich.', 'Multi-Max', 'WavePSF']
-        _dm = (0 if not ls_lucky_lr_en and not ls_lucky_mm_en and not ls_lucky_wpsf_en
-               else 1 if ls_lucky_lr_en else 2 if ls_lucky_mm_en else 3)
-        windowSurfaceObj.blit(_font_cache[ck_s].render("Déconvolution", True, (130, 140, 180)), (panel_x + 2, start_y))
-        start_y += 16
-        control_rects['gx_deconv_mode'] = draw_jsk_slider(panel_x, start_y, slider_w, slider_h, f"Mode: {_dm_names[_dm]}", _dm, 0, 3, (90, 110, 180))
-        start_y += slider_h + margin
-        if _dm == 3:
-            _wc = (60, 150, 130)
-            control_rects['gx_wpsf_iter'] = draw_jsk_slider(panel_x, start_y, slider_w, slider_h, f"Iter RL: {ls_lucky_wpsf_iter}", ls_lucky_wpsf_iter, 5, 50, _wc)
-            start_y += slider_h + margin
-            control_rects['gx_wpsf_aperture'] = draw_jsk_slider(panel_x, start_y, slider_w, slider_h, f"Diam. {ls_wpsf_aperture}mm", ls_wpsf_aperture, 50, 1000, _wc)
-            start_y += slider_h + margin
-            control_rects['gx_wpsf_obstruction'] = draw_jsk_slider(panel_x, start_y, slider_w, slider_h, f"Obstr. {ls_wpsf_obstruction}%", ls_wpsf_obstruction, 0, 50, _wc)
-            start_y += slider_h + margin
-            control_rects['gx_wpsf_pixel_scale'] = draw_jsk_slider(panel_x, start_y, slider_w, slider_h, f"Échelle {ls_wpsf_pixel_scale/100:.2f}\"/px", ls_wpsf_pixel_scale, 5, 200, _wc)
-            start_y += slider_h + margin
-            control_rects['gx_wpsf_seeing'] = draw_jsk_slider(panel_x, start_y, slider_w, slider_h, f"Seeing {ls_wpsf_seeing/10:.1f}\"" if ls_wpsf_seeing > 0 else "Seeing OFF", ls_wpsf_seeing, 0, 30, _wc)
-            start_y += slider_h + margin
-        start_y += 4
         windowSurfaceObj.blit(_font_cache[ck_s].render("Balance couleur", True, (160, 140, 200)), (panel_x + 2, start_y))
         start_y += 16
         for _k, _lbl, _v, _mn, _mx, _c in [
@@ -8632,8 +8612,64 @@ def draw_files_controls(screen_width, screen_height):
             control_rects[_k] = draw_jsk_slider(panel_x, start_y, slider_w, slider_h, _lbl, _v, _mn, _mx, _c)
             start_y += slider_h + margin
 
-    # ── Tab 4 : Structure galactique ─────────────────────────────────────
+    # ── Tab 4 : Déconvolution ────────────────────────────────────────────
     elif files_settings_tab == 4:
+        slider_h = 22; margin = 2
+        _dm_names = {0: 'OFF', 1: 'Lucy-Rich.', 2: 'MM-ADMM', 3: 'WavePSF RL'}
+        _dm = (0 if not ls_lucky_lr_en and not ls_lucky_mm_en and not ls_lucky_wpsf_en
+               else 1 if ls_lucky_lr_en else 2 if ls_lucky_mm_en else 3)
+        _dm_colors = {0: (70, 80, 90), 1: (170, 100, 80), 2: (90, 110, 190), 3: (60, 150, 130)}
+        _dc = _dm_colors[_dm]
+        windowSurfaceObj.blit(_font_cache[ck_s].render("Déconvolution", True, (130, 150, 200)), (panel_x + 2, start_y))
+        start_y += 16
+        control_rects['gx_deconv_mode'] = draw_jsk_slider(panel_x, start_y, slider_w, slider_h, f"Mode: {_dm_names[_dm]}", _dm, 0, 3, _dc)
+        start_y += slider_h + margin + 2
+        if _dm == 1:
+            # Lucy-Richardson
+            _lrc = (170, 100, 80)
+            control_rects['gx_lr_iter'] = draw_jsk_slider(panel_x, start_y, slider_w, slider_h, f"Itér: {ls_lucky_lr_iter}", ls_lucky_lr_iter, 5, 60, _lrc)
+            start_y += slider_h + margin
+            control_rects['gx_lr_sigma'] = draw_jsk_slider(panel_x, start_y, slider_w, slider_h, f"Sigma PSF: {ls_lucky_lr_sigma/10:.1f}px", ls_lucky_lr_sigma, 5, 30, _lrc)
+            start_y += slider_h + margin
+        elif _dm == 2:
+            # MM-ADMM
+            _mmc = (90, 110, 190)
+            control_rects['gx_mm_iter'] = draw_jsk_slider(panel_x, start_y, slider_w, slider_h, f"Itér: {ls_lucky_mm_iter}", ls_lucky_mm_iter, 5, 30, _mmc)
+            start_y += slider_h + margin
+            control_rects['gx_mm_sigma'] = draw_jsk_slider(panel_x, start_y, slider_w, slider_h, f"Sigma PSF: {ls_lucky_mm_sigma/10:.1f}px", ls_lucky_mm_sigma, 3, 15, _mmc)
+            start_y += slider_h + margin
+            control_rects['gx_mm_lambda'] = draw_jsk_slider(panel_x, start_y, slider_w, slider_h, f"\u03bb TV: {ls_lucky_mm_lambda/100:.2f}", ls_lucky_mm_lambda, 1, 15, _mmc)
+            start_y += slider_h + margin
+        elif _dm == 3:
+            # WavePSF RL
+            _wc = (60, 150, 130)
+            windowSurfaceObj.blit(_font_cache[ck_s].render("Paramètres RL", True, _wc), (panel_x + 2, start_y))
+            start_y += 16
+            control_rects['gx_wpsf_iter'] = draw_jsk_slider(panel_x, start_y, slider_w, slider_h, f"Itér RL: {ls_lucky_wpsf_iter}", ls_lucky_wpsf_iter, 5, 50, _wc)
+            start_y += slider_h + margin + 2
+            windowSurfaceObj.blit(_font_cache[ck_s].render("Optique du télescope", True, _wc), (panel_x + 2, start_y))
+            start_y += 16
+            control_rects['gx_wpsf_aperture'] = draw_jsk_slider(panel_x, start_y, slider_w, slider_h, f"Diam. {ls_wpsf_aperture}mm", ls_wpsf_aperture, 50, 1000, _wc)
+            start_y += slider_h + margin
+            control_rects['gx_wpsf_obstruction'] = draw_jsk_slider(panel_x, start_y, slider_w, slider_h, f"Obstr. {ls_wpsf_obstruction}%", ls_wpsf_obstruction, 0, 50, _wc)
+            start_y += slider_h + margin
+            control_rects['gx_wpsf_pixel_scale'] = draw_jsk_slider(panel_x, start_y, slider_w, slider_h, f"Échelle {ls_wpsf_pixel_scale/100:.2f}\"/px", ls_wpsf_pixel_scale, 5, 200, _wc)
+            start_y += slider_h + margin
+            control_rects['gx_wpsf_seeing'] = draw_jsk_slider(panel_x, start_y, slider_w, slider_h, f"Seeing {ls_wpsf_seeing/10:.1f}\"" if ls_wpsf_seeing > 0 else "Seeing OFF", ls_wpsf_seeing, 0, 30, _wc)
+            start_y += slider_h + margin + 2
+            windowSurfaceObj.blit(_font_cache[ck_s].render("Aberrations (Zernike)", True, _wc), (panel_x + 2, start_y))
+            start_y += 16
+            control_rects['gx_wpsf_defocus'] = draw_jsk_slider(panel_x, start_y, slider_w, slider_h, f"Defocus {ls_wpsf_defocus/100:+.2f}\u03bb", ls_wpsf_defocus, -100, 100, _wc)
+            start_y += slider_h + margin
+            control_rects['gx_wpsf_astig_x'] = draw_jsk_slider(panel_x, start_y, slider_w, slider_h, f"Astig\u00d7 {ls_wpsf_astig_x/100:+.2f}\u03bb", ls_wpsf_astig_x, -100, 100, _wc)
+            start_y += slider_h + margin
+            control_rects['gx_wpsf_astig_y'] = draw_jsk_slider(panel_x, start_y, slider_w, slider_h, f"Astig+ {ls_wpsf_astig_y/100:+.2f}\u03bb", ls_wpsf_astig_y, -100, 100, _wc)
+            start_y += slider_h + margin
+            control_rects['gx_wpsf_spherical'] = draw_jsk_slider(panel_x, start_y, slider_w, slider_h, f"Sphér. {ls_wpsf_spherical/100:+.2f}\u03bb", ls_wpsf_spherical, -100, 100, _wc)
+            start_y += slider_h + margin
+
+    # ── Tab 5 : Structure galactique ─────────────────────────────────────
+    elif files_settings_tab == 5:
         slider_h = 22; margin = 2
         _tc = (80, 210, 190); _ce = (50, 170, 150); _cp = (60, 140, 190)
         _cenh = (80, 180, 155); _cusm = (60, 150, 200); _csr = (130, 160, 80)
@@ -8851,6 +8887,7 @@ def handle_galaxy_slider_click(mx, my, control_rects):
     global ls_lucky_mm_en, ls_lucky_mm_iter, ls_lucky_mm_sigma, ls_lucky_mm_lambda
     global ls_lucky_wpsf_en, ls_lucky_wpsf_iter
     global ls_wpsf_aperture, ls_wpsf_pixel_scale, ls_wpsf_seeing
+    global ls_wpsf_obstruction, ls_wpsf_defocus, ls_wpsf_astig_x, ls_wpsf_astig_y, ls_wpsf_spherical
     global ls_post_red, ls_post_green, ls_post_blue, ls_post_sat, ls_post_brightness
     global galaxy_paused, galaxy_pre_filter_array, galaxy_last_filtered_array
     global galaxy_livestack
@@ -8870,9 +8907,9 @@ def handle_galaxy_slider_click(mx, my, control_rects):
 
             # --- Tab 0: Capture ---
             elif name == 'gx_alignment_mode':
-                galaxy_alignment_mode = 1 if ratio > 0.5 else 0
+                galaxy_alignment_mode = max(0, min(2, int(ratio * 2 + 0.5)))
                 if galaxy_livestack is not None:
-                    _am = "translation" if galaxy_alignment_mode == 1 else "none"
+                    _am = ['none', 'translation', 'rotation'][galaxy_alignment_mode]
                     galaxy_livestack.configure(alignment_mode=_am)
             elif name == 'gx_preview_refresh':
                 galaxy_preview_refresh = max(1, min(10, int(ratio * 9) + 1))
@@ -9532,9 +9569,12 @@ def apply_lucky_post_stack_filters(img, color_correction=False):
             result = np.clip(result.astype(np.int16) + ls_post_brightness, 0, 255).astype(np.uint8)
         # ── Galaxy Structure Enhancer (après toutes les déconvolutions) ───────
         if galaxy_filter_en and galaxy_enhancer is not None:
+            _gp = GALAXY_FILTER_PRESETS[min(galaxy_filter_preset, len(GALAXY_FILTER_PRESETS)-1)]
             galaxy_enhancer.configure(
                 enabled       = True,
                 galaxy_type   = int(galaxy_filter_preset),
+                sigma_min     = float(_gp['sigma_min']),
+                sigma_max     = float(_gp['sigma_max']),
                 enhancement   = galaxy_filter_enh   / 10.0,
                 usm_strength  = galaxy_filter_usm   / 10.0,
                 star_reduction= galaxy_filter_star_r / 100.0,
@@ -19760,15 +19800,20 @@ while True:
                 # ===== LIVE STACK PAUSED: ré-appliquer stretch + filtres en temps réel =====
                 elif ls_paused and ls_pre_stretch_array is not None:
                     try:
-                        _pre = ls_pre_stretch_array.copy()
-                        # Re-appliquer le stretch avec les paramètres courants
-                        if stretch_preset != 0:
-                            _pre = astro_stretch(_pre)
-                        if _pre.dtype != np.uint8:
-                            _pre = np.clip(_pre, 0, 255).astype(np.uint8)
-                        ls_pre_filter_array = _pre  # Mettre à jour pour cohérence
-                        _disp = apply_lucky_post_stack_filters(_pre, color_correction=True)
-                        ls_last_filtered_array = _disp
+                        # Recalculer seulement si invalidé (ls_last_filtered_array = None)
+                        # → mis à None à l'entrée en pause et par handle_ls_slider_click
+                        if ls_last_filtered_array is None:
+                            _pre = ls_pre_stretch_array.copy()
+                            # Re-appliquer le stretch avec les paramètres courants
+                            if stretch_preset != 0:
+                                _pre = astro_stretch(_pre)
+                            if _pre.dtype != np.uint8:
+                                _pre = np.clip(_pre, 0, 255).astype(np.uint8)
+                            ls_pre_filter_array = _pre  # Mettre à jour pour cohérence
+                            _disp = apply_lucky_post_stack_filters(_pre, color_correction=True)
+                            ls_last_filtered_array = _disp
+                        else:
+                            _disp = ls_last_filtered_array
                         if len(_disp.shape) == 3:
                             _t = np.swapaxes(_disp, 0, 1)
                             if raw_format >= 2:
@@ -21665,7 +21710,7 @@ while True:
                         stacking_method=_method_names[galaxy_stack_method],
                         kappa=galaxy_stack_kappa / 10.0,
                         iterations=galaxy_stack_iterations,
-                        alignment_mode="translation" if galaxy_alignment_mode == 1 else "none",
+                        alignment_mode=['none', 'translation', 'rotation'][min(galaxy_alignment_mode, 2)],
                         enable_qc=bool(galaxy_enable_qc),
                         max_fwhm=galaxy_max_fwhm / 10.0 if galaxy_max_fwhm > 0 else 999.0,
                         min_sharpness=galaxy_min_sharpness / 1000.0 if galaxy_min_sharpness > 0 else 0.0,
@@ -21864,7 +21909,7 @@ while True:
                             stacking_method=_fx_methods[min(galaxy_stack_method, 4)],
                             kappa=galaxy_stack_kappa / 10.0,
                             iterations=galaxy_stack_iterations,
-                            alignment_mode="translation" if galaxy_alignment_mode == 1 else "none",
+                            alignment_mode=['none', 'translation', 'rotation'][min(galaxy_alignment_mode, 2)],
                             enable_qc=bool(galaxy_enable_qc),
                             max_fwhm=galaxy_max_fwhm / 10.0 if galaxy_max_fwhm > 0 else 999.0,
                             min_sharpness=galaxy_min_sharpness / 1000.0 if galaxy_min_sharpness > 0 else 0.0,
@@ -22052,6 +22097,7 @@ while True:
                 if livestack_active:
                     # Mettre en pause : suspendre sans réinitialiser le stack accumulé
                     ls_paused = True
+                    ls_last_filtered_array = None  # Forcer recalcul initial en pause
                     livestack_active = False
                     if livestack is not None:
                         livestack.pause()
