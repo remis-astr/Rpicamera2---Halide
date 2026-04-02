@@ -198,12 +198,14 @@ class AdvancedAligner:
         matches = []
         match_distances = []
 
-        # Seuil adaptatif : 5% de la plus petite dimension, entre 50px et 200px
+        # Seuil adaptatif : 15% de la plus petite dimension, entre 50px et 500px
+        # 5% était trop restrictif pour des séquences avec dérive > ~50px (images 1080p → 54px seulement)
+        # 15% → 162px pour 1080p, bien en dessous de l'espacement moyen des étoiles (~218px pour 43 étoiles)
         if self.reference_image is not None:
             h, w = self.reference_image.shape[:2]
-            match_threshold = max(50, min(200, int(0.05 * min(h, w))))
+            match_threshold = max(50, min(500, int(0.15 * min(h, w))))
         else:
-            match_threshold = 100
+            match_threshold = 150
 
         for i, ref_pt in enumerate(ref_pts):
             # Distances à toutes les étoiles courantes
@@ -216,21 +218,46 @@ class AdvancedAligner:
                 matches.append((ref_pt, cur_pts[min_idx]))
                 match_distances.append(min_dist)
 
-        # Besoin d'au moins 3 matches
-        if len(matches) < 3:
-            print(f"  [WARN] Pas assez de matches: {len(matches)}")
+        # Exiger au moins 25% des étoiles testées ET un minimum absolu de 5
+        min_required = max(5, int(0.25 * min(n_ref, n_cur)))
+        if len(matches) < min_required:
+            print(f"  [WARN] Pas assez de matches: {len(matches)}/{min(n_ref, n_cur)} (requis {min_required})")
             return None, {}
 
-        # Calculer la translation médiane (plus robuste que moyenne)
-        # ref - cur pour ramener l'image courante vers la référence
+        # ── RANSAC simplifié en 2 passes ─────────────────────────────────────
+        # Problème avec grand seuil (162px) : avec une dérive de ~86px, la probabilité
+        # qu'une étoile voisine soit plus proche que la vraie cible est ~32% par étoile.
+        # La médiane seule ne suffit plus quand la direction de dérive varie d'une frame
+        # à l'autre (oscillation du guidage). Solution : passe 1 grossière → passe 2
+        # affinée qui ne garde que les paires cohérentes avec la translation consensus.
+
+        # Passe 1 : estimation grossière (médiane brute sur tous les matches)
         translations = np.array([ref - cur for ref, cur in matches])
-        dy = np.median(translations[:, 0])
-        dx = np.median(translations[:, 1])
+        dy_rough = float(np.median(translations[:, 0]))
+        dx_rough = float(np.median(translations[:, 1]))
+
+        # Passe 2 : ne garder que les matches dont la translation est dans ±refine_tol
+        # de la translation grossière.  15px couvre les erreurs de centroïde tout en
+        # rejetant les faux appariements (translation aléatoire ≠ consensus).
+        refine_tol = 15.0
+        refined = [(ref, cur) for ref, cur in matches
+                   if (abs((ref[0] - cur[0]) - dy_rough) < refine_tol and
+                       abs((ref[1] - cur[1]) - dx_rough) < refine_tol)]
+
+        if len(refined) < min_required:
+            # Raffinement trop agressif (cas rare) → réutiliser les matches bruts
+            refined = matches
+
+        # Translation finale sur les matches raffinés
+        translations_refined = np.array([ref - cur for ref, cur in refined])
+        dy = float(np.median(translations_refined[:, 0]))
+        dx = float(np.median(translations_refined[:, 1]))
 
         params = {
             'dx': dx, 'dy': dy, 'angle': 0, 'scale': 1.0,
-            'matches': len(matches),
-            'total': len(ref_pts)
+            'matches': len(refined),
+            'total': len(ref_pts),
+            'raw_matches': len(matches),
         }
 
         transform = np.array([
@@ -242,17 +269,64 @@ class AdvancedAligner:
         return transform, params
     
     def _compute_rotation(self, ref_stars, cur_stars, image_shape):
-        """Calcule rotation + translation avec OpenCV"""
-        n_stars = min(30, len(ref_stars), len(cur_stars))
-        
-        # Convertir en format OpenCV (x, y)
-        ref_pts = ref_stars[:n_stars][:, [1, 0]].astype(np.float32)
-        cur_pts = cur_stars[:n_stars][:, [1, 0]].astype(np.float32)
-        
+        """Calcule rotation + translation avec matching d'étoiles puis RANSAC rigide.
+
+        Ancienne implémentation : passait les 30 étoiles ref et 30 étoiles courantes
+        triées INDÉPENDAMMENT par luminosité à estimateAffinePartial2D → faux car
+        l'algo attend des paires correspondantes.
+
+        Nouvelle implémentation :
+          1. Matching NNN (même pipeline que translation, tolérance élargie à 25px
+             pour conserver les étoiles déplacées par rotation)
+          2. estimateAffinePartial2D sur les paires matchées → rotation + translation
+        """
+        n_ref = min(30, len(ref_stars))
+        n_cur = min(30, len(cur_stars))
+        ref_pts_all = ref_stars[:n_ref]
+        cur_pts_all = cur_stars[:n_cur]
+
+        # ── Seuil adaptatif identique au mode translation ──────────────────────
+        if self.reference_image is not None:
+            h, w = self.reference_image.shape[:2]
+            match_threshold = max(50, min(500, int(0.15 * min(h, w))))
+        else:
+            match_threshold = 150
+
+        # ── Matching NNN ───────────────────────────────────────────────────────
+        matches = []
+        for ref_pt in ref_pts_all:
+            distances = np.sqrt(np.sum((cur_pts_all - ref_pt)**2, axis=1))
+            min_idx = np.argmin(distances)
+            if distances[min_idx] < match_threshold:
+                matches.append((ref_pt, cur_pts_all[min_idx]))
+
+        min_required = max(5, int(0.25 * min(n_ref, n_cur)))
+        if len(matches) < min_required:
+            print(f"  [WARN] Pas assez de matches: {len(matches)}/{min(n_ref, n_cur)}")
+            return None, {}
+
+        # ── RANSAC 2-pass pour éliminer les faux matches ──────────────────────
+        # Tolérance volontairement large (25px) pour ne PAS éliminer les étoiles
+        # dont la translation brute dévie à cause de la rotation de champ.
+        # L'étape suivante (estimateAffinePartial2D) gère correctement la rotation.
+        translations = np.array([ref - cur for ref, cur in matches])
+        dy_rough = float(np.median(translations[:, 0]))
+        dx_rough = float(np.median(translations[:, 1]))
+        refine_tol = 25.0
+        refined = [(ref, cur) for ref, cur in matches
+                   if (abs((ref[0] - cur[0]) - dy_rough) < refine_tol and
+                       abs((ref[1] - cur[1]) - dx_rough) < refine_tol)]
+        if len(refined) < min_required:
+            refined = matches
+
+        # ── Ajustement rigide (rotation + translation) sur paires matchées ────
+        # Convertir (y, x) → (x, y) pour OpenCV
+        matched_ref = np.array([pt[[1, 0]] for pt, _ in refined], dtype=np.float32)
+        matched_cur = np.array([pt[[1, 0]] for _, pt in refined], dtype=np.float32)
+
         try:
-            # Transformation rigide (rotation + translation + scale)
             M, inliers = cv2.estimateAffinePartial2D(
-                cur_pts, ref_pts,
+                matched_cur, matched_ref,
                 method=cv2.RANSAC,
                 ransacReprojThreshold=5.0,
                 maxIters=2000,
@@ -262,29 +336,28 @@ class AdvancedAligner:
             if M is None:
                 return None, {}
 
-            # Vérifier le ratio d'inliers
-            n_inliers = np.sum(inliers) if inliers is not None else 0
-            inliers_ratio = n_inliers / len(cur_pts) if len(cur_pts) > 0 else 0
+            n_inliers = int(np.sum(inliers)) if inliers is not None else 0
+            inliers_ratio = n_inliers / len(matched_cur) if len(matched_cur) > 0 else 0
 
             if inliers_ratio < self.config.quality.min_inliers_ratio:
-                print(f"  [WARN] Pas assez d'inliers: {n_inliers}/{len(cur_pts)} ({inliers_ratio*100:.1f}%)")
+                print(f"  [WARN] Pas assez d'inliers rotation: {n_inliers}/{len(matched_cur)} "
+                      f"({inliers_ratio*100:.1f}%)")
                 return None, {}
 
-            # Extraire paramètres
             angle = np.arctan2(M[1, 0], M[0, 0]) * 180 / np.pi
             scale = np.sqrt(M[0, 0]**2 + M[1, 0]**2)
-            dx = M[0, 2]
-            dy = M[1, 2]
+            dx = float(M[0, 2])
+            dy = float(M[1, 2])
 
             params = {
                 'dx': dx, 'dy': dy, 'angle': angle, 'scale': scale,
                 'inliers': n_inliers,
-                'total': len(cur_pts)
+                'total': len(matched_ref),
             }
 
             transform = np.vstack([M, [0, 0, 1]])
-
             return transform, params
+
         except Exception as e:
             print(f"  [ALIGN] Erreur _compute_rotation: {e}")
             return None, {}
@@ -386,9 +459,18 @@ class AdvancedAligner:
         drift = np.sqrt(params.get('dx', 0)**2 + params.get('dy', 0)**2)
 
         if mode == AlignmentMode.TRANSLATION:
-            matches = params.get('matches', 0)
-            total = params.get('total', 0)
-            print(f"  Translation: drift={drift:.2f}px, matches={matches}/{total}")
+            matches     = params.get('matches', 0)
+            raw_matches = params.get('raw_matches', matches)  # avant raffinement RANSAC
+            total       = params.get('total', 0)
+            dx          = params.get('dx', 0)
+            dy          = params.get('dy', 0)
+            # Afficher dx/dy pour diagnostiquer les changements de direction de dérive
+            if raw_matches != matches:
+                print(f"  Translation: drift={drift:.2f}px, dx={dx:+.1f} dy={dy:+.1f}, "
+                      f"matches={matches}/{total} (bruts:{raw_matches})")
+            else:
+                print(f"  Translation: drift={drift:.2f}px, dx={dx:+.1f} dy={dy:+.1f}, "
+                      f"matches={matches}/{total}")
         elif mode == AlignmentMode.ROTATION:
             print(f"  Rotation: angle={params.get('angle', 0):.3f}°, "
                   f"drift={drift:.2f}px, "
