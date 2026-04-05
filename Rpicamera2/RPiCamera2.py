@@ -1121,6 +1121,41 @@ def auto_fix_bad_pixels_bayer(raw_bayer, sigma=5.0, min_threshold_adu=20.0, blen
     return np.clip(fixed, 0, 65535).astype(np.uint16)
 
 
+def _fix_hot_pixels_rgb(rgb_float32, sigma=5.0, min_adu=20.0, blend_factor=0.7):
+    """
+    Retrait de pixels chauds sur image float32 RGB [0,1] déjà décodée.
+    Même algorithme qu'auto_fix_bad_pixels_bayer() mais par canal RGB.
+    min_adu : seuil minimum en unités ADU 16-bit (équivalent à la plage 0-65535).
+    """
+    import cv2
+    scaled = np.clip(rgb_float32 * 65535.0, 0, 65535).astype(np.float32)
+    result = scaled.copy()
+    for c in range(scaled.shape[2]):
+        ch = scaled[:, :, c].copy()
+        med = cv2.medianBlur(ch.astype(np.uint16), 3).astype(np.float32)
+        dev_hot = np.maximum(ch - med, 0)
+        block_size = 64
+        h, w = ch.shape
+        thresh_map = np.zeros_like(ch)
+        for by in range(0, h, block_size):
+            for bx in range(0, w, block_size):
+                ye, xe = min(by + block_size, h), min(bx + block_size, w)
+                bd = dev_hot[by:ye, bx:xe]
+                mad = np.median(bd[bd > 0]) if np.any(bd > 0) else 0
+                thr = sigma * mad * 1.4826
+                if mad < 1e-6:
+                    thr = sigma * np.percentile(bd, 95)
+                if min_adu > 0:
+                    thr = max(thr, min_adu)
+                thresh_map[by:ye, bx:xe] = thr
+        is_hot = dev_hot > thresh_map
+        is_hot[0, :] = False; is_hot[-1, :] = False
+        is_hot[:, 0] = False; is_hot[:, -1] = False
+        ch[is_hot] = blend_factor * med[is_hot] + (1 - blend_factor) * ch[is_hot]
+        result[:, :, c] = ch
+    return np.clip(result / 65535.0, 0.0, 1.0).astype(np.float32)
+
+
 def debayer_raw_array(raw_array, raw_format_str, red_gain=1.0, blue_gain=1.0, apply_denoise=True, swap_rb=False, fix_bad_pixels=False, sigma_threshold=5.0, min_adu_threshold=20.0, bl_per_channel=None, bl_auto_estimate=False, use_vng=False, global_black_level=0):
     """
     Débayérise un array RAW Bayer (SRGGB12 ou SRGGB16) en RGB uint16 avec balance des blancs.
@@ -1373,17 +1408,8 @@ def _ls_process_frame_thread(arr_copy, proc_kw, livestack_obj):
             livestack_obj._ls_vmax_ema = _new_ema
             # Normaliser à [0,1] (même espace que session.get_preview_png)
             _norm = np.clip(_raw * (1.0 / max(_new_ema, 1e-6)), 0.0, 1.0)
-            # Retrait de gradient si activé — même position que dans
-            # session.get_preview_png() : après norm, avant stretch
-            if _sess is not None and getattr(getattr(_sess, 'config', None), 'gradient_removal', False):
-                _ls_cfg = _sess.config
-                _norm = _sess._remove_gradient(
-                    _norm,
-                    n_tiles=getattr(_ls_cfg, 'gradient_removal_tiles', 8),
-                    flat_strength=getattr(_ls_cfg, 'gradient_removal_flat_strength', 0),
-                    poly_degree=getattr(_ls_cfg, 'gradient_removal_poly_degree', 2),
-                    grid_sigma=getattr(_ls_cfg, 'gradient_removal_sigma', 2.0),
-                )
+            # Sauvegarder le float32 pré-gradient pour réglage interactif en pause
+            livestack_obj._ls_pre_gradient = _norm.copy()
             stacked = np.clip(_norm * 255.0, 0, 255).astype(np.uint8)
         else:
             # MODE ISP/YUV : get_preview_png() n'active pas l'EMA vmin (clip_high=100.0)
@@ -1429,10 +1455,12 @@ def _galaxy_process_frame_thread(arr_copy, proc_kw, galaxy_ls_obj):
 
 def _files_scan_dir():
     """Scanne files_dir et peuple files_list (triée chronologiquement)."""
-    global files_list, files_index
-    _EXTS = {'.dng', '.raw', '.cr2', '.nef', '.arw', '.orf', '.rw2', '.pef',
-             '.fit', '.fits', '.fts', '.ser',
-             '.png', '.jpg', '.jpeg', '.tif', '.tiff', '.bmp'}
+    global files_list, files_index, files_format_type
+    _EXTS_IMAGE = {'.dng', '.raw', '.cr2', '.nef', '.arw', '.orf', '.rw2', '.pef',
+                   '.fit', '.fits', '.fts',
+                   '.png', '.jpg', '.jpeg', '.tif', '.tiff', '.bmp'}
+    _EXTS_VIDEO = {'.ser', '.mp4', '.mpeg', '.mpg', '.avi', '.mov'}
+    _EXTS = _EXTS_IMAGE | _EXTS_VIDEO
     try:
         _paths = [
             os.path.join(files_dir, f)
@@ -1446,17 +1474,22 @@ def _files_scan_dir():
         print(f"[FILES] Scan: {_e}")
         files_list = []
     files_index = 0
-    print(f"[FILES] {len(files_list)} fichier(s) dans {files_dir}")
+    # Détecter le type de fichiers : "video" si au moins un SER/MP4/MPEG présent
+    _has_video = any(os.path.splitext(p)[1].lower() in _EXTS_VIDEO for p in files_list)
+    files_format_type = "video" if _has_video else "image"
+    print(f"[FILES] {len(files_list)} fichier(s) dans {files_dir} — mode: {files_format_type}")
 
 
 def _files_load_and_stack(file_path, ls_obj):
     """
-    Charge un fichier image (DNG/FITS/SER/PNG/JPEG...) et l'injecte dans le
-    pipeline galaxy (process_frame + normalisation EMA vmax + gradient removal).
+    Charge un fichier image (DNG/FITS/SER/MP4/MPEG/PNG/JPEG...) et l'injecte dans le
+    pipeline approprié (Lucky si vidéo, galaxy sinon).
     Retourne uint8 (H,W,3) ou None.
+    Pour les fichiers vidéo/SER, ls_obj._video_file_done=True signale fin du fichier.
     Appelé depuis ThreadPoolExecutor(max_workers=1).
     """
     _ext = os.path.splitext(file_path)[1].lower()
+    _VIDEO_EXTS = {'.ser', '.mp4', '.mpeg', '.mpg', '.avi', '.mov'}
     try:
         rgb = None   # float32 (H,W,3)
 
@@ -1488,9 +1521,11 @@ def _files_load_and_stack(file_path, ls_obj):
 
         elif _ext == '.ser':
             import struct as _struct
+            import cv2 as _cv2
             with open(file_path, 'rb') as _f:
                 _hdr = _f.read(178)
             if len(_hdr) < 178:
+                ls_obj._video_file_done = True
                 return None
             _color_id  = _struct.unpack_from('<i', _hdr, 18)[0]
             _endian    = _struct.unpack_from('<i', _hdr, 22)[0]
@@ -1498,23 +1533,75 @@ def _files_load_and_stack(file_path, ls_obj):
             _img_h     = _struct.unpack_from('<i', _hdr, 30)[0]
             _bit_depth = _struct.unpack_from('<i', _hdr, 34)[0]
             _fc        = _struct.unpack_from('<i', _hdr, 38)[0]
-            _bpp  = (_bit_depth + 7) // 8
-            _chs  = 3 if _color_id > 0 else 1
+            _bpp = (_bit_depth + 7) // 8
+            # ColorID: 0=MONO, 8=BAYER_RGGB, 9=BAYER_GRBG, 10=BAYER_GBRG, 11=BAYER_BGGR
+            #          100=RGB, 101=BGR  — Bayer = 1 canal RAW, pas 3 canaux
+            # IMPORTANT : convention OpenCV décalée vs SER (BayerBG = RGGB physique, etc.)
+            # Référence : FireCapture, SharpCap, PIPP utilisent ce même mapping.
+            _SER_BAYER = { 8: _cv2.COLOR_BayerBG2RGB,   # RGGB → BayerBG en OpenCV
+                           9: _cv2.COLOR_BayerGR2RGB,   # GRBG → BayerGR
+                          10: _cv2.COLOR_BayerGB2RGB,   # GBRG → BayerGB
+                          11: _cv2.COLOR_BayerRG2RGB}   # BGGR → BayerRG
+            _is_bayer = _color_id in _SER_BAYER
+            _chs  = 3 if _color_id in (100, 101) else 1   # Bayer et MONO = 1 canal
             _fsize = _img_w * _img_h * _bpp * _chs
-            _fidx = getattr(ls_obj, '_ser_frame_idx', 0)
+            ls_obj._video_total_frames = _fc
+            _fidx = getattr(ls_obj, '_video_frame_idx', 0)
             if _fidx >= _fc:
+                ls_obj._video_file_done = True
                 return None
             with open(file_path, 'rb') as _f:
                 _f.seek(178 + _fidx * _fsize)
                 _raw_bytes = _f.read(_fsize)
             if len(_raw_bytes) < _fsize:
+                ls_obj._video_file_done = True
                 return None
             _dtype = np.uint8 if _bpp == 1 else (np.uint16 if _endian == 0 else np.dtype('>u2'))
-            _arr = np.frombuffer(_raw_bytes, dtype=_dtype).astype(np.float32)
-            _arr /= (255.0 if _bpp == 1 else 65535.0)
-            rgb = (_arr.reshape(_img_h, _img_w, 3) if _chs == 3
-                   else np.stack([_arr.reshape(_img_h, _img_w)] * 3, axis=2))
-            ls_obj._ser_frame_idx = _fidx + 1
+            _arr = np.frombuffer(_raw_bytes, dtype=_dtype)
+            if _chs == 3:
+                # RGB ou BGR direct
+                _img = _arr.reshape(_img_h, _img_w, 3)
+                if _color_id == 101:   # BGR → RGB
+                    _img = _img[:, :, ::-1]
+                rgb = _img.astype(np.float32) / (255.0 if _bpp == 1 else 65535.0)
+            elif _is_bayer:
+                # Bayer RAW → debayering → RGB
+                _bayer = _arr.reshape(_img_h, _img_w)
+                if _bpp > 1 and _endian != 0:          # big-endian → swap
+                    _bayer = _bayer.byteswap()
+                _bayer8 = (_bayer >> ((_bit_depth - 8) if _bit_depth > 8 else 0)).astype(np.uint8)
+                _rgb8 = _cv2.cvtColor(_bayer8, _SER_BAYER[_color_id])
+                rgb = _rgb8.astype(np.float32) / 255.0
+            else:
+                # MONO → répliquer en 3 canaux
+                _gray = _arr.reshape(_img_h, _img_w).astype(np.float32)
+                _gray /= (255.0 if _bpp == 1 else 65535.0)
+                rgb = np.stack([_gray, _gray, _gray], axis=2)
+            ls_obj._video_frame_idx = _fidx + 1
+            ls_obj._video_file_done = (_fidx + 1 >= _fc)
+
+        elif _ext in ('.mp4', '.mpeg', '.mpg', '.avi', '.mov'):
+            import cv2 as _cv2
+            _cap = _cv2.VideoCapture(file_path)
+            if not _cap.isOpened():
+                ls_obj._video_file_done = True
+                return None
+            _fc = int(_cap.get(_cv2.CAP_PROP_FRAME_COUNT))
+            ls_obj._video_total_frames = max(_fc, 1)
+            _fidx = getattr(ls_obj, '_video_frame_idx', 0)
+            if _fidx >= _fc > 0:
+                _cap.release()
+                ls_obj._video_file_done = True
+                return None
+            _cap.set(_cv2.CAP_PROP_POS_FRAMES, _fidx)
+            _ret, _vframe = _cap.read()
+            _cap.release()
+            if not _ret:
+                ls_obj._video_file_done = True
+                return None
+            rgb = _cv2.cvtColor(_vframe, _cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+            ls_obj._video_frame_idx = _fidx + 1
+            ls_obj._video_file_done = (_fidx + 1 >= _fc)
 
         elif _ext in ('.png', '.jpg', '.jpeg', '.tif', '.tiff', '.bmp'):
             import cv2 as _cv2
@@ -1528,35 +1615,128 @@ def _files_load_and_stack(file_path, ls_obj):
             return None
 
         if rgb is None:
+            # Pour les fichiers non-vidéo, indiquer que le fichier est terminé
+            if _ext not in _VIDEO_EXTS:
+                ls_obj._video_file_done = True
             return None
 
+        # Retrait pixels chauds (si activé)
+        if fix_bad_pixels:
+            rgb = _fix_hot_pixels_rgb(
+                rgb,
+                sigma=fix_bad_pixels_sigma / 10.0,
+                min_adu=fix_bad_pixels_min_adu / 10.0)
+
+        # ── Mode Lucky (SER/vidéo) : process_frame() gère le pipeline en interne ──
+        if getattr(ls_obj, 'use_lucky', False):
+            _lucky_result = ls_obj.process_frame(rgb)
+            if _lucky_result is None:
+                _lucky_result = ls_obj.last_lucky_result
+            if _lucky_result is None:
+                return None
+            _mx = float(_lucky_result.max())
+            if _mx <= 0:
+                return None
+            _norm = np.clip(_lucky_result * (1.0 / _mx), 0.0, 1.0)
+            # Super-résolution : vrai drizzle (si actif) ou Lanczos fallback
+            if files_drizzle_en and files_drizzle_scale > 10:
+                _lucky_stk = getattr(ls_obj, 'lucky_stacker', None)
+                _drz_res = None
+                if _lucky_stk is not None and getattr(_lucky_stk, 'use_drizzle', False):
+                    # Résultat drizzle déjà à la bonne résolution
+                    _drz_raw = getattr(_lucky_stk, 'last_drizzle_result', None)
+                    if _drz_raw is not None:
+                        _dmx = float(_drz_raw.max())
+                        if _dmx > 0:
+                            _drz_res = np.clip(_drz_raw * (1.0 / _dmx), 0.0, 1.0)
+                if _drz_res is not None:
+                    _norm = _drz_res
+                else:
+                    # Fallback Lanczos si drizzle pas encore disponible
+                    import cv2 as _cv2
+                    _dsc = files_drizzle_scale / 10.0
+                    _dh, _dw = _norm.shape[:2]
+                    _norm = _cv2.resize(
+                        _norm.astype(np.float32),
+                        (int(_dw * _dsc), int(_dh * _dsc)),
+                        interpolation=_cv2.INTER_LANCZOS4)
+            return np.clip(_norm * 255.0, 0, 255).astype(np.uint8)
+
+        # ── Mode Galaxy (images) : pipeline existant ──────────────────────────────
+        ls_obj._video_file_done = True  # fichier image = 1 frame, toujours terminé
         # Injecter dans le pipeline de stacking (identique à _gx_stack_worker)
         ls_obj.process_frame(rgb)
 
         _stacked = None
+        _raw = None
         if ls_obj.session is not None and ls_obj.session.stacker is not None:
             _raw = ls_obj.session.stacker.get_result()
-            if _raw is not None:
-                _raw = _raw.copy()
-                # Remplacer NaN/inf (bordures warpAffine) par 0 avant normalisation
-                if not np.all(np.isfinite(_raw)):
-                    _raw = np.where(np.isfinite(_raw), _raw, 0.0)
-                _mx = float(_raw.max())
-                if _mx > 0:
-                    _ema = getattr(ls_obj, '_files_vmax_ema', 0.0)
-                    _new_ema = _mx if _ema <= 0 else 0.25 * _mx + 0.75 * _ema
-                    ls_obj._files_vmax_ema = _new_ema
-                    _norm = np.clip(_raw * (1.0 / max(_new_ema, 1e-6)), 0.0, 1.0)
-                    _sess = ls_obj.session
-                    if getattr(getattr(_sess, 'config', None), 'gradient_removal', False):
-                        _gc = _sess.config
-                        _norm = _sess._remove_gradient(
-                            _norm,
-                            n_tiles=getattr(_gc, 'gradient_removal_tiles', 8),
-                            flat_strength=getattr(_gc, 'gradient_removal_flat_strength', 0),
-                            poly_degree=getattr(_gc, 'gradient_removal_poly_degree', 2),
-                            grid_sigma=getattr(_gc, 'gradient_removal_sigma', 2.0))
-                    _stacked = np.clip(_norm * 255.0, 0, 255).astype(np.uint8)
+        # Alignement Surface : résultat dans advanced_stacker (pas session.stacker)
+        if _raw is None and getattr(ls_obj, 'use_planetary', False):
+            _adv = getattr(ls_obj, 'advanced_stacker', None)
+            if _adv is not None:
+                _raw = _adv.combine()
+        if _raw is not None:
+            _raw = _raw.copy()
+            # Recadrer sur la zone bien couverte (intersection des frames)
+            # Avec canvas élargi et drift croissant, la zone de référence fixe
+            # contient des pixels couverts par peu de frames aux bords → aspect
+            # "rétrécissement" après stretch. On utilise la weight_map pour
+            # trouver la zone couverte par ≥90% des frames (intersection robuste)
+            # et la cropper. pygame.transform.scale ramène ensuite à l'écran.
+            _aligner = getattr(ls_obj.session, 'aligner', None) if ls_obj.session else None
+            _cmx = getattr(_aligner, '_canvas_mx', 0)
+            _cmy = getattr(_aligner, '_canvas_my', 0)
+            _dbg_n = getattr(getattr(getattr(ls_obj.session, 'stacker', None), 'config', None), 'num_stacked', 0)
+            print(f"[FILES-DBG #{_dbg_n}] raw shape avant crop: {_raw.shape}, canvas_mx={_cmx} canvas_my={_cmy}")
+            if _cmx > 0 or _cmy > 0:
+                _stacker_obj = getattr(ls_obj.session, 'stacker', None)
+                _wmap = getattr(_stacker_obj, 'weight_map', None)
+                _n_stacked = max(1, getattr(getattr(_stacker_obj, 'config', None), 'num_stacked', 1))
+                _done_crop = False
+                if _wmap is not None:
+                    _wmax = float(_wmap.max())
+                    _wmin_nonzero = float(_wmap[_wmap > 0].min()) if (_wmap > 0).any() else 0
+                    print(f"[FILES-DBG #{_dbg_n}] weight_map shape={_wmap.shape} max={_wmax:.0f} min_nonzero={_wmin_nonzero:.0f} n_stacked={_n_stacked}")
+                    _thresh = max(1.0, _wmax * 0.90)
+                    _mask = _wmap >= _thresh
+                    _n_covered = int(_mask.sum())
+                    if _mask.any():
+                        _rows_ok = np.where(_mask.any(axis=1))[0]
+                        _cols_ok = np.where(_mask.any(axis=0))[0]
+                        print(f"[FILES-DBG #{_dbg_n}] thresh={_thresh:.1f} covered_px={_n_covered} rows=[{_rows_ok[0]}:{_rows_ok[-1]+1}] cols=[{_cols_ok[0]}:{_cols_ok[-1]+1}]")
+                        if len(_rows_ok) >= 64 and len(_cols_ok) >= 64:
+                            _raw = _raw[int(_rows_ok[0]):int(_rows_ok[-1]) + 1,
+                                        int(_cols_ok[0]):int(_cols_ok[-1]) + 1]
+                            _done_crop = True
+                            print(f"[FILES-DBG #{_dbg_n}] crop wmap → shape={_raw.shape}")
+                    else:
+                        print(f"[FILES-DBG #{_dbg_n}] thresh={_thresh:.1f} → aucun pixel couvert!")
+                else:
+                    print(f"[FILES-DBG #{_dbg_n}] weight_map=None → fallback crop fixe")
+                if not _done_crop:
+                    _ch, _cw = _raw.shape[:2]
+                    _h_orig = _ch - 2 * _cmy
+                    _w_orig = _cw - 2 * _cmx
+                    if _h_orig > 0 and _w_orig > 0:
+                        _raw = _raw[_cmy:_cmy + _h_orig, _cmx:_cmx + _w_orig]
+                        print(f"[FILES-DBG #{_dbg_n}] crop fixe → shape={_raw.shape}")
+            # Remplacer NaN/inf (bordures warpAffine) par 0 avant normalisation
+            _nan_count = int(np.sum(~np.isfinite(_raw)))
+            if _nan_count > 0:
+                print(f"[FILES-DBG #{_dbg_n}] NaN/inf dans crop: {_nan_count} px ({100*_nan_count/_raw.size:.1f}%)")
+                _raw = np.where(np.isfinite(_raw), _raw, 0.0)
+            _mx = float(_raw.max())
+            print(f"[FILES-DBG #{_dbg_n}] crop final shape={_raw.shape} max={_mx:.2f}")
+            if _mx > 0:
+                _ema = getattr(ls_obj, '_files_vmax_ema', 0.0)
+                _new_ema = _mx if _ema <= 0 else 0.25 * _mx + 0.75 * _ema
+                ls_obj._files_vmax_ema = _new_ema
+                _norm = np.clip(_raw * (1.0 / max(_new_ema, 1e-6)), 0.0, 1.0)
+                # Sauvegarder le float32 pré-gradient pour réglage interactif en pause
+                ls_obj._files_pre_gradient = _norm.copy()
+                _stacked = np.clip(_norm * 255.0, 0, 255).astype(np.uint8)
+                print(f"[FILES-DBG #{_dbg_n}] stacked shape={_stacked.shape} vmax_ema={_new_ema:.2f}")
         return _stacked
 
     except Exception as _e:
@@ -2154,8 +2334,16 @@ ls_paused = False                    # True = live stack en pause
 ls_last_filtered_array = None        # Dernier résultat filtré LS pour bouton SAVE PNG
 ls_pre_filter_array = None           # Stack LS avant filtres (re-filtrage interactif en pause)
 ls_pre_stretch_array = None          # Stack LS avant stretch (re-stretch interactif en pause)
+ls_pre_gradient_array = None         # float32 [0,1] stack avant gradient removal (interactif en pause)
 
 # Filtres de netteté post-stack Lucky (onglet Filtre)
+ls_wavelet_en        = False # Wavelets Registax actifs
+ls_wavelet_l1        = 0    # Niveau 1 fin (~1px), ×10 (0–30)
+ls_wavelet_l2        = 0    # Niveau 2 (~2px)
+ls_wavelet_l3        = 0    # Niveau 3 (~4px)
+ls_wavelet_l4        = 0    # Niveau 4 (~8px)
+ls_wavelet_l5        = 0    # Niveau 5 (~16px)
+ls_wavelet_l6        = 0    # Niveau 6 grossier (~32px)
 ls_lucky_clahe_en    = 0     # 0=off, 1=on
 ls_lucky_clahe_str   = 15    # CLAHE clipLimit ×10  (10→1.0 … 40→4.0)
 ls_lucky_clahe_tile  = 8     # CLAHE tileGridSize (4–32)
@@ -2216,8 +2404,8 @@ ls_cam_saturation = 10  # Saturation hardware ISP LS: 0-20 → 0.0-2.0 (défaut 
 
 # Live Stack parameters
 ls_preview_refresh = 5  # Rafraîchir preview toutes les N images (1-10)
-ls_alignment_mode = 2  # 0=OFF/none, 1=translation, 2=rotation, 3=affine
-ls_alignment_modes = ["OFF", "translation", "rotation", "affine"]
+ls_alignment_mode = 2  # 0=OFF/none, 1=translation, 2=rotation
+ls_alignment_modes = ["OFF", "translation", "rotation"]
 ls_enable_qc = 0  # Contrôle qualité désactivé par défaut (0=OFF, 1=ON)
 ls_max_fwhm = 170  # FWHM max x10 (0=OFF, 100-250 = 10.0-25.0)
 ls_min_sharpness = 70  # Netteté min x1000 (0=OFF, 30-150 = 0.030-0.150)
@@ -2329,14 +2517,17 @@ galaxy_min_sharpness = 70       # x1000
 galaxy_max_drift = 2500
 galaxy_min_stars = 10
 
-galaxy_alignment_mode = 1       # 0=OFF, 1=Translation, 2=Rotation
+galaxy_alignment_mode = 2       # 0=OFF, 1=Translation, 2=Rotation, 3=Surface
+files_img_max_shift = 100       # Décalage max alignement images (pixels), 0-500
 galaxy_binning = 1              # 1=binning ON (1928×1090), 0=natif (3856×2180)
 
 # Gradient removal (pour RAW)
 galaxy_gradient_removal = 0
+galaxy_gradient_intensity = 0   # 0-100 % intensité du retrait (mode FILES uniquement)
 galaxy_gradient_flat_strength = 0
 galaxy_gradient_poly_degree = 2
 galaxy_gradient_sigma = 20      # x10
+galaxy_pre_gradient_array = None  # float32 [0,1] stack avant gradient removal (interactif en pause)
 
 galaxy_color_enabled = 0    # 0=OFF, 1=ON — Correction couleur RVB (post-stretch)
 galaxy_r_gain = 100         # 50-200 → 0.5x-2.0x (100=neutre)
@@ -2358,8 +2549,12 @@ files_index    = 0              # Index du fichier en cours de traitement
 files_last_filtered_array = None
 files_pre_filter_array    = None
 files_pre_stretch_array   = None
+files_pre_gradient_array  = None  # float32 [0,1] stack avant gradient removal (interactif en pause)
 files_browser_visible = False   # Navigateur de dossier ouvert
 files_browser_scroll  = 0       # Scroll dans le navigateur
+files_format_type     = "image" # "image" ou "video" — déterminé par _files_scan_dir()
+files_drizzle_en      = False   # Super-résolution Lanczos active (mode vidéo/SER)
+files_drizzle_scale   = 15      # Facteur ×10 (10=×1.0, 15=×1.5, 20=×2.0, 30=×3.0)
 
 # RAW Format parameters (pour Lucky/Live Stack et vidéo RAW)
 raw_format = 1  # 0=YUV420, 1=XRGB8888, 2=SRGGB12, 3=SRGGB16
@@ -2383,6 +2578,7 @@ isp_wb_blue = 100             # 0.5-2.0 → 50-200 (défaut 1.0)
 isp_gamma = 100               # 0.5-3.0 → 50-300 (défaut 1.0, correspond à gamma 2.2)
 isp_black_level = 256         # 0-500 direct (défaut 256 pour IMX585 12-bit)
 ls_gradient_removal = 0       # 0=OFF, 1=ON  (suppression gradient fond de ciel, RAW uniquement)
+ls_gradient_intensity = 0     # 0-100 % intensité du retrait (0=désactivé)
 ls_gradient_flat_strength = 0 # 0-100 : intensité correction vignetage (0=BG seulement, 100=flat complet)
 ls_gradient_poly_degree = 2   # Degré polynôme 2D (1=linéaire 2=quadratique 3=cubique 4=quartique)
 ls_gradient_sigma = 2.0       # Seuil σ masquage tuiles (0.5=agressif, 5.0=minimal)
@@ -3060,7 +3256,7 @@ isp_config_path = "isp_config_neutral.json"
 
 # Live Stack parameters
 ls_preview_refresh = max(1, min(ls_preview_refresh, 10))
-ls_alignment_mode = max(0, min(ls_alignment_mode, 2))
+ls_alignment_mode = max(0, min(ls_alignment_mode, 2))  # 0=OFF, 1=translation, 2=rotation
 ls_enable_qc = max(0, min(ls_enable_qc, 1))
 ls_max_fwhm = max(0, min(ls_max_fwhm, 300))
 ls_min_sharpness = max(0, min(ls_min_sharpness, 200))
@@ -6094,7 +6290,7 @@ def draw_ls_stats_bar(screen_width, screen_height, stats, is_scheduler=False,
 def _draw_ls_tab_bar(panel_x, panel_w, y):
     """Dessine la barre d'onglets LS (7 onglets) et retourne les rects."""
     global windowSurfaceObj, _font_cache, ls_settings_tab
-    tab_labels = ["Cap.", "QC", "Stack", "Sched.", "Img", "Str.", "Filtres"]
+    tab_labels = ["Cap.", "QC", "Stack", "Sched.", "Img", "Str.", "Filtres", "Wav."]
     n = len(tab_labels)
     tab_h = 24
     tab_w = panel_w // n
@@ -6130,11 +6326,13 @@ def draw_ls_controls(screen_width, screen_height):
     global ls_settings_tab, livestack_active, ls_sched_frames_done
     global stretch_preset, isp_gamma, isp_brightness, isp_contrast, isp_saturation
     global ls_cam_brightness, ls_cam_contrast, ls_cam_saturation, raw_format
-    global isp_black_level, ls_gradient_removal, ls_gradient_flat_strength, ls_gradient_poly_degree, ls_gradient_sigma, ls_raw_awb_auto
+    global isp_black_level, ls_gradient_removal, ls_gradient_intensity, ls_gradient_flat_strength, ls_gradient_poly_degree, ls_gradient_sigma, ls_raw_awb_auto
     global log_factor, mtf_shadows, mtf_midtone, mtf_highlights
     global ghs_D, ghs_b, ghs_SP, ghs_LP, ghs_HP, ghs_preset, stretch_factor, stretch_p_low, stretch_p_high
     global ls_planetary_enable, ls_planetary_mode, ls_planetary_disk_min, ls_planetary_disk_max
     global fix_bad_pixels, fix_bad_pixels_sigma, fix_bad_pixels_min_adu
+    global ls_wavelet_en, ls_wavelet_l1, ls_wavelet_l2, ls_wavelet_l3
+    global ls_wavelet_l4, ls_wavelet_l5, ls_wavelet_l6
     global ls_lucky_clahe_en, ls_lucky_clahe_str, ls_lucky_clahe_tile
     global ls_lucky_usm_en, ls_lucky_usm_sigma, ls_lucky_usm_amount
     global ls_lucky_lr_en, ls_lucky_lr_iter, ls_lucky_lr_sigma
@@ -6220,11 +6418,11 @@ def draw_ls_controls(screen_width, screen_height):
             (panel_x + 2, start_y))
         start_y += 16
 
-        align_names = ['OFF', 'Translation', 'Rotation', 'Affine']
+        align_names = ['OFF', 'Translation', 'Rotation']
         cur_align = align_names[ls_alignment_mode] if 0 <= ls_alignment_mode < len(align_names) else "?"
         control_rects['ls_alignment_mode'] = draw_jsk_slider(
             panel_x, start_y, slider_w, slider_h,
-            f"Mode: {cur_align}", ls_alignment_mode, 0, 3, (75, 155, 95))
+            f"Mode: {cur_align}", ls_alignment_mode, 0, 2, (75, 155, 95))
         start_y += slider_h + margin
 
         control_rects['ls_preview_refresh'] = draw_jsk_slider(
@@ -6483,25 +6681,25 @@ def draw_ls_controls(screen_width, screen_height):
                         f"{_ch_lbl}: {_ch_val}", _ch_val, 0, 512, (110, 130, 160))
                     start_y += slider_h + margin
 
-            _gr_lbl = "ON" if ls_gradient_removal else "OFF"
             control_rects['ls_raw_gradient'] = draw_jsk_slider(
                 panel_x, start_y, slider_w, slider_h,
-                f"Gradient BG: {_gr_lbl}", ls_gradient_removal, 0, 1, (110, 160, 140))
+                f"Intensité: {ls_gradient_intensity}%", ls_gradient_intensity, 0, 100, (110, 160, 140))
             start_y += slider_h + margin
-            control_rects['ls_raw_flat_strength'] = draw_jsk_slider(
-                panel_x, start_y, slider_w, slider_h,
-                f"Vignetage: {ls_gradient_flat_strength}%", ls_gradient_flat_strength, 0, 100, (110, 160, 140))
-            start_y += slider_h + margin
-            _poly_labels = {1: "Lin", 2: "Quad", 3: "Cub", 4: "Qua4"}
-            control_rects['ls_raw_poly_degree'] = draw_jsk_slider(
-                panel_x, start_y, slider_w, slider_h,
-                f"Poly deg: {_poly_labels.get(ls_gradient_poly_degree, ls_gradient_poly_degree)}",
-                ls_gradient_poly_degree, 1, 4, (110, 160, 140))
-            start_y += slider_h + margin
-            control_rects['ls_raw_grid_sigma'] = draw_jsk_slider(
-                panel_x, start_y, slider_w, slider_h,
-                f"Sigma tuiles: {ls_gradient_sigma:.1f}", ls_gradient_sigma * 10, 5, 50, (110, 160, 140))
-            start_y += slider_h + margin
+            if ls_gradient_intensity > 0:
+                _poly_labels = {1: "Lin", 2: "Quad", 3: "Cub", 4: "Qua4"}
+                control_rects['ls_raw_flat_strength'] = draw_jsk_slider(
+                    panel_x, start_y, slider_w, slider_h,
+                    f"Vignetage: {ls_gradient_flat_strength}%", ls_gradient_flat_strength, 0, 100, (110, 160, 140))
+                start_y += slider_h + margin
+                control_rects['ls_raw_poly_degree'] = draw_jsk_slider(
+                    panel_x, start_y, slider_w, slider_h,
+                    f"Poly deg: {_poly_labels.get(ls_gradient_poly_degree, ls_gradient_poly_degree)}",
+                    ls_gradient_poly_degree, 1, 4, (110, 160, 140))
+                start_y += slider_h + margin
+                control_rects['ls_raw_grid_sigma'] = draw_jsk_slider(
+                    panel_x, start_y, slider_w, slider_h,
+                    f"Sigma tuiles: {ls_gradient_sigma:.1f}", ls_gradient_sigma * 10, 5, 50, (110, 160, 140))
+                start_y += slider_h + margin
             _awb_lbl = "ON" if ls_raw_awb_auto else "OFF"
             control_rects['ls_raw_awb_auto'] = draw_jsk_slider(
                 panel_x, start_y, slider_w, slider_h,
@@ -6783,6 +6981,40 @@ def draw_ls_controls(screen_width, screen_height):
             f"Luminosit\u00e9: {ls_post_brightness:+d}", ls_post_brightness, -100, 100, (190, 190, 120))
         start_y += slider_h + margin
 
+    # ── Tab 7 : Wavelets Registax ──────────────────────────────────────────────
+    elif ls_settings_tab == 7:
+        slider_h = 24; margin = 4
+        _wc = (80, 160, 220); _wca = (50, 120, 190)
+        windowSurfaceObj.blit(
+            _font_cache[ck_sect].render("Wavelets (style Registax)", True, _wc),
+            (panel_x + 2, start_y))
+        start_y += 18
+        windowSurfaceObj.blit(
+            _font_cache[15].render("Sharpening multi-échelles sans halo", True, (70, 100, 130)),
+            (panel_x + 2, start_y))
+        start_y += 14
+        _we_col = _wca if ls_wavelet_en else (60, 70, 85)
+        control_rects['ls_wav_en'] = draw_jsk_slider(
+            panel_x, start_y, slider_w, slider_h,
+            f"Wavelets: {'ON' if ls_wavelet_en else 'OFF'}",
+            int(ls_wavelet_en), 0, 1, _we_col)
+        start_y += slider_h + margin + 4
+        windowSurfaceObj.blit(
+            _font_cache[15].render("L1=fins détails  →  L6=structures larges", True, (70, 100, 130)),
+            (panel_x + 2, start_y))
+        start_y += 14
+        for _k, _lbl, _v in [
+            ('ls_wav_l1', f"L1 (~1px):   {ls_wavelet_l1/10:.1f}", ls_wavelet_l1),
+            ('ls_wav_l2', f"L2 (~2px):   {ls_wavelet_l2/10:.1f}", ls_wavelet_l2),
+            ('ls_wav_l3', f"L3 (~4px):   {ls_wavelet_l3/10:.1f}", ls_wavelet_l3),
+            ('ls_wav_l4', f"L4 (~8px):   {ls_wavelet_l4/10:.1f}", ls_wavelet_l4),
+            ('ls_wav_l5', f"L5 (~16px):  {ls_wavelet_l5/10:.1f}", ls_wavelet_l5),
+            ('ls_wav_l6', f"L6 (~32px):  {ls_wavelet_l6/10:.1f}", ls_wavelet_l6),
+        ]:
+            _lc = _wca if _v > 0 else (55, 65, 80)
+            control_rects[_k] = draw_jsk_slider(panel_x, start_y, slider_w, slider_h, _lbl, _v, 0, 30, _lc)
+            start_y += slider_h + margin
+
     return control_rects
 
 
@@ -6795,12 +7027,14 @@ def handle_ls_slider_click(mx, my, control_rects):
     global ls_scheduler_enabled, ls_sched_gain, ls_sched_expo_us, ls_sched_frames
     global stretch_preset, isp_gamma, isp_brightness, isp_contrast, isp_saturation
     global ls_cam_brightness, ls_cam_contrast, ls_cam_saturation, picam2, use_picamera2
-    global livestack, isp_black_level, ls_gradient_removal, ls_gradient_flat_strength, ls_gradient_poly_degree, ls_gradient_sigma, ls_raw_awb_auto
+    global livestack, isp_black_level, ls_gradient_removal, ls_gradient_intensity, ls_gradient_flat_strength, ls_gradient_poly_degree, ls_gradient_sigma, ls_raw_awb_auto
     global debayer_vng, ls_bl_per_channel_enable, ls_bl_r, ls_bl_g1, ls_bl_g2, ls_bl_b
     global log_factor, mtf_shadows, mtf_midtone, mtf_highlights
     global ghs_D, ghs_b, ghs_SP, ghs_LP, ghs_HP, stretch_factor, stretch_p_low, stretch_p_high
     global ls_planetary_enable, ls_planetary_mode, ls_planetary_disk_min, ls_planetary_disk_max
     global fix_bad_pixels, fix_bad_pixels_sigma, fix_bad_pixels_min_adu
+    global ls_wavelet_en, ls_wavelet_l1, ls_wavelet_l2, ls_wavelet_l3
+    global ls_wavelet_l4, ls_wavelet_l5, ls_wavelet_l6
     global ls_lucky_clahe_en, ls_lucky_clahe_str, ls_lucky_clahe_tile
     global ls_lucky_usm_en, ls_lucky_usm_sigma, ls_lucky_usm_amount
     global ls_lucky_lr_en, ls_lucky_lr_iter, ls_lucky_lr_sigma
@@ -6809,7 +7043,7 @@ def handle_ls_slider_click(mx, my, control_rects):
     global ls_wpsf_aperture, ls_wpsf_obstruction, ls_wpsf_pixel_scale, ls_wpsf_seeing
     global ls_wpsf_defocus, ls_wpsf_astig_x, ls_wpsf_astig_y, ls_wpsf_spherical
     global ls_post_red, ls_post_green, ls_post_blue, ls_post_sat, ls_post_brightness
-    global ls_paused, ls_pre_filter_array, ls_last_filtered_array
+    global ls_paused, ls_pre_filter_array, ls_last_filtered_array, ls_pre_gradient_array
     global raw_format
     import math as _math
 
@@ -6821,7 +7055,7 @@ def handle_ls_slider_click(mx, my, control_rects):
             elif name.startswith('ls_capture_format_'):
                 raw_format = int(name[-1])
             elif name == 'ls_alignment_mode':
-                ls_alignment_mode = max(0, min(3, int(ratio * 3 + 0.5)))
+                ls_alignment_mode = max(0, min(2, int(ratio * 2 + 0.5)))
             elif name == 'ls_preview_refresh':
                 ls_preview_refresh = max(1, min(10, int(ratio * 9) + 1))
             elif name == 'ls_save_progress':
@@ -6963,21 +7197,30 @@ def handle_ls_slider_click(mx, my, control_rects):
             elif name == 'ls_raw_bl_b':
                 ls_bl_b = int(ratio * 512)
             elif name == 'ls_raw_gradient':
-                ls_gradient_removal = 1 if ratio > 0.5 else 0
+                ls_gradient_intensity = int(ratio * 100)
+                ls_gradient_removal = 1 if ls_gradient_intensity > 0 else 0
                 if livestack is not None:
-                    livestack.configure(gradient_removal=bool(ls_gradient_removal))
+                    livestack.configure(gradient_removal=bool(ls_gradient_intensity > 0))
+                if ls_paused:
+                    ls_last_filtered_array = None
             elif name == 'ls_raw_flat_strength':
                 ls_gradient_flat_strength = int(ratio * 100)
                 if livestack is not None:
                     livestack.configure(gradient_removal_flat_strength=ls_gradient_flat_strength)
+                if ls_paused:
+                    ls_last_filtered_array = None
             elif name == 'ls_raw_poly_degree':
                 ls_gradient_poly_degree = max(1, min(4, int(1 + ratio * 3 + 0.5)))
                 if livestack is not None:
                     livestack.configure(gradient_removal_poly_degree=ls_gradient_poly_degree)
+                if ls_paused:
+                    ls_last_filtered_array = None
             elif name == 'ls_raw_grid_sigma':
                 ls_gradient_sigma = round(max(0.5, min(5.0, 0.5 + ratio * 4.5)), 1)
                 if livestack is not None:
                     livestack.configure(gradient_removal_sigma=ls_gradient_sigma)
+                if ls_paused:
+                    ls_last_filtered_array = None
             elif name == 'ls_raw_awb_auto':
                 ls_raw_awb_auto = 1 if ratio > 0.5 else 0
                 if livestack is not None:
@@ -7002,6 +7245,21 @@ def handle_ls_slider_click(mx, my, control_rects):
                 fix_bad_pixels_sigma = max(10, int(10 + ratio * 90 + 0.5))
             elif name == 'ls_raw_fix_adu':
                 fix_bad_pixels_min_adu = max(10, int(10 + ratio * 490 + 0.5))
+            # --- Wavelets (onglet 6) ---
+            elif name == 'ls_wav_en':
+                ls_wavelet_en = ratio > 0.5
+            elif name == 'ls_wav_l1':
+                ls_wavelet_l1 = max(0, min(30, int(ratio * 30 + 0.5)))
+            elif name == 'ls_wav_l2':
+                ls_wavelet_l2 = max(0, min(30, int(ratio * 30 + 0.5)))
+            elif name == 'ls_wav_l3':
+                ls_wavelet_l3 = max(0, min(30, int(ratio * 30 + 0.5)))
+            elif name == 'ls_wav_l4':
+                ls_wavelet_l4 = max(0, min(30, int(ratio * 30 + 0.5)))
+            elif name == 'ls_wav_l5':
+                ls_wavelet_l5 = max(0, min(30, int(ratio * 30 + 0.5)))
+            elif name == 'ls_wav_l6':
+                ls_wavelet_l6 = max(0, min(30, int(ratio * 30 + 0.5)))
             # --- Filtres post-stack (onglet 6, partagés avec Lucky) ---
             elif name == 'ls_lucky_clahe_en':
                 ls_lucky_clahe_en = 1 if ratio > 0.5 else 0
@@ -7059,7 +7317,7 @@ def handle_ls_slider_click(mx, my, control_rects):
             elif name == 'ls_post_brightness':
                 ls_post_brightness = max(-100, min(100, int(-100 + ratio * 200 + 0.5)))
             # Re-appliquer les filtres si stack en pause
-            if name.startswith(('ls_lucky_', 'ls_post_', 'ls_wpsf_')) and ls_paused and ls_pre_filter_array is not None:
+            if name.startswith(('ls_wav_', 'ls_lucky_', 'ls_post_', 'ls_wpsf_')) and ls_paused and ls_pre_filter_array is not None:
                 try:
                     ls_last_filtered_array = apply_lucky_post_stack_filters(
                         ls_pre_filter_array.copy(), color_correction=True)
@@ -7527,11 +7785,11 @@ def draw_galaxy_controls(screen_width, screen_height):
     Retourne dict des rects pour détection clics.
     """
     global windowSurfaceObj, _font_cache
-    global galaxy_settings_tab, galaxy_active, galaxy_livestack, galaxy_alignment_mode
+    global galaxy_settings_tab, galaxy_active, galaxy_livestack, galaxy_alignment_mode, files_img_max_shift
     global galaxy_hdr_bits_clip, galaxy_hdr_weights
     global galaxy_stack_method, galaxy_stack_kappa, galaxy_stack_iterations
     global galaxy_enable_qc, galaxy_max_fwhm, galaxy_min_sharpness, galaxy_max_drift, galaxy_min_stars
-    global galaxy_preview_refresh, galaxy_gradient_removal
+    global galaxy_preview_refresh, galaxy_gradient_removal, galaxy_gradient_intensity
     global stretch_preset, stretch_factor, stretch_p_low, stretch_p_high
     global ghs_D, ghs_b, ghs_SP, ghs_LP, ghs_HP
     global log_factor, mtf_shadows, mtf_midtone, mtf_highlights
@@ -7592,12 +7850,17 @@ def draw_galaxy_controls(screen_width, screen_height):
             (panel_x + 2, start_y))
         start_y += 16
 
-        _align_names = ['OFF', 'Transl.', 'Rotation']
-        _align_idx = min(galaxy_alignment_mode, 2)
+        _align_names = ['OFF', 'Transl.', 'Rotation', 'Surface']
+        _align_idx = min(galaxy_alignment_mode, 3)
         control_rects['gx_alignment_mode'] = draw_jsk_slider(
             panel_x, start_y, slider_w, slider_h,
-            f"Align: {_align_names[_align_idx]}", _align_idx, 0, 2, (120, 90, 170))
+            f"Align: {_align_names[_align_idx]}", _align_idx, 0, 3, (120, 90, 170))
         start_y += slider_h + margin
+        if galaxy_alignment_mode > 0:
+            control_rects['gx_img_max_shift'] = draw_jsk_slider(
+                panel_x, start_y, slider_w, slider_h,
+                f"Drift max: {files_img_max_shift}px", files_img_max_shift, 0, 500, (100, 75, 150))
+            start_y += slider_h + margin
 
         control_rects['gx_preview_refresh'] = draw_jsk_slider(
             panel_x, start_y, slider_w, slider_h,
@@ -7760,13 +8023,13 @@ def draw_galaxy_controls(screen_width, screen_height):
             _font_cache[ck_sect].render("Gradient", True, (170, 140, 210)),
             (panel_x + 2, start_y))
         start_y += 16
-        control_rects['gx_gradient'] = draw_jsk_slider(
+        control_rects['gx_gradient_intensity'] = draw_jsk_slider(
             panel_x, start_y, slider_w, slider_h,
-            f"Gradient BG: {'ON' if galaxy_gradient_removal else 'OFF'}",
-            galaxy_gradient_removal, 0, 1, (130, 120, 170))
+            f"Intensité: {galaxy_gradient_intensity}%",
+            galaxy_gradient_intensity, 0, 100, (130, 120, 170))
         start_y += slider_h + margin
 
-        if galaxy_gradient_removal:
+        if galaxy_gradient_intensity > 0:
             _poly_labels = {1: 'Linéaire', 2: 'Quadratique', 3: 'Cubique', 4: 'Quartique'}
             control_rects['gx_gradient_flat_strength'] = draw_jsk_slider(
                 panel_x, start_y, slider_w, slider_h,
@@ -8351,8 +8614,9 @@ def draw_files_stats_bar(screen_width, screen_height, stats, is_paused=False):
 
 
 def _draw_files_tab_bar(panel_x, panel_w, y):
-    global windowSurfaceObj, _font_cache, files_settings_tab
-    _labels = ["Fich.", "Stack", "Str.", "Filtres", "Décnv.", "Struct."]
+    global windowSurfaceObj, _font_cache, files_settings_tab, files_format_type
+    _tab1 = "Lucky" if files_format_type == "video" else "Stack"
+    _labels = ["Fich.", _tab1, "Str.", "Filtres", "Décnv.", "Struct.", "Wav."]
     n = len(_labels); tab_h = 24; tab_w = panel_w // n
     rects = {}
     ck = 15
@@ -8374,9 +8638,12 @@ def _draw_files_tab_bar(panel_x, panel_w, y):
 def draw_files_controls(screen_width, screen_height):
     """Panneau de réglages FILES — partage les globals galaxy pour le pipeline."""
     global windowSurfaceObj, _font_cache, files_settings_tab, files_dir
+    global files_drizzle_en, files_drizzle_scale
+    global ls_wavelet_en, ls_wavelet_l1, ls_wavelet_l2, ls_wavelet_l3
+    global ls_wavelet_l4, ls_wavelet_l5, ls_wavelet_l6
     global galaxy_stack_method, galaxy_stack_kappa, galaxy_stack_iterations
     global galaxy_enable_qc, galaxy_max_fwhm, galaxy_min_sharpness, galaxy_max_drift, galaxy_min_stars
-    global galaxy_alignment_mode, galaxy_gradient_removal
+    global galaxy_alignment_mode, galaxy_gradient_removal, galaxy_gradient_intensity, files_img_max_shift
     global galaxy_gradient_flat_strength, galaxy_gradient_poly_degree, galaxy_gradient_sigma
     global stretch_preset, ghs_D, ghs_b, ghs_SP, ghs_LP, ghs_HP
     global stretch_factor, stretch_p_low, stretch_p_high
@@ -8391,10 +8658,14 @@ def draw_files_controls(screen_width, screen_height):
     global ls_wpsf_defocus, ls_wpsf_astig_x, ls_wpsf_astig_y, ls_wpsf_spherical
     global ls_post_red, ls_post_green, ls_post_blue, ls_post_sat, ls_post_brightness
     global debayer_vng, ls_bl_per_channel_enable, ls_bl_r, ls_bl_g1, ls_bl_g2, ls_bl_b
-    global isp_black_level, fix_bad_pixels, fix_bad_pixels_sigma
+    global isp_black_level, fix_bad_pixels, fix_bad_pixels_sigma, fix_bad_pixels_min_adu
     global galaxy_filter_en, galaxy_filter_preset, galaxy_filter_enh, galaxy_filter_usm
     global galaxy_filter_star_r, galaxy_filter_star_k, galaxy_filter_n_scales
     global GALAXY_FILTER_PRESETS
+    global files_format_type, files_active, files_livestack
+    global ls_lucky_buffer, ls_lucky_keep, ls_lucky_score, ls_lucky_stack
+    global ls_lucky_align, ls_lucky_roi, ls_lucky_max_shift
+    global ls_lucky_buffer_mode, ls_elite_pool_size, ls_elite_stack_interval
 
     panel_w = 260; panel_m = 10
     panel_x = screen_width - panel_w - panel_m
@@ -8421,48 +8692,157 @@ def draw_files_controls(screen_width, screen_height):
     if files_settings_tab == 0:
         ck_s2 = 18
         if ck_s2 not in _font_cache: _font_cache[ck_s2] = pygame.font.Font(None, ck_s2)
-        # Dossier courant
-        windowSurfaceObj.blit(_font_cache[ck_s].render("Dossier source", True, (80, 190, 100)), (panel_x + 2, start_y))
-        start_y += 16
-        _dn = files_dir if len(files_dir) <= 28 else "..." + files_dir[-25:]
-        windowSurfaceObj.blit(_font_cache[ck_s2].render(_dn, True, (150, 220, 160)), (panel_x + 4, start_y))
+        # Source courante (dossier ou fichier vidéo unique)
+        _is_single_vid = (files_format_type == "video" and len(files_list) == 1
+                          and os.path.isfile(files_list[0]))
+        if _is_single_vid:
+            windowSurfaceObj.blit(_font_cache[ck_s].render("Fichier vidéo", True, (100, 170, 255)), (panel_x + 2, start_y))
+            start_y += 16
+            _fn = os.path.basename(files_list[0])
+            _fn = _fn if len(_fn) <= 28 else _fn[:25] + "..."
+            windowSurfaceObj.blit(_font_cache[ck_s2].render(_fn, True, (160, 210, 255)), (panel_x + 4, start_y))
+        else:
+            windowSurfaceObj.blit(_font_cache[ck_s].render("Dossier source", True, (80, 190, 100)), (panel_x + 2, start_y))
+            start_y += 16
+            _dn = files_dir if len(files_dir) <= 28 else "..." + files_dir[-25:]
+            windowSurfaceObj.blit(_font_cache[ck_s2].render(_dn, True, (150, 220, 160)), (panel_x + 4, start_y))
         start_y += 18
-        # Bouton "Choisir dossier"
+        # Bouton "Choisir fichier/dossier"
         _br = pygame.Rect(panel_x + 4, start_y, slider_w - 8, 28)
-        pygame.draw.rect(windowSurfaceObj, (20, 60, 32), _br, border_radius=6)
-        pygame.draw.rect(windowSurfaceObj, (55, 160, 75), _br, 1, border_radius=6)
-        windowSurfaceObj.blit(_font_cache[ck_s].render("Choisir dossier", True, (100, 220, 130)),
-                              _font_cache[ck_s].render("Choisir dossier", True, (100, 220, 130)).get_rect(center=_br.center))
+        pygame.draw.rect(windowSurfaceObj, (18, 35, 60), _br, border_radius=6)
+        pygame.draw.rect(windowSurfaceObj, (55, 130, 200), _br, 1, border_radius=6)
+        windowSurfaceObj.blit(_font_cache[ck_s].render("Choisir fichier / dossier", True, (120, 190, 255)),
+                              _font_cache[ck_s].render("Choisir fichier / dossier", True, (120, 190, 255)).get_rect(center=_br.center))
         control_rects['fx_choose_dir'] = _br
         start_y += 34
-        # Fichiers trouvés
+        # Fichiers trouvés / sélectionnés
         _total = len(files_list)
         _done  = min(files_index, _total)
-        windowSurfaceObj.blit(_font_cache[ck_s].render(f"{_total} fichier(s) trouvé(s)", True, (80, 200, 100)), (panel_x + 2, start_y))
+        windowSurfaceObj.blit(_font_cache[ck_s].render(f"{_total} fichier(s) sélectionné(s)", True, (80, 200, 100)), (panel_x + 2, start_y))
         start_y += 18
         windowSurfaceObj.blit(_font_cache[ck_s].render(f"Traités: {_done}/{_total}", True, (120, 210, 140)), (panel_x + 2, start_y))
         start_y += 22
-        # Bouton Rescanner
-        _rr = pygame.Rect(panel_x + 4, start_y, slider_w - 8, 28)
-        pygame.draw.rect(windowSurfaceObj, (16, 45, 24), _rr, border_radius=6)
-        pygame.draw.rect(windowSurfaceObj, (40, 120, 55), _rr, 1, border_radius=6)
-        windowSurfaceObj.blit(_font_cache[ck_s].render("Rescanner dossier", True, (80, 180, 100)),
-                              _font_cache[ck_s].render("Rescanner dossier", True, (80, 180, 100)).get_rect(center=_rr.center))
-        control_rects['fx_rescan'] = _rr
-        start_y += 34
+        # Bouton Rescanner (seulement pour mode dossier images)
+        if not _is_single_vid:
+            _rr = pygame.Rect(panel_x + 4, start_y, slider_w - 8, 28)
+            pygame.draw.rect(windowSurfaceObj, (16, 45, 24), _rr, border_radius=6)
+            pygame.draw.rect(windowSurfaceObj, (40, 120, 55), _rr, 1, border_radius=6)
+            windowSurfaceObj.blit(_font_cache[ck_s].render("Rescanner dossier", True, (80, 180, 100)),
+                                  _font_cache[ck_s].render("Rescanner dossier", True, (80, 180, 100)).get_rect(center=_rr.center))
+            control_rects['fx_rescan'] = _rr
+            start_y += 34
         # Alignement
         windowSurfaceObj.blit(_font_cache[ck_s].render("Alignement", True, (80, 190, 100)), (panel_x + 2, start_y))
         start_y += 16
-        _an = ['OFF', 'Transl.', 'Rotation']
+        _an = ['OFF', 'Transl.', 'Rotation', 'Surface']
         control_rects['gx_alignment_mode'] = draw_jsk_slider(
             panel_x, start_y, slider_w, slider_h,
-            f"Align: {_an[min(galaxy_alignment_mode, 2)]}", galaxy_alignment_mode, 0, 2, (50, 160, 80))
+            f"Align: {_an[min(galaxy_alignment_mode, 3)]}", galaxy_alignment_mode, 0, 3, (50, 160, 80))
         start_y += slider_h + margin
+        if galaxy_alignment_mode > 0:
+            control_rects['gx_img_max_shift'] = draw_jsk_slider(
+                panel_x, start_y, slider_w, slider_h,
+                f"Drift max: {files_img_max_shift}px", files_img_max_shift, 0, 500, (40, 140, 70))
+            start_y += slider_h + margin
         # Formats supportés
         start_y += 6
-        windowSurfaceObj.blit(_font_cache[ck_s].render("Formats: DNG FITS SER PNG JPEG", True, (60, 130, 75)), (panel_x + 2, start_y))
+        windowSurfaceObj.blit(_font_cache[ck_s].render("Images: DNG FITS PNG JPEG", True, (60, 130, 75)), (panel_x + 2, start_y))
+        start_y += 16
+        windowSurfaceObj.blit(_font_cache[ck_s].render("Vidéo: SER MP4 MPEG AVI MOV", True, (100, 160, 220)), (panel_x + 2, start_y))
+        start_y += 14
+        _ftype_col = (100, 200, 240) if files_format_type == "video" else (100, 220, 130)
+        windowSurfaceObj.blit(_font_cache[ck_s].render(f"Mode détecté: {files_format_type.upper()}", True, _ftype_col), (panel_x + 2, start_y))
 
-    # ── Tab 1 : Stack + QC ────────────────────────────────────────────────
+    # ── Tab 1 : Stack + QC (images) OU Lucky (vidéo/SER) ─────────────────
+    elif files_settings_tab == 1 and files_format_type == "video":
+        # ─── Panneau Lucky (identique au Lucky RGB8 live) ────────────────
+        slider_h = 24; margin = 3
+        _buf_mode_names = ['Ring Buffer', 'Pool Élite']
+        _bm = min(ls_lucky_buffer_mode, 1)
+        control_rects['fx_lucky_buffer_mode'] = draw_jsk_slider(
+            panel_x, start_y, slider_w, slider_h,
+            f"Mode: {_buf_mode_names[_bm]}", _bm, 0, 1, (50, 80, 160))
+        start_y += slider_h + margin + 4
+
+        if ls_lucky_buffer_mode == 0:
+            windowSurfaceObj.blit(_font_cache[ck_s].render("Sélection des frames", True, (100, 160, 255)), (panel_x + 2, start_y))
+            start_y += 16
+            control_rects['fx_lucky_buffer'] = draw_jsk_slider(
+                panel_x, start_y, slider_w, slider_h,
+                f"Buffer: {ls_lucky_buffer} imgs", ls_lucky_buffer, 10, 200, (60, 100, 180))
+            start_y += slider_h + margin
+            control_rects['fx_lucky_keep'] = draw_jsk_slider(
+                panel_x, start_y, slider_w, slider_h,
+                f"Garder: {ls_lucky_keep}%", ls_lucky_keep, 1, 50, (60, 100, 180))
+            start_y += slider_h + margin + 6
+        else:
+            windowSurfaceObj.blit(_font_cache[ck_s].render("Pool Élite", True, (80, 200, 160)), (panel_x + 2, start_y))
+            start_y += 16
+            control_rects['fx_elite_pool_size'] = draw_jsk_slider(
+                panel_x, start_y, slider_w, slider_h,
+                f"Pool: {ls_elite_pool_size} imgs", ls_elite_pool_size, 20, 300, (50, 150, 120))
+            start_y += slider_h + margin
+            control_rects['fx_elite_stack_interval'] = draw_jsk_slider(
+                panel_x, start_y, slider_w, slider_h,
+                f"Stack: {ls_elite_stack_interval}s", ls_elite_stack_interval, 2, 15, (50, 150, 120))
+            start_y += slider_h + margin + 6
+
+        windowSurfaceObj.blit(_font_cache[ck_s].render("Qualité & Alignement", True, (100, 160, 255)), (panel_x + 2, start_y))
+        start_y += 16
+        _score_names = ['Laplacian', 'Gradient', 'Sobel', 'Tenengrad', 'LocalVar', 'PSD']
+        control_rects['fx_lucky_score'] = draw_jsk_slider(
+            panel_x, start_y, slider_w, slider_h,
+            f"Score: {_score_names[min(ls_lucky_score, 5)]}", ls_lucky_score, 0, 5, (80, 120, 200))
+        start_y += slider_h + margin
+        _stack_names = ['Mean', 'Median', 'Sigma-Clip']
+        control_rects['fx_lucky_stack'] = draw_jsk_slider(
+            panel_x, start_y, slider_w, slider_h,
+            f"Stack: {_stack_names[min(ls_lucky_stack, 2)]}", ls_lucky_stack, 0, 2, (80, 120, 200))
+        start_y += slider_h + margin
+        _align_names = ['OFF', 'Surface']
+        control_rects['fx_lucky_align'] = draw_jsk_slider(
+            panel_x, start_y, slider_w, slider_h,
+            f"Alignement: {_align_names[min(ls_lucky_align, 1)]}", ls_lucky_align, 0, 1, (80, 120, 200))
+        start_y += slider_h + margin
+        if ls_lucky_align > 0:
+            control_rects['fx_lucky_max_shift'] = draw_jsk_slider(
+                panel_x, start_y, slider_w, slider_h,
+                f"Shift max: {ls_lucky_max_shift}px" if ls_lucky_max_shift > 0 else "Shift max: OFF",
+                ls_lucky_max_shift, 0, 200, (60, 100, 170))
+            start_y += slider_h + margin
+        control_rects['fx_lucky_roi'] = draw_jsk_slider(
+            panel_x, start_y, slider_w, slider_h,
+            f"ROI score: {ls_lucky_roi}%", ls_lucky_roi, 20, 100, (80, 120, 200))
+        start_y += slider_h + margin + 6
+        # Stats Lucky si traitement actif
+        if files_active and files_livestack is not None:
+            _lk_stats = files_livestack.stats
+            _bf = _lk_stats.get('lucky_buffer_fill', 0)
+            _bs = _lk_stats.get('lucky_buffer_size', ls_lucky_buffer)
+            _sd = _lk_stats.get('lucky_stacks_done', 0)
+            _fr = getattr(files_livestack, '_video_frame_idx', 0)
+            _ft = getattr(files_livestack, '_video_total_frames', 0)
+            windowSurfaceObj.blit(_font_cache[ck_s].render(f"Buffer: {_bf}/{_bs}  Stacks: {_sd}", True, (120, 180, 255)), (panel_x + 2, start_y))
+            start_y += 16
+            if _ft > 0:
+                windowSurfaceObj.blit(_font_cache[ck_s].render(f"Frame: {_fr}/{_ft}", True, (120, 180, 255)), (panel_x + 2, start_y))
+                start_y += 16
+        # ─ Super-résolution Lanczos ───────────────────────────────────────────
+        start_y += 4
+        windowSurfaceObj.blit(_font_cache[ck_s].render("Super-résolution", True, (90, 160, 220)), (panel_x + 2, start_y))
+        start_y += 16
+        _dz_c = (50, 120, 190) if files_drizzle_en else (60, 70, 85)
+        control_rects['fx_drizzle_en'] = draw_jsk_slider(
+            panel_x, start_y, slider_w, slider_h,
+            f"Drizzle: {'ON ×' + f'{files_drizzle_scale/10:.1f}' if files_drizzle_en else 'OFF'}",
+            int(files_drizzle_en), 0, 1, _dz_c)
+        start_y += slider_h + margin
+        if files_drizzle_en:
+            control_rects['fx_drizzle_scale'] = draw_jsk_slider(
+                panel_x, start_y, slider_w, slider_h,
+                f"Échelle: ×{files_drizzle_scale/10:.1f}", files_drizzle_scale, 10, 30, _dz_c)
+            start_y += slider_h + margin
+
     elif files_settings_tab == 1:
         _sm = ['Mean', 'Median', 'Kappa-σ', 'Winsor.', 'Wght']
         windowSurfaceObj.blit(_font_cache[ck_s].render("Méthode de stacking", True, (80, 190, 100)), (panel_x + 2, start_y))
@@ -8507,11 +8887,11 @@ def draw_files_controls(screen_width, screen_height):
         start_y += 8
         windowSurfaceObj.blit(_font_cache[ck_s].render("Gradient", True, (80, 190, 100)), (panel_x + 2, start_y))
         start_y += 16
-        control_rects['gx_gradient'] = draw_jsk_slider(
+        control_rects['gx_gradient_intensity'] = draw_jsk_slider(
             panel_x, start_y, slider_w, slider_h,
-            f"Gradient BG: {'ON' if galaxy_gradient_removal else 'OFF'}", galaxy_gradient_removal, 0, 1, (60, 160, 90))
+            f"Intensité: {galaxy_gradient_intensity}%", galaxy_gradient_intensity, 0, 100, (60, 160, 90))
         start_y += slider_h + margin
-        if galaxy_gradient_removal:
+        if galaxy_gradient_intensity > 0:
             _pl = {1: 'Linéaire', 2: 'Quadrat.', 3: 'Cubique', 4: 'Quarti.'}
             control_rects['gx_gradient_flat_strength'] = draw_jsk_slider(
                 panel_x, start_y, slider_w, slider_h,
@@ -8524,6 +8904,23 @@ def draw_files_controls(screen_width, screen_height):
             control_rects['gx_gradient_sigma'] = draw_jsk_slider(
                 panel_x, start_y, slider_w, slider_h,
                 f"Sigma: {galaxy_gradient_sigma/10:.1f}", galaxy_gradient_sigma, 5, 50, (50, 150, 100))
+            start_y += slider_h + margin
+
+        start_y += 8
+        windowSurfaceObj.blit(_font_cache[ck_s].render("Pixels chauds", True, (190, 100, 100)), (panel_x + 2, start_y))
+        start_y += 16
+        control_rects['gx_raw_fix_bad'] = draw_jsk_slider(
+            panel_x, start_y, slider_w, slider_h,
+            f"Pix chauds: {'ON' if fix_bad_pixels else 'OFF'}", fix_bad_pixels, 0, 1, (190, 100, 100))
+        start_y += slider_h + margin
+        if fix_bad_pixels:
+            control_rects['gx_raw_fix_sig'] = draw_jsk_slider(
+                panel_x, start_y, slider_w, slider_h,
+                f"Sigma: {fix_bad_pixels_sigma/10:.1f}", fix_bad_pixels_sigma, 10, 100, (175, 100, 110))
+            start_y += slider_h + margin
+            control_rects['gx_raw_fix_adu'] = draw_jsk_slider(
+                panel_x, start_y, slider_w, slider_h,
+                f"ADU min: {fix_bad_pixels_min_adu/10:.1f}", fix_bad_pixels_min_adu, 0, 500, (160, 100, 120))
             start_y += slider_h + margin
 
     # ── Tab 2 : Stretch ───────────────────────────────────────────────────
@@ -8708,23 +9105,52 @@ def draw_files_controls(screen_width, screen_height):
             f"Échelles: {galaxy_filter_n_scales}", galaxy_filter_n_scales, 2, 6, _cns)
         start_y += slider_h + margin
 
+    # ── Tab 6 : Wavelets Registax ─────────────────────────────────────────
+    elif files_settings_tab == 6:
+        slider_h = 22; margin = 3
+        _wc  = (80, 160, 220)   # bleu-cyan (sharpening)
+        _wca = (50, 120, 190)
+        windowSurfaceObj.blit(_font_cache[ck_s].render("Wavelets (style Registax)", True, _wc), (panel_x + 2, start_y))
+        start_y += 16
+        _we_col = _wca if ls_wavelet_en else (60, 70, 85)
+        control_rects['gx_wav_en'] = draw_jsk_slider(
+            panel_x, start_y, slider_w, slider_h,
+            f"Wavelets: {'ON' if ls_wavelet_en else 'OFF'}", int(ls_wavelet_en), 0, 1, _we_col)
+        start_y += slider_h + margin + 4
+        windowSurfaceObj.blit(_font_cache[ck_s].render("L1=fin  →  L6=grossier (0.0-3.0)", True, (70, 100, 130)), (panel_x + 2, start_y))
+        start_y += 14
+        for _k, _lbl, _v in [
+            ('gx_wav_l1', f"L1 (~1px):  {ls_wavelet_l1/10:.1f}", ls_wavelet_l1),
+            ('gx_wav_l2', f"L2 (~2px):  {ls_wavelet_l2/10:.1f}", ls_wavelet_l2),
+            ('gx_wav_l3', f"L3 (~4px):  {ls_wavelet_l3/10:.1f}", ls_wavelet_l3),
+            ('gx_wav_l4', f"L4 (~8px):  {ls_wavelet_l4/10:.1f}", ls_wavelet_l4),
+            ('gx_wav_l5', f"L5 (~16px): {ls_wavelet_l5/10:.1f}", ls_wavelet_l5),
+            ('gx_wav_l6', f"L6 (~32px): {ls_wavelet_l6/10:.1f}", ls_wavelet_l6),
+        ]:
+            _lc = _wca if _v > 0 else (55, 65, 80)
+            control_rects[_k] = draw_jsk_slider(panel_x, start_y, slider_w, slider_h, _lbl, _v, 0, 30, _lc)
+            start_y += slider_h + margin
+
     return control_rects
 
 
 def draw_files_browser(screen_width, screen_height):
     """
-    Overlay de navigation de dossiers.
-    Affiche les sous-dossiers du répertoire courant + bouton parent.
+    Overlay de navigation.
+    - Dossiers → naviguer dedans (📁)
+    - Fichiers vidéo/SER → sélection directe du fichier (🎬)
+    - Bouton "Sélectionner ce dossier" → mode images (scan de tout le dossier)
     """
     global windowSurfaceObj, _font_cache, files_dir, files_browser_scroll
-    _bw = 500; _bh = 400
+    _VIDEO_EXTS = {'.ser', '.mp4', '.mpeg', '.mpg', '.avi', '.mov'}
+    _bw = 520; _bh = 480
     _bx = (screen_width - _bw) // 2
     _by = (screen_height - _bh) // 2
     # Fond
     _bg = pygame.Surface((_bw, _bh), pygame.SRCALPHA)
-    _bg.fill((8, 22, 12, 235))
+    _bg.fill((8, 18, 28, 240))
     windowSurfaceObj.blit(_bg, (_bx, _by))
-    pygame.draw.rect(windowSurfaceObj, (50, 160, 70), (_bx, _by, _bw, _bh), 2, border_radius=8)
+    pygame.draw.rect(windowSurfaceObj, (50, 130, 180), (_bx, _by, _bw, _bh), 2, border_radius=8)
     ck = 20
     if ck not in _font_cache: _font_cache[ck] = pygame.font.Font(None, ck)
     ck2 = 18
@@ -8733,49 +9159,84 @@ def draw_files_browser(screen_width, screen_height):
     f2 = _font_cache[ck2]
     rects = {}
     y = _by + 10
-    # Titre + chemin courant
-    windowSurfaceObj.blit(f.render("Choisir dossier", True, (100, 220, 130)), (_bx + 10, y)); y += 24
-    _dn = files_dir if len(files_dir) <= 50 else "..." + files_dir[-47:]
-    windowSurfaceObj.blit(f2.render(_dn, True, (150, 210, 160)), (_bx + 10, y)); y += 22
+    # Titre
+    windowSurfaceObj.blit(f.render("Sélectionner fichier / dossier", True, (100, 200, 255)), (_bx + 10, y)); y += 24
+    _dn = files_dir if len(files_dir) <= 52 else "..." + files_dir[-49:]
+    windowSurfaceObj.blit(f2.render(_dn, True, (140, 190, 220)), (_bx + 10, y)); y += 22
     # Bouton parent
     _pr = pygame.Rect(_bx + 10, y, _bw - 20, 28)
-    pygame.draw.rect(windowSurfaceObj, (25, 65, 35), _pr, border_radius=5)
-    pygame.draw.rect(windowSurfaceObj, (60, 160, 75), _pr, 1, border_radius=5)
-    windowSurfaceObj.blit(f2.render("↑  Dossier parent", True, (120, 230, 140)), (_bx + 18, y + 6))
+    pygame.draw.rect(windowSurfaceObj, (20, 50, 70), _pr, border_radius=5)
+    pygame.draw.rect(windowSurfaceObj, (60, 130, 180), _pr, 1, border_radius=5)
+    windowSurfaceObj.blit(f2.render("↑  Dossier parent", True, (120, 200, 240)), (_bx + 18, y + 6))
     rects['fb_parent'] = _pr
     y += 34
-    # Liste des sous-dossiers
+
+    # Construire la liste : dossiers d'abord, puis fichiers vidéo
     try:
-        _entries = sorted([
-            d for d in os.listdir(files_dir)
-            if os.path.isdir(os.path.join(files_dir, d)) and not d.startswith('.')
-        ])
+        _all = os.listdir(files_dir)
     except Exception:
-        _entries = []
-    _item_h = 30; _max_vis = (_bh - (y - _by) - 50) // _item_h
-    _scroll  = max(0, min(files_browser_scroll, max(0, len(_entries) - _max_vis)))
+        _all = []
+    _dirs  = sorted([d for d in _all if os.path.isdir(os.path.join(files_dir, d))  and not d.startswith('.')])
+    _vids  = sorted([f for f in _all if os.path.isfile(os.path.join(files_dir, f)) and os.path.splitext(f)[1].lower() in _VIDEO_EXTS])
+    # Entrées : ('dir', name) ou ('vid', name)
+    _entries = [('dir', d) for d in _dirs] + [('vid', v) for v in _vids]
+
+    _footer_h = 84
+    _item_h   = 30
+    _list_h   = _bh - (y - _by) - _footer_h
+    _max_vis  = max(1, _list_h // _item_h)
+    _n        = len(_entries)
+    _scroll   = max(0, min(files_browser_scroll, max(0, _n - _max_vis)))
     files_browser_scroll = _scroll
-    for i, dn in enumerate(_entries[_scroll: _scroll + _max_vis]):
+
+    for i, (kind, name) in enumerate(_entries[_scroll: _scroll + _max_vis]):
         _ir = pygame.Rect(_bx + 10, y, _bw - 20, _item_h - 2)
-        pygame.draw.rect(windowSurfaceObj, (15, 40, 20), _ir, border_radius=4)
-        pygame.draw.rect(windowSurfaceObj, (35, 90, 48), _ir, 1, border_radius=4)
-        windowSurfaceObj.blit(f2.render(f"📁 {dn}", True, (110, 210, 130)), (_bx + 18, y + 7))
-        rects[f'fb_dir_{_scroll + i}'] = (_ir, os.path.join(files_dir, dn))
+        if kind == 'dir':
+            pygame.draw.rect(windowSurfaceObj, (14, 35, 22), _ir, border_radius=4)
+            pygame.draw.rect(windowSurfaceObj, (35, 90, 48),  _ir, 1, border_radius=4)
+            windowSurfaceObj.blit(f2.render(f"📁 {name}", True, (110, 210, 130)), (_bx + 18, y + 7))
+            rects[f'fb_dir_{_scroll + i}'] = (_ir, os.path.join(files_dir, name))
+        else:
+            pygame.draw.rect(windowSurfaceObj, (18, 30, 55), _ir, border_radius=4)
+            pygame.draw.rect(windowSurfaceObj, (60, 100, 200), _ir, 1, border_radius=4)
+            _ext = os.path.splitext(name)[1].upper()
+            windowSurfaceObj.blit(f2.render(f"🎬 {name}", True, (140, 190, 255)), (_bx + 18, y + 7))
+            rects[f'fb_vid_{_scroll + i}'] = (_ir, os.path.join(files_dir, name))
         y += _item_h
-    # Bouton Choisir ce dossier
-    y = _by + _bh - 44
-    _sr = pygame.Rect(_bx + 10, y, (_bw - 30) // 2, 32)
-    pygame.draw.rect(windowSurfaceObj, (20, 80, 35), _sr, border_radius=6)
-    pygame.draw.rect(windowSurfaceObj, (60, 200, 80), _sr, 1, border_radius=6)
-    windowSurfaceObj.blit(f.render("Sélectionner", True, (100, 240, 130)),
-                          f.render("Sélectionner", True, (100, 240, 130)).get_rect(center=_sr.center))
+
+    # Boutons scroll ▲ ▼
+    _scroll_y = _by + _bh - _footer_h
+    if _n > _max_vis:
+        _btn_w = (_bw - 30) // 2
+        _up_r   = pygame.Rect(_bx + 10,           _scroll_y, _btn_w, 26)
+        _down_r = pygame.Rect(_bx + 20 + _btn_w,  _scroll_y, _btn_w, 26)
+        _up_active   = _scroll > 0
+        _down_active = _scroll < _n - _max_vis
+        for _r, _active in ((_up_r, _up_active), (_down_r, _down_active)):
+            pygame.draw.rect(windowSurfaceObj, (14, 28, 45), _r, border_radius=4)
+            pygame.draw.rect(windowSurfaceObj, (60, 130, 180) if _active else (25, 45, 60), _r, 1, border_radius=4)
+        _c_up   = (120, 200, 240) if _up_active   else (45, 80, 100)
+        _c_down = (120, 200, 240) if _down_active else (45, 80, 100)
+        windowSurfaceObj.blit(f2.render(f"▲  ({_scroll}/{_n})", True, _c_up),
+                              f2.render(f"▲  ({_scroll}/{_n})", True, _c_up).get_rect(center=_up_r.center))
+        windowSurfaceObj.blit(f2.render(f"▼  ({min(_scroll+_max_vis,_n)}/{_n})", True, _c_down),
+                              f2.render(f"▼  ({min(_scroll+_max_vis,_n)}/{_n})", True, _c_down).get_rect(center=_down_r.center))
+        rects['fb_scroll_up']   = _up_r
+        rects['fb_scroll_down'] = _down_r
+
+    # Bouton "Sélectionner ce dossier" (mode images) + Annuler
+    y = _by + _bh - 46
+    _sr = pygame.Rect(_bx + 10, y, (_bw - 30) // 2, 34)
+    pygame.draw.rect(windowSurfaceObj, (16, 60, 28), _sr, border_radius=6)
+    pygame.draw.rect(windowSurfaceObj, (50, 170, 80), _sr, 1, border_radius=6)
+    windowSurfaceObj.blit(f2.render("📂 Dossier (images)", True, (100, 230, 130)),
+                          f2.render("📂 Dossier (images)", True, (100, 230, 130)).get_rect(center=_sr.center))
     rects['fb_select'] = _sr
-    # Bouton Annuler
-    _cr = pygame.Rect(_bx + 20 + (_bw - 30) // 2, y, (_bw - 30) // 2, 32)
-    pygame.draw.rect(windowSurfaceObj, (55, 28, 28), _cr, border_radius=6)
-    pygame.draw.rect(windowSurfaceObj, (130, 60, 60), _cr, 1, border_radius=6)
-    windowSurfaceObj.blit(f.render("Annuler", True, (220, 140, 140)),
-                          f.render("Annuler", True, (220, 140, 140)).get_rect(center=_cr.center))
+    _cr = pygame.Rect(_bx + 20 + (_bw - 30) // 2, y, (_bw - 30) // 2, 34)
+    pygame.draw.rect(windowSurfaceObj, (50, 22, 22), _cr, border_radius=6)
+    pygame.draw.rect(windowSurfaceObj, (130, 55, 55), _cr, 1, border_radius=6)
+    windowSurfaceObj.blit(f.render("Annuler", True, (220, 130, 130)),
+                          f.render("Annuler", True, (220, 130, 130)).get_rect(center=_cr.center))
     rects['fb_cancel'] = _cr
     return rects
 
@@ -8822,13 +9283,50 @@ def draw_files_interface(screen_width, screen_height):
 
 def handle_files_slider_click(mx, my, control_rects):
     """Gère les clics sur le panneau FILES. Retourne True si géré."""
-    global files_settings_tab, files_last_filtered_array
+    global files_settings_tab, files_last_filtered_array, files_format_type
+    global ls_lucky_buffer, ls_lucky_keep, ls_lucky_score, ls_lucky_stack
+    global ls_lucky_align, ls_lucky_roi, ls_lucky_max_shift
+    global ls_lucky_buffer_mode, ls_elite_pool_size, ls_elite_stack_interval
+    global ls_elite_entry_mode, ls_elite_score_clip, ls_elite_score_kappa
+    global files_drizzle_en, files_drizzle_scale
     for name, rect in control_rects.items():
         if not rect.collidepoint(mx, my):
             continue
         # Onglets FILES
         if name.startswith('fx_tab_'):
             files_settings_tab = int(name.split('_')[-1])
+            return True
+        # Super-résolution drizzle
+        if name.startswith('fx_drizzle_'):
+            ratio = max(0.0, min(1.0, (mx - rect.x) / rect.width))
+            if name == 'fx_drizzle_en':
+                files_drizzle_en = ratio > 0.5
+            elif name == 'fx_drizzle_scale':
+                files_drizzle_scale = max(10, min(30, int(10 + ratio * 20 + 0.5)))
+            return True
+        # Contrôles Lucky (Tab 1 vidéo) — préfixe fx_lucky_* ou fx_elite_*
+        if name.startswith('fx_lucky_') or name.startswith('fx_elite_'):
+            ratio = max(0.0, min(1.0, (mx - rect.x) / rect.width))
+            if name == 'fx_lucky_buffer_mode':
+                ls_lucky_buffer_mode = 1 if ratio > 0.5 else 0
+            elif name == 'fx_elite_pool_size':
+                ls_elite_pool_size = max(20, min(300, int(20 + ratio * 280)))
+            elif name == 'fx_elite_stack_interval':
+                ls_elite_stack_interval = max(2, min(15, int(2 + ratio * 13)))
+            elif name == 'fx_lucky_buffer':
+                ls_lucky_buffer = max(10, min(200, int(10 + ratio * 190)))
+            elif name == 'fx_lucky_keep':
+                ls_lucky_keep = max(1, min(50, int(1 + ratio * 49)))
+            elif name == 'fx_lucky_score':
+                ls_lucky_score = max(0, min(5, int(ratio * 5 + 0.5)))
+            elif name == 'fx_lucky_stack':
+                ls_lucky_stack = max(0, min(2, int(ratio * 2 + 0.5)))
+            elif name == 'fx_lucky_align':
+                ls_lucky_align = max(0, min(1, int(ratio + 0.5)))
+            elif name == 'fx_lucky_max_shift':
+                ls_lucky_max_shift = max(0, min(200, int(ratio * 200)))
+            elif name == 'fx_lucky_roi':
+                ls_lucky_roi = max(20, min(100, int(20 + ratio * 80)))
             return True
         # Contrôles partagés avec galaxy → déléguer
         _handled = handle_galaxy_slider_click(mx, my, control_rects)
@@ -8873,14 +9371,17 @@ def handle_galaxy_slider_click(mx, my, control_rects):
     global galaxy_settings_tab, galaxy_hdr_bits_clip, galaxy_hdr_weights
     global galaxy_stack_method, galaxy_stack_kappa, galaxy_stack_iterations
     global galaxy_enable_qc, galaxy_max_fwhm, galaxy_min_sharpness, galaxy_max_drift, galaxy_min_stars
-    global galaxy_preview_refresh, galaxy_gradient_removal, galaxy_alignment_mode
+    global galaxy_preview_refresh, galaxy_gradient_removal, galaxy_gradient_intensity, galaxy_alignment_mode
+    global files_img_max_shift
     global stretch_preset, stretch_factor, stretch_p_low, stretch_p_high
     global ghs_D, ghs_b, ghs_SP, ghs_LP, ghs_HP
     global log_factor, mtf_shadows, mtf_midtone, mtf_highlights
     global isp_brightness, isp_contrast, isp_saturation
     global isp_black_level, debayer_vng, ls_bl_per_channel_enable
     global ls_bl_r, ls_bl_g1, ls_bl_g2, ls_bl_b
-    global fix_bad_pixels, fix_bad_pixels_sigma
+    global fix_bad_pixels, fix_bad_pixels_sigma, fix_bad_pixels_min_adu
+    global ls_wavelet_en, ls_wavelet_l1, ls_wavelet_l2, ls_wavelet_l3
+    global ls_wavelet_l4, ls_wavelet_l5, ls_wavelet_l6
     global ls_lucky_clahe_en, ls_lucky_clahe_str, ls_lucky_clahe_tile
     global ls_lucky_usm_en, ls_lucky_usm_sigma, ls_lucky_usm_amount
     global ls_lucky_lr_en, ls_lucky_lr_iter, ls_lucky_lr_sigma
@@ -8896,6 +9397,7 @@ def handle_galaxy_slider_click(mx, my, control_rects):
     global galaxy_filter_en, galaxy_filter_preset, galaxy_filter_enh
     global galaxy_filter_usm, galaxy_filter_star_r, galaxy_filter_star_k, galaxy_filter_n_scales
     global galaxy_save_raws
+    global galaxy_pre_gradient_array
 
     for name, rect in control_rects.items():
         if rect.collidepoint(mx, my):
@@ -8907,10 +9409,15 @@ def handle_galaxy_slider_click(mx, my, control_rects):
 
             # --- Tab 0: Capture ---
             elif name == 'gx_alignment_mode':
-                galaxy_alignment_mode = max(0, min(2, int(ratio * 2 + 0.5)))
+                galaxy_alignment_mode = max(0, min(3, int(ratio * 3 + 0.5)))
                 if galaxy_livestack is not None:
-                    _am = ['none', 'translation', 'rotation'][galaxy_alignment_mode]
-                    galaxy_livestack.configure(alignment_mode=_am)
+                    _am = ['none', 'translation', 'rotation', 'surface'][galaxy_alignment_mode]
+                    galaxy_livestack.configure(alignment_mode=_am,
+                                               planetary_max_shift=float(files_img_max_shift))
+            elif name == 'gx_img_max_shift':
+                files_img_max_shift = max(0, min(500, int(ratio * 500 + 0.5)))
+                if galaxy_livestack is not None and galaxy_alignment_mode > 0:
+                    galaxy_livestack.configure(planetary_max_shift=float(files_img_max_shift))
             elif name == 'gx_preview_refresh':
                 galaxy_preview_refresh = max(1, min(10, int(ratio * 9) + 1))
                 if galaxy_livestack is not None:
@@ -8934,6 +9441,8 @@ def handle_galaxy_slider_click(mx, my, control_rects):
                 fix_bad_pixels = 1 if ratio > 0.5 else 0
             elif name == 'gx_raw_fix_sig':
                 fix_bad_pixels_sigma = max(10, int(10 + ratio * 90 + 0.5))
+            elif name == 'gx_raw_fix_adu':
+                fix_bad_pixels_min_adu = max(0, int(ratio * 500 + 0.5))
             elif name == 'gx_save_raws':
                 galaxy_save_raws = 1 if ratio > 0.5 else 0
                 print(f"[GALAXY] Sauvegarde RAW: {'ON' if galaxy_save_raws else 'OFF'}")
@@ -8981,22 +9490,36 @@ def handle_galaxy_slider_click(mx, my, control_rects):
                 galaxy_min_stars = max(0, min(50, int(ratio * 50)))
                 if galaxy_livestack is not None:
                     galaxy_livestack.configure(min_stars=int(galaxy_min_stars))
+            elif name == 'gx_gradient_intensity':
+                galaxy_gradient_intensity = int(ratio * 100)
+                if galaxy_livestack is not None:
+                    galaxy_livestack.configure(gradient_removal=bool(galaxy_gradient_intensity > 0))
+                if galaxy_paused:
+                    galaxy_last_filtered_array = None
             elif name == 'gx_gradient':
                 galaxy_gradient_removal = 1 if ratio > 0.5 else 0
                 if galaxy_livestack is not None:
                     galaxy_livestack.configure(gradient_removal=bool(galaxy_gradient_removal))
+                if galaxy_paused:
+                    galaxy_last_filtered_array = None
             elif name == 'gx_gradient_flat_strength':
                 galaxy_gradient_flat_strength = int(ratio * 100)
                 if galaxy_livestack is not None:
                     galaxy_livestack.configure(gradient_removal_flat_strength=galaxy_gradient_flat_strength)
+                if galaxy_paused:
+                    galaxy_last_filtered_array = None
             elif name == 'gx_gradient_poly_degree':
                 galaxy_gradient_poly_degree = max(1, min(4, int(1 + ratio * 3 + 0.5)))
                 if galaxy_livestack is not None:
                     galaxy_livestack.configure(gradient_removal_poly_degree=galaxy_gradient_poly_degree)
+                if galaxy_paused:
+                    galaxy_last_filtered_array = None
             elif name == 'gx_gradient_sigma':
                 galaxy_gradient_sigma = max(5, min(50, int(5 + ratio * 45 + 0.5)))
                 if galaxy_livestack is not None:
                     galaxy_livestack.configure(gradient_removal_sigma=galaxy_gradient_sigma / 10.0)
+                if galaxy_paused:
+                    galaxy_last_filtered_array = None
 
             # --- Tab 3: Image / Stretch ---
             elif name == 'gx_img_color_enabled':
@@ -9141,8 +9664,24 @@ def handle_galaxy_slider_click(mx, my, control_rects):
             elif name == 'gx_struct_nscales':
                 galaxy_filter_n_scales = max(2, min(6, int(2 + ratio * 4 + 0.5)))
 
+            # --- Tab 6: Wavelets ---
+            elif name == 'gx_wav_en':
+                ls_wavelet_en = ratio > 0.5
+            elif name == 'gx_wav_l1':
+                ls_wavelet_l1 = max(0, min(30, int(ratio * 30 + 0.5)))
+            elif name == 'gx_wav_l2':
+                ls_wavelet_l2 = max(0, min(30, int(ratio * 30 + 0.5)))
+            elif name == 'gx_wav_l3':
+                ls_wavelet_l3 = max(0, min(30, int(ratio * 30 + 0.5)))
+            elif name == 'gx_wav_l4':
+                ls_wavelet_l4 = max(0, min(30, int(ratio * 30 + 0.5)))
+            elif name == 'gx_wav_l5':
+                ls_wavelet_l5 = max(0, min(30, int(ratio * 30 + 0.5)))
+            elif name == 'gx_wav_l6':
+                ls_wavelet_l6 = max(0, min(30, int(ratio * 30 + 0.5)))
+
             # Re-appliquer filtres si en pause
-            if name.startswith(('gx_clahe', 'gx_usm', 'gx_deconv', 'gx_lr_', 'gx_mm_',
+            if name.startswith(('gx_wav_', 'gx_clahe', 'gx_usm', 'gx_deconv', 'gx_lr_', 'gx_mm_',
                                'gx_wpsf_', 'gx_post_', 'gx_img_r_', 'gx_img_g_', 'gx_img_b_',
                                'gx_img_color_', 'gx_struct_')) and galaxy_paused and galaxy_pre_filter_array is not None:
                 try:
@@ -9339,7 +9878,7 @@ def apply_lucky_post_stack_filters(img, color_correction=False):
     """
     Applique les filtres de netteté post-stack Lucky sur l'image résultante.
 
-    Pipeline : CLAHE → Unsharp Mask adaptatif → Déconvolution Lucy-Richardson
+    Pipeline : Wavelets → CLAHE → Unsharp Mask → Déconvolution → Couleur
     Travaille sur le canal luminance (YCrCb) pour préserver les couleurs.
 
     Args:
@@ -9347,6 +9886,8 @@ def apply_lucky_post_stack_filters(img, color_correction=False):
     Returns:
         uint8 ndarray BGR ou mono filtré
     """
+    global ls_wavelet_en, ls_wavelet_l1, ls_wavelet_l2, ls_wavelet_l3
+    global ls_wavelet_l4, ls_wavelet_l5, ls_wavelet_l6
     global ls_lucky_clahe_en, ls_lucky_clahe_str, ls_lucky_clahe_tile
     global ls_lucky_usm_en, ls_lucky_usm_sigma, ls_lucky_usm_amount
     global ls_lucky_lr_en, ls_lucky_lr_iter, ls_lucky_lr_sigma
@@ -9366,7 +9907,12 @@ def apply_lucky_post_stack_filters(img, color_correction=False):
     _color_active = color_correction and (img.ndim == 3) and (
         ls_post_red != 100 or ls_post_green != 100 or ls_post_blue != 100 or ls_post_sat != 100)
     _brightness_active = color_correction and (ls_post_brightness != 0)
-    if not ls_lucky_clahe_en and not ls_lucky_usm_en and not ls_lucky_lr_en and not ls_lucky_mm_en and not ls_lucky_wpsf_en and not _color_active and not _brightness_active and not galaxy_filter_en:
+    _wav_active = ls_wavelet_en and any(v > 0 for v in (
+        ls_wavelet_l1, ls_wavelet_l2, ls_wavelet_l3,
+        ls_wavelet_l4, ls_wavelet_l5, ls_wavelet_l6))
+    if (not _wav_active and not ls_lucky_clahe_en and not ls_lucky_usm_en
+            and not ls_lucky_lr_en and not ls_lucky_mm_en and not ls_lucky_wpsf_en
+            and not _color_active and not _brightness_active and not galaxy_filter_en):
         return img
 
     is_color = (img.ndim == 3)
@@ -9376,6 +9922,15 @@ def apply_lucky_post_stack_filters(img, color_correction=False):
         gray = y
     else:
         gray = img.copy()
+
+    # ── Wavelets multi-échelles (style Registax) ──────────────────────────────
+    if _wav_active:
+        from libastrostack.stretch import wavelet_sharpen as _wav_fn
+        _ww = [ls_wavelet_l1 / 10.0, ls_wavelet_l2 / 10.0, ls_wavelet_l3 / 10.0,
+               ls_wavelet_l4 / 10.0, ls_wavelet_l5 / 10.0, ls_wavelet_l6 / 10.0]
+        _y_f = gray.astype(np.float32) / 255.0
+        _y_f = _wav_fn(_y_f, _ww)
+        gray = np.clip(_y_f * 255.0, 0, 255).astype(np.uint8)
 
     # ── CLAHE ────────────────────────────────────────────────────────────────
     if ls_lucky_clahe_en:
@@ -9644,8 +10199,18 @@ def draw_lucky_rec_button(screen_width, screen_height, is_recording=False, elaps
     return icon_rect
 
 
+def get_dated_save_path(base_path):
+    """Retourne base_path/YYYY-MM-DD/ sans créer le répertoire.
+    À utiliser lors de l'activation d'un mode — le répertoire sera créé
+    uniquement au moment de la première sauvegarde effective."""
+    from pathlib import Path as _Path
+    import datetime as _dt
+    return _Path(base_path) / _dt.date.today().strftime("%Y-%m-%d")
+
+
 def get_dated_save_dir(base_path):
-    """Retourne base_path/YYYY-MM-DD/ (créé si absent)."""
+    """Retourne base_path/YYYY-MM-DD/ (créé si absent).
+    À utiliser uniquement lors d'une sauvegarde effective."""
     from pathlib import Path as _Path
     import datetime as _dt
     dated = _Path(base_path) / _dt.date.today().strftime("%Y-%m-%d")
@@ -9844,7 +10409,7 @@ def draw_lucky_pause_button(screen_width, screen_height, is_paused=False, is_act
 def _draw_lucky_tab_bar(panel_x, panel_w, y):
     """Dessine la barre d'onglets Lucky (4 onglets) et retourne les rects."""
     global windowSurfaceObj, _font_cache, lucky_settings_tab
-    tab_labels = ["Lucky", "Save", "Image", "Filtre"]
+    tab_labels = ["Lucky", "Save", "Image", "Filtre", "Wav."]
     n = len(tab_labels)
     tab_h = 24
     tab_w = panel_w // n
@@ -9882,7 +10447,10 @@ def draw_lucky_controls(screen_width, screen_height):
     global ls_lucky_buffer_mode, ls_elite_pool_size, ls_elite_stack_interval
     global ls_elite_entry_mode, ls_elite_score_clip, ls_elite_score_kappa
     global ls_lucky_mm_en, ls_lucky_mm_iter, ls_lucky_mm_sigma, ls_lucky_mm_lambda
+    global ls_wavelet_en, ls_wavelet_l1, ls_wavelet_l2, ls_wavelet_l3
+    global ls_wavelet_l4, ls_wavelet_l5, ls_wavelet_l6
     global lucky_raw_interface_mode
+    global ls_bl_per_channel_enable, ls_bl_r, ls_bl_g1, ls_bl_g2, ls_bl_b, isp_black_level
 
     panel_w  = 260
     panel_m  = 10
@@ -10022,6 +10590,37 @@ def draw_lucky_controls(screen_width, screen_height):
             panel_x, start_y, slider_w, slider_h,
             f"ROI score: {ls_lucky_roi}%", ls_lucky_roi, 20, 100, (80, 120, 200))
         start_y += slider_h + margin
+
+        # ── Black Level (RAW uniquement) ──────────────────────────────────────
+        if lucky_raw_interface_mode == 1:
+            windowSurfaceObj.blit(
+                _font_cache[ck_sect].render("Black Level (RAW)", True, (180, 160, 110)),
+                (panel_x + 2, start_y))
+            start_y += 16
+            _bl_mode_names = ["Global", "Auto FPN", "Manuel"]
+            _bl_mode_lbl = _bl_mode_names[min(ls_bl_per_channel_enable, 2)]
+            control_rects['lk_raw_bl_mode'] = draw_jsk_slider(
+                panel_x, start_y, slider_w, slider_h,
+                f"BL Mode: {_bl_mode_lbl}", ls_bl_per_channel_enable, 0, 2, (160, 140, 110))
+            start_y += slider_h + margin
+            _bl_global_active = (ls_bl_per_channel_enable == 0)
+            _bl_color = (160, 140, 110) if _bl_global_active else (60, 55, 45)
+            _bl_suffix = "" if _bl_global_active else " [-]"
+            control_rects['lk_raw_black_level'] = draw_jsk_slider(
+                panel_x, start_y, slider_w, slider_h,
+                f"Black Level: {isp_black_level}{_bl_suffix}", isp_black_level, 0, 500, _bl_color)
+            start_y += slider_h + margin
+            if ls_bl_per_channel_enable == 2:
+                for _ch_lbl, _ch_val, _ch_key in [
+                    ("BL R",  ls_bl_r,  'lk_raw_bl_r'),
+                    ("BL G1", ls_bl_g1, 'lk_raw_bl_g1'),
+                    ("BL G2", ls_bl_g2, 'lk_raw_bl_g2'),
+                    ("BL B",  ls_bl_b,  'lk_raw_bl_b'),
+                ]:
+                    control_rects[_ch_key] = draw_jsk_slider(
+                        panel_x, start_y, slider_w, slider_h,
+                        f"{_ch_lbl}: {_ch_val}", _ch_val, 0, 512, (110, 130, 160))
+                    start_y += slider_h + margin
 
     # =====================================================
     # ONGLET 1 : Sauvegarde
@@ -10273,6 +10872,41 @@ def draw_lucky_controls(screen_width, screen_height):
             f"Luminosit\u00e9: {ls_post_brightness:+d}", ls_post_brightness, -100, 100, (190, 190, 120))
         start_y += slider_h + margin
 
+    # ── Tab 4 : Wavelets Registax ──────────────────────────────────────────────
+    elif lucky_settings_tab == 4:
+        if 15 not in _font_cache: _font_cache[15] = pygame.font.Font(None, 15)
+        slider_h = 24; margin = 4
+        _wc = (80, 160, 220); _wca = (50, 120, 190)
+        windowSurfaceObj.blit(
+            _font_cache[ck_sect].render("Wavelets (style Registax)", True, _wc),
+            (panel_x + 2, start_y))
+        start_y += 18
+        windowSurfaceObj.blit(
+            _font_cache[15].render("Sharpening multi-échelles sans halo", True, (70, 100, 130)),
+            (panel_x + 2, start_y))
+        start_y += 14
+        _we_col = _wca if ls_wavelet_en else (60, 70, 85)
+        control_rects['lk_wav_en'] = draw_jsk_slider(
+            panel_x, start_y, slider_w, slider_h,
+            f"Wavelets: {'ON' if ls_wavelet_en else 'OFF'}",
+            int(ls_wavelet_en), 0, 1, _we_col)
+        start_y += slider_h + margin + 4
+        windowSurfaceObj.blit(
+            _font_cache[15].render("L1=fins détails  →  L6=structures larges", True, (70, 100, 130)),
+            (panel_x + 2, start_y))
+        start_y += 14
+        for _k, _lbl, _v in [
+            ('lk_wav_l1', f"L1 (~1px):   {ls_wavelet_l1/10:.1f}", ls_wavelet_l1),
+            ('lk_wav_l2', f"L2 (~2px):   {ls_wavelet_l2/10:.1f}", ls_wavelet_l2),
+            ('lk_wav_l3', f"L3 (~4px):   {ls_wavelet_l3/10:.1f}", ls_wavelet_l3),
+            ('lk_wav_l4', f"L4 (~8px):   {ls_wavelet_l4/10:.1f}", ls_wavelet_l4),
+            ('lk_wav_l5', f"L5 (~16px):  {ls_wavelet_l5/10:.1f}", ls_wavelet_l5),
+            ('lk_wav_l6', f"L6 (~32px):  {ls_wavelet_l6/10:.1f}", ls_wavelet_l6),
+        ]:
+            _lc = _wca if _v > 0 else (55, 65, 80)
+            control_rects[_k] = draw_jsk_slider(panel_x, start_y, slider_w, slider_h, _lbl, _v, 0, 30, _lc)
+            start_y += slider_h + margin
+
     return control_rects
 
 
@@ -10286,6 +10920,8 @@ def handle_lucky_slider_click(mx, my, control_rects):
     global ghs_D, ghs_b, ghs_SP, ghs_LP, ghs_HP
     global red, blue, use_picamera2, picam2
     global log_factor, mtf_shadows, mtf_midtone, mtf_highlights
+    global ls_wavelet_en, ls_wavelet_l1, ls_wavelet_l2, ls_wavelet_l3
+    global ls_wavelet_l4, ls_wavelet_l5, ls_wavelet_l6
     global ls_lucky_clahe_en, ls_lucky_clahe_str, ls_lucky_clahe_tile
     global ls_lucky_usm_en, ls_lucky_usm_sigma, ls_lucky_usm_amount
     global ls_lucky_lr_en, ls_lucky_lr_iter, ls_lucky_lr_sigma
@@ -10294,6 +10930,7 @@ def handle_lucky_slider_click(mx, my, control_rects):
     global luckystack, livestack
     global ls_lucky_buffer_mode, ls_elite_pool_size, ls_elite_stack_interval
     global ls_elite_entry_mode, ls_elite_score_clip, ls_elite_score_kappa
+    global isp_black_level, ls_bl_per_channel_enable, ls_bl_r, ls_bl_g1, ls_bl_g2, ls_bl_b
 
     _needs_isp = False
 
@@ -10426,6 +11063,21 @@ def handle_lucky_slider_click(mx, my, control_rects):
                 if use_picamera2 and picam2 is not None:
                     picam2.set_controls({"AwbEnable": False,
                                          "ColourGains": (red / 10.0, blue / 10.0)})
+            # ── Onglet Filtre — Wavelets ─────────────────────────────────────
+            elif name == 'lk_wav_en':
+                ls_wavelet_en = ratio > 0.5
+            elif name == 'lk_wav_l1':
+                ls_wavelet_l1 = max(0, min(30, int(ratio * 30 + 0.5)))
+            elif name == 'lk_wav_l2':
+                ls_wavelet_l2 = max(0, min(30, int(ratio * 30 + 0.5)))
+            elif name == 'lk_wav_l3':
+                ls_wavelet_l3 = max(0, min(30, int(ratio * 30 + 0.5)))
+            elif name == 'lk_wav_l4':
+                ls_wavelet_l4 = max(0, min(30, int(ratio * 30 + 0.5)))
+            elif name == 'lk_wav_l5':
+                ls_wavelet_l5 = max(0, min(30, int(ratio * 30 + 0.5)))
+            elif name == 'lk_wav_l6':
+                ls_wavelet_l6 = max(0, min(30, int(ratio * 30 + 0.5)))
             # ── Onglet Filtre ─────────────────────────────────────────────────
             elif name == 'ls_lucky_clahe_en':
                 ls_lucky_clahe_en = 1 if ratio > 0.5 else 0
@@ -10463,6 +11115,20 @@ def handle_lucky_slider_click(mx, my, control_rects):
                 ls_post_sat = max(0, min(200, int(ratio * 200)))
             elif name == 'ls_post_brightness':
                 ls_post_brightness = max(-100, min(100, int(-100 + ratio * 200)))
+            # ── Black Level RAW (Lucky RAW panel) ─────────────────────────────
+            elif name == 'lk_raw_bl_mode':
+                ls_bl_per_channel_enable = max(0, min(2, int(ratio * 2 + 0.5)))
+            elif name == 'lk_raw_black_level':
+                if ls_bl_per_channel_enable == 0:
+                    isp_black_level = max(0, min(500, int(ratio * 500)))
+            elif name == 'lk_raw_bl_r':
+                ls_bl_r = max(0, min(512, int(ratio * 512)))
+            elif name == 'lk_raw_bl_g1':
+                ls_bl_g1 = max(0, min(512, int(ratio * 512)))
+            elif name == 'lk_raw_bl_g2':
+                ls_bl_g2 = max(0, min(512, int(ratio * 512)))
+            elif name == 'lk_raw_bl_b':
+                ls_bl_b = max(0, min(512, int(ratio * 512)))
             if _needs_isp:
                 apply_isp_to_session()
             return True
@@ -13609,6 +14275,7 @@ def handle_home_click(mx, my):
     global files_settings_tab, _files_slider_rects, _files_slider_dragging
     global files_dir, files_list, files_index, files_active, files_paused
     global files_livestack, files_last_filtered_array, files_pre_filter_array, files_pre_stretch_array
+    global files_pre_gradient_array
     global files_browser_scroll
 
     import math
@@ -17628,7 +18295,7 @@ def preview():
     global livestack_active, luckystack_active, raw_format, raw_stream_size, capture_size, jsk_live_mode
     global lucky_recorder
     global lucky_last_filtered_array, lucky_paused, lucky_last_stack_before_filter, lucky_raw_pre_stretch_array
-    global ls_paused, ls_last_filtered_array, ls_pre_filter_array, ls_pre_stretch_array
+    global ls_paused, ls_last_filtered_array, ls_pre_filter_array, ls_pre_stretch_array, ls_pre_gradient_array
     global ls_lucky_clahe_en, ls_lucky_clahe_str, ls_lucky_clahe_tile
     global ls_lucky_usm_en, ls_lucky_usm_sigma, ls_lucky_usm_amount
     global ls_lucky_lr_en, ls_lucky_lr_iter, ls_lucky_lr_sigma
@@ -19244,18 +19911,8 @@ while True:
                                     _gxp['vmax_ema'] = _mx if _ema <= 0 else 0.25 * _mx + 0.75 * _ema
                                     # Normaliser à [0,1] (même espace que session.get_preview_png)
                                     _norm = np.clip(_raw * (1.0 / max(_gxp['vmax_ema'], 1e-6)), 0.0, 1.0)
-                                    # Retrait de gradient si activé — même position que dans
-                                    # session.get_preview_png() : après norm, avant stretch
-                                    _gx_sess = ls_obj.session
-                                    if getattr(getattr(_gx_sess, 'config', None), 'gradient_removal', False):
-                                        _gx_cfg = _gx_sess.config
-                                        _norm = _gx_sess._remove_gradient(
-                                            _norm,
-                                            n_tiles=getattr(_gx_cfg, 'gradient_removal_tiles', 8),
-                                            flat_strength=getattr(_gx_cfg, 'gradient_removal_flat_strength', 0),
-                                            poly_degree=getattr(_gx_cfg, 'gradient_removal_poly_degree', 2),
-                                            grid_sigma=getattr(_gx_cfg, 'gradient_removal_sigma', 2.0),
-                                        )
+                                    # Sauvegarder le float32 pré-gradient pour réglage interactif en pause
+                                    ls_obj._gx_pre_gradient = _norm.copy()
                                     stacked = np.clip(_norm * 255.0, 0, 255).astype(np.uint8)
                     except Exception:
                         pass
@@ -19300,25 +19957,58 @@ while True:
                 _gx_display = None
 
                 if galaxy_paused and galaxy_pre_stretch_array is not None:
-                    # Re-stretch/re-filter interactif en pause
-                    stacked_array = galaxy_pre_stretch_array.copy()
-                    if stretch_preset != 0:
-                        stacked_array = astro_stretch(stacked_array)
-                    if stacked_array.dtype != np.uint8:
-                        stacked_array = np.clip(stacked_array, 0, 255).astype(np.uint8)
-                    if galaxy_color_enabled and (galaxy_r_gain != 100 or galaxy_g_gain != 100 or galaxy_b_gain != 100):
-                        _fa = stacked_array.astype(np.float32)
-                        _fa[:,:,0] = np.clip(_fa[:,:,0] * galaxy_r_gain / 100.0, 0, 255)
-                        _fa[:,:,1] = np.clip(_fa[:,:,1] * galaxy_g_gain / 100.0, 0, 255)
-                        _fa[:,:,2] = np.clip(_fa[:,:,2] * galaxy_b_gain / 100.0, 0, 255)
-                        stacked_array = _fa.astype(np.uint8)
-                    galaxy_pre_filter_array = stacked_array.copy()
-                    stacked_array = apply_lucky_post_stack_filters(stacked_array, color_correction=True)
-                    galaxy_last_filtered_array = stacked_array.copy()
-                    _gx_display = stacked_array
+                    # Re-gradient + re-stretch + re-filter interactif en pause
+                    # (recalcul uniquement si galaxy_last_filtered_array invalidé)
+                    if galaxy_last_filtered_array is None:
+                        if (galaxy_gradient_intensity > 0 and galaxy_pre_gradient_array is not None
+                                and galaxy_livestack is not None):
+                            _sess_gx = getattr(galaxy_livestack, 'session', None)
+                            if _sess_gx is not None:
+                                _norm_gr = _sess_gx._remove_gradient(
+                                    galaxy_pre_gradient_array,
+                                    n_tiles=8,
+                                    flat_strength=galaxy_gradient_flat_strength,
+                                    poly_degree=galaxy_gradient_poly_degree,
+                                    grid_sigma=galaxy_gradient_sigma / 10.0,
+                                    intensity=galaxy_gradient_intensity)
+                                stacked_array = np.clip(_norm_gr * 255.0, 0, 255).astype(np.uint8)
+                            else:
+                                stacked_array = galaxy_pre_stretch_array.copy()
+                        else:
+                            stacked_array = galaxy_pre_stretch_array.copy()
+                        if stretch_preset != 0:
+                            stacked_array = astro_stretch(stacked_array)
+                        if stacked_array.dtype != np.uint8:
+                            stacked_array = np.clip(stacked_array, 0, 255).astype(np.uint8)
+                        if galaxy_color_enabled and (galaxy_r_gain != 100 or galaxy_g_gain != 100 or galaxy_b_gain != 100):
+                            _fa = stacked_array.astype(np.float32)
+                            _fa[:,:,0] = np.clip(_fa[:,:,0] * galaxy_r_gain / 100.0, 0, 255)
+                            _fa[:,:,1] = np.clip(_fa[:,:,1] * galaxy_g_gain / 100.0, 0, 255)
+                            _fa[:,:,2] = np.clip(_fa[:,:,2] * galaxy_b_gain / 100.0, 0, 255)
+                            stacked_array = _fa.astype(np.uint8)
+                        galaxy_pre_filter_array = stacked_array.copy()
+                        stacked_array = apply_lucky_post_stack_filters(stacked_array, color_correction=True)
+                        galaxy_last_filtered_array = stacked_array.copy()
+                    _gx_display = galaxy_last_filtered_array
 
                 elif galaxy_active and _gxp['last_display'] is not None:
-                    _gx_display = _gxp['last_display']
+                    galaxy_pre_gradient_array = getattr(galaxy_livestack, '_gx_pre_gradient', None)
+                    if (galaxy_gradient_intensity > 0 and galaxy_pre_gradient_array is not None
+                            and galaxy_livestack is not None):
+                        _sess_gx = getattr(galaxy_livestack, 'session', None)
+                        if _sess_gx is not None:
+                            _norm_gr = _sess_gx._remove_gradient(
+                                galaxy_pre_gradient_array,
+                                n_tiles=8,
+                                flat_strength=galaxy_gradient_flat_strength,
+                                poly_degree=galaxy_gradient_poly_degree,
+                                grid_sigma=galaxy_gradient_sigma / 10.0,
+                                intensity=galaxy_gradient_intensity)
+                            _gx_display = np.clip(_norm_gr * 255.0, 0, 255).astype(np.uint8)
+                        else:
+                            _gx_display = _gxp['last_display'].copy()
+                    else:
+                        _gx_display = _gxp['last_display'].copy()
                     galaxy_pre_stretch_array = _gx_display.copy()
                     stacked_array = _gx_display.copy()
                     if stretch_preset != 0:
@@ -19386,11 +20076,20 @@ while True:
                         if show_cmds == 1:
                             print(f"[FILES THREAD] {_fe}")
                     _fxp['future'] = None
-                    # Avancer dans la liste
-                    files_index += 1
-                    if files_index >= len(files_list):
+                    # Pour les fichiers vidéo/SER, ne pas avancer files_index tant
+                    # que le fichier n'est pas épuisé (_video_file_done=False)
+                    _video_file_done = getattr(files_livestack, '_video_file_done', True)
+                    if _video_file_done:
+                        # Avancer dans la liste
+                        files_index += 1
+                    if _video_file_done and files_index >= len(files_list):
                         files_active = False
-                        print(f"[FILES] Traitement terminé: {files_index} fichier(s)")
+                        # Stocker le dernier résultat pour le mode pause interactif
+                        if _fxp['last_display'] is not None:
+                            files_pre_stretch_array = _fxp['last_display'].copy()
+                            files_last_filtered_array = None  # forcer re-render en pause
+                        files_paused = True
+                        print(f"[FILES] Traitement terminé: {files_index} fichier(s) — pause automatique")
 
                 # Soumettre le fichier suivant si thread libre et stacking actif
                 if files_active and _fxp['future'] is None and files_index < len(files_list):
@@ -19400,10 +20099,26 @@ while True:
                 # Sélectionner l'image à afficher
                 _fx_display = None
                 if files_paused and files_pre_stretch_array is not None:
-                    # Mode pause : re-appliquer stretch + filtres interactivement
+                    # Mode pause : re-appliquer gradient + stretch + filtres interactivement
                     # (seulement si les sliders ont changé — détecté par files_last_filtered_array)
                     if files_last_filtered_array is None:
-                        _fpre = files_pre_stretch_array.copy()
+                        # Appliquer gradient removal depuis le float32 pré-gradient
+                        if (galaxy_gradient_intensity > 0 and files_pre_gradient_array is not None
+                                and files_livestack is not None):
+                            _sess = getattr(files_livestack, 'session', None)
+                            if _sess is not None:
+                                _norm_gr = _sess._remove_gradient(
+                                    files_pre_gradient_array,
+                                    n_tiles=8,
+                                    flat_strength=galaxy_gradient_flat_strength,
+                                    poly_degree=galaxy_gradient_poly_degree,
+                                    grid_sigma=galaxy_gradient_sigma / 10.0,
+                                    intensity=galaxy_gradient_intensity)
+                                _fpre = np.clip(_norm_gr * 255.0, 0, 255).astype(np.uint8)
+                            else:
+                                _fpre = files_pre_stretch_array.copy()
+                        else:
+                            _fpre = files_pre_stretch_array.copy()
                         if stretch_preset != 0:
                             _fpre = astro_stretch(_fpre)
                         if _fpre.dtype != np.uint8:
@@ -19418,7 +20133,24 @@ while True:
                     _fx_new = _fxp.get('_last_shown') is not _fxp['last_display']
                     if _fx_new:
                         _fxp['_last_shown'] = _fxp['last_display']
-                        _fd = _fxp['last_display']
+                        files_pre_gradient_array = getattr(files_livestack, '_files_pre_gradient', None)
+                        # Appliquer gradient removal pendant le stacking actif si intensité > 0
+                        if (galaxy_gradient_intensity > 0 and files_pre_gradient_array is not None
+                                and files_livestack is not None):
+                            _sess = getattr(files_livestack, 'session', None)
+                            if _sess is not None:
+                                _norm_gr = _sess._remove_gradient(
+                                    files_pre_gradient_array,
+                                    n_tiles=8,
+                                    flat_strength=galaxy_gradient_flat_strength,
+                                    poly_degree=galaxy_gradient_poly_degree,
+                                    grid_sigma=galaxy_gradient_sigma / 10.0,
+                                    intensity=galaxy_gradient_intensity)
+                                _fd = np.clip(_norm_gr * 255.0, 0, 255).astype(np.uint8)
+                            else:
+                                _fd = _fxp['last_display'].copy()
+                        else:
+                            _fd = _fxp['last_display'].copy()
                         files_pre_stretch_array = _fd.copy()
                         if stretch_preset != 0:
                             _fd = astro_stretch(_fd)
@@ -19432,7 +20164,17 @@ while True:
                 if _fx_display is not None:
                     _ft = np.swapaxes(_fx_display, 0, 1)
                     _fi = pygame.surfarray.make_surface(_ft)
-                    _fi = pygame.transform.scale(_fi, (max_width, max_height))
+                    # Scale-fit en préservant l'aspect ratio (letterbox si nécessaire)
+                    _fw, _fh = _fi.get_size()
+                    _scale = min(max_width / max(_fw, 1), max_height / max(_fh, 1))
+                    _fw2 = int(_fw * _scale)
+                    _fh2 = int(_fh * _scale)
+                    _fi = pygame.transform.scale(_fi, (_fw2, _fh2))
+                    if _fw2 != max_width or _fh2 != max_height:
+                        _fsurf = pygame.Surface((max_width, max_height))
+                        _fsurf.fill((0, 0, 0))
+                        _fsurf.blit(_fi, ((max_width - _fw2) // 2, (max_height - _fh2) // 2))
+                        _fi = _fsurf
                     windowSurfaceObj.blit(_fi, (0, 0))
                 else:
                     windowSurfaceObj.fill((0, 0, 0))
@@ -19698,6 +20440,20 @@ while True:
                         stacked_array = _lsp['last_display']
 
                         if stacked_array is not None:
+                            # Stocker le float32 pré-gradient (pour re-calcul interactif en pause)
+                            ls_pre_gradient_array = getattr(livestack, '_ls_pre_gradient', None)
+                            # Appliquer gradient removal pendant le stacking actif si intensité > 0
+                            if (ls_gradient_intensity > 0 and ls_pre_gradient_array is not None):
+                                _sess_ls = getattr(livestack, 'session', None)
+                                if _sess_ls is not None:
+                                    _norm_gr = _sess_ls._remove_gradient(
+                                        ls_pre_gradient_array,
+                                        n_tiles=8,
+                                        flat_strength=ls_gradient_flat_strength,
+                                        poly_degree=ls_gradient_poly_degree,
+                                        grid_sigma=ls_gradient_sigma,
+                                        intensity=ls_gradient_intensity)
+                                    stacked_array = np.clip(_norm_gr * 255.0, 0, 255).astype(np.uint8)
                             # Stocker avant stretch pour re-stretch interactif en pause
                             ls_pre_stretch_array = stacked_array.copy()
                             # Appliquer le stretch astro (déplacé du thread → main loop)
@@ -19803,7 +20559,23 @@ while True:
                         # Recalculer seulement si invalidé (ls_last_filtered_array = None)
                         # → mis à None à l'entrée en pause et par handle_ls_slider_click
                         if ls_last_filtered_array is None:
-                            _pre = ls_pre_stretch_array.copy()
+                            # Appliquer gradient removal depuis le float32 pré-gradient
+                            if (ls_gradient_intensity > 0 and ls_pre_gradient_array is not None
+                                    and livestack is not None):
+                                _sess_ls = getattr(livestack, 'session', None)
+                                if _sess_ls is not None:
+                                    _norm_gr = _sess_ls._remove_gradient(
+                                        ls_pre_gradient_array,
+                                        n_tiles=8,
+                                        flat_strength=ls_gradient_flat_strength,
+                                        poly_degree=ls_gradient_poly_degree,
+                                        grid_sigma=ls_gradient_sigma,
+                                        intensity=ls_gradient_intensity)
+                                    _pre = np.clip(_norm_gr * 255.0, 0, 255).astype(np.uint8)
+                                else:
+                                    _pre = ls_pre_stretch_array.copy()
+                            else:
+                                _pre = ls_pre_stretch_array.copy()
                             # Re-appliquer le stretch avec les paramètres courants
                             if stretch_preset != 0:
                                 _pre = astro_stretch(_pre)
@@ -21670,6 +22442,7 @@ while True:
                 galaxy_last_filtered_array = None
                 galaxy_pre_filter_array = None
                 galaxy_pre_stretch_array = None
+                galaxy_pre_gradient_array = None
                 if hasattr(pygame, '_gx_proc'):
                     pygame._gx_proc['last_display'] = None
                 print("[GALAXY] Session réinitialisée")
@@ -21704,19 +22477,21 @@ while True:
                         'raw_format': raw_formats[raw_format]
                     }
                     galaxy_livestack = create_advanced_livestack_session(_cam_params)
-                    galaxy_livestack.output_dir = get_dated_save_dir("/home/admin/stacks/galaxy")
+                    galaxy_livestack.output_dir = get_dated_save_path("/home/admin/stacks/galaxy")
                     _method_names = ['mean', 'median', 'kappa_sigma', 'winsorized', 'weighted']
+                    _gx_align_mode = ['none', 'translation', 'rotation', 'surface'][min(galaxy_alignment_mode, 3)]
                     galaxy_livestack.configure(
                         stacking_method=_method_names[galaxy_stack_method],
                         kappa=galaxy_stack_kappa / 10.0,
                         iterations=galaxy_stack_iterations,
-                        alignment_mode=['none', 'translation', 'rotation'][min(galaxy_alignment_mode, 2)],
+                        alignment_mode=_gx_align_mode,
+                        planetary_max_shift=float(files_img_max_shift),
                         enable_qc=bool(galaxy_enable_qc),
                         max_fwhm=galaxy_max_fwhm / 10.0 if galaxy_max_fwhm > 0 else 999.0,
                         min_sharpness=galaxy_min_sharpness / 1000.0 if galaxy_min_sharpness > 0 else 0.0,
                         max_drift=float(galaxy_max_drift) if galaxy_max_drift > 0 else 999999.0,
                         min_stars=int(galaxy_min_stars),
-                        planetary_enable=False,
+                        planetary_enable=(galaxy_alignment_mode == 3),
                         lucky_enable=False,
                         png_stretch=['off', 'ghs', 'asinh', 'log', 'mtf'][min(stretch_preset, 4)],
                         png_factor=stretch_factor / 10.0,
@@ -21734,7 +22509,7 @@ while True:
                         isp_enable=False,
                         video_format='raw12',
                         raw_black_level=0,
-                        gradient_removal=bool(galaxy_gradient_removal),
+                        gradient_removal=bool(galaxy_gradient_intensity > 0),
                         gradient_removal_flat_strength=galaxy_gradient_flat_strength,
                         gradient_removal_poly_degree=galaxy_gradient_poly_degree,
                         gradient_removal_sigma=galaxy_gradient_sigma / 10.0,
@@ -21869,11 +22644,30 @@ while True:
                             files_dir = os.path.dirname(files_dir) or files_dir
                             files_browser_scroll = 0
                             continue
+                    elif _bk == 'fb_scroll_up':
+                        if _bv.collidepoint(mousex, mousey):
+                            files_browser_scroll = max(0, files_browser_scroll - 3)
+                            continue
+                    elif _bk == 'fb_scroll_down':
+                        if _bv.collidepoint(mousex, mousey):
+                            files_browser_scroll += 3
+                            continue
                     elif _bk.startswith('fb_dir_'):
                         _rect, _dpath = _bv
                         if _rect.collidepoint(mousex, mousey):
                             files_dir = _dpath
                             files_browser_scroll = 0
+                            continue
+                    elif _bk.startswith('fb_vid_'):
+                        _rect, _fpath = _bv
+                        if _rect.collidepoint(mousex, mousey):
+                            # Sélection directe d'un fichier vidéo
+                            files_list = [_fpath]
+                            files_index = 0
+                            files_format_type = "video"
+                            files_browser_visible = False
+                            files_browser_scroll = 0
+                            print(f"[FILES] Fichier vidéo sélectionné: {os.path.basename(_fpath)}")
                             continue
                 continue
 
@@ -21903,20 +22697,37 @@ while True:
                             'format': 'RGB888', 'sensor_mode': 0,
                         }
                         files_livestack = create_advanced_livestack_session(_fx_cam_params)
-                        files_livestack.output_dir = get_dated_save_dir("/home/admin/stacks/files")
+                        files_livestack.output_dir = get_dated_save_path("/home/admin/stacks/files")
                         _fx_methods = ['mean', 'median', 'kappa_sigma', 'winsorized', 'weighted']
+                        _fx_is_video = (files_format_type == "video")
+                        _fx_score_methods = ['laplacian', 'gradient', 'sobel', 'tenengrad', 'local_variance', 'psd']
+                        _fx_stack_methods = ['mean', 'median', 'sigma_clip']
+                        _fx_align_mode = ['none', 'translation', 'rotation', 'surface'][min(galaxy_alignment_mode, 3)]
                         files_livestack.configure(
                             stacking_method=_fx_methods[min(galaxy_stack_method, 4)],
                             kappa=galaxy_stack_kappa / 10.0,
                             iterations=galaxy_stack_iterations,
-                            alignment_mode=['none', 'translation', 'rotation'][min(galaxy_alignment_mode, 2)],
+                            alignment_mode=_fx_align_mode,
+                            planetary_max_shift=float(files_img_max_shift),
+                            canvas_margin_frac=0.4,
+                            max_rotation=15.0,
                             enable_qc=bool(galaxy_enable_qc),
                             max_fwhm=galaxy_max_fwhm / 10.0 if galaxy_max_fwhm > 0 else 999.0,
                             min_sharpness=galaxy_min_sharpness / 1000.0 if galaxy_min_sharpness > 0 else 0.0,
                             max_drift=float(galaxy_max_drift) if galaxy_max_drift > 0 else 999999.0,
                             min_stars=int(galaxy_min_stars),
-                            planetary_enable=False,
-                            lucky_enable=False,
+                            planetary_enable=_fx_is_video or (galaxy_alignment_mode == 3),
+                            lucky_enable=_fx_is_video,
+                            lucky_buffer_size=ls_lucky_buffer,
+                            lucky_keep_percent=float(ls_lucky_keep),
+                            lucky_score_method=_fx_score_methods[min(ls_lucky_score, 5)],
+                            lucky_stack_method=_fx_stack_methods[min(ls_lucky_stack, 2)],
+                            lucky_align_enabled=bool(ls_lucky_align),
+                            lucky_align_mode=ls_lucky_align,
+                            lucky_score_roi_percent=float(ls_lucky_roi),
+                            lucky_max_shift=float(ls_lucky_max_shift),
+                            lucky_drizzle_enable=_fx_is_video and files_drizzle_en,
+                            lucky_drizzle_scale=files_drizzle_scale / 10.0,
                             png_stretch=['off', 'ghs', 'asinh', 'log', 'mtf'][min(stretch_preset, 4)],
                             png_factor=stretch_factor / 10.0,
                             png_clip_low=0.0 if stretch_preset == 1 else stretch_p_low / 10.0,
@@ -21927,7 +22738,7 @@ while True:
                             mtf_midtone=mtf_midtone / 100.0,
                             mtf_shadows=mtf_shadows / 100.0,
                             mtf_highlights=mtf_highlights / 100.0,
-                            gradient_removal=bool(galaxy_gradient_removal),
+                            gradient_removal=bool(galaxy_gradient_removal) and not _fx_is_video,
                             gradient_removal_tiles=8,
                             gradient_removal_flat_strength=galaxy_gradient_flat_strength,
                             gradient_removal_poly_degree=galaxy_gradient_poly_degree,
@@ -21936,6 +22747,9 @@ while True:
                         )
                         files_livestack.reset()
                         files_livestack._files_vmax_ema = 0.0
+                        files_livestack._video_frame_idx = 0
+                        files_livestack._video_file_done = False
+                        files_livestack._video_total_frames = 0
                         files_livestack.start()
                         files_active = True
                         files_paused = False
@@ -21949,7 +22763,8 @@ while True:
                         else:
                             pygame._fx_proc['future'] = None
                             pygame._fx_proc['last_display'] = None
-                        print(f"[FILES] Démarrage: {len(files_list)} fichier(s)")
+                        _mode_str = "Lucky SER/vidéo" if _fx_is_video else "Galaxy images"
+                        print(f"[FILES] Démarrage ({_mode_str}): {len(files_list)} fichier(s)")
                     else:
                         print("[FILES] Aucun fichier trouvé dans", files_dir)
                 continue
@@ -21958,11 +22773,14 @@ while True:
             if is_click_on_files_save_fit(mousex, mousey, fs_width, fs_height):
                 if files_livestack is not None:
                     try:
+                        import time as _tfit
+                        _ts_fit = _tfit.strftime("%Y%m%d_%H%M%S")
+                        _fit_fname = f"files_stack_{files_index:04d}_{_ts_fit}"
                         if raw_format >= 2:
-                            save_with_external_processing(files_livestack, filename="files_stack",
+                            save_with_external_processing(files_livestack, filename=_fit_fname,
                                                           raw_format_name=raw_formats[raw_format])
                         else:
-                            files_livestack.save(filename="files_stack")
+                            files_livestack.save(filename=_fit_fname)
                         print("[FILES] Stack FITS sauvegardé")
                     except Exception as _fe:
                         print(f"[FILES] Erreur save FIT: {_fe}")
@@ -21972,9 +22790,10 @@ while True:
             if is_click_on_files_save_png(mousex, mousey, fs_width, fs_height):
                 if files_last_filtered_array is not None:
                     try:
-                        import cv2 as _cv2
+                        import cv2 as _cv2, time as _tpng
+                        _ts_png = _tpng.strftime("%Y%m%d_%H%M%S")
                         _png_dir = get_dated_save_dir("/home/admin/stacks/files")
-                        _png_path = os.path.join(str(_png_dir), f"files_preview_{files_index:04d}.png")
+                        _png_path = os.path.join(str(_png_dir), f"files_preview_{files_index:04d}_{_ts_png}.png")
                         _cv2.imwrite(_png_path, _cv2.cvtColor(files_last_filtered_array, _cv2.COLOR_RGB2BGR))
                         print(f"[FILES] PNG sauvegardé: {_png_path}")
                     except Exception as _fe:
@@ -22003,6 +22822,9 @@ while True:
                         files_livestack.stop()
                         files_livestack.reset()
                         files_livestack._files_vmax_ema = 0.0
+                        files_livestack._video_frame_idx = 0
+                        files_livestack._video_file_done = False
+                        files_livestack._video_total_frames = 0
                     except Exception:
                         pass
                 if hasattr(pygame, '_fx_proc'):
@@ -22011,6 +22833,7 @@ while True:
                 files_last_filtered_array = None
                 files_pre_stretch_array   = None
                 files_pre_filter_array    = None
+                files_pre_gradient_array  = None
                 print("[FILES] Stack réinitialisé")
                 continue
 
@@ -22130,6 +22953,7 @@ while True:
                 ls_last_filtered_array = None
                 ls_pre_filter_array = None
                 ls_pre_stretch_array = None
+                ls_pre_gradient_array = None
                 if hasattr(pygame, '_ls_raw_save_queue'):
                     pygame._ls_raw_save_queue.put(None)
                     del pygame._ls_raw_save_queue
@@ -22234,7 +23058,7 @@ while True:
                     else:
                         livestack.camera_params = _cam_params
                     from pathlib import Path as _Path
-                    livestack.output_dir = get_dated_save_dir("/home/admin/stacks/live")
+                    livestack.output_dir = get_dated_save_path("/home/admin/stacks/live")
 
                     livestack.configure(
                         stacking_method=['mean', 'median', 'kappa_sigma', 'winsorized', 'weighted'][ls_stack_method],
@@ -22292,7 +23116,7 @@ while True:
                         isp_config_path=None,
                         video_format=_vfmt_map.get(raw_format, 'yuv420'),
                         raw_black_level=0,
-                        gradient_removal=bool(ls_gradient_removal) if raw_format >= 2 else False,
+                        gradient_removal=bool(ls_gradient_intensity > 0) if raw_format >= 2 else False,
                         gradient_removal_flat_strength=ls_gradient_flat_strength if raw_format >= 2 else 0,
                         gradient_removal_poly_degree=ls_gradient_poly_degree if raw_format >= 2 else 2,
                         gradient_removal_sigma=ls_gradient_sigma if raw_format >= 2 else 2.0,
@@ -22469,6 +23293,7 @@ while True:
                 if _is_raw_lucky:
                     lucky_raw_active = False
                     if raw_lucky_stacker is not None:
+                        raw_lucky_stacker.stop()
                         raw_lucky_stacker.reset()
                 else:
                     if luckystack_active or lucky_paused:
@@ -22528,6 +23353,8 @@ while True:
                     if _is_raw_lucky:
                         lucky_raw_active = False
                         raw_array = None   # évite le warning "Array 2D fallback" sur la frame suivante
+                        if raw_lucky_stacker is not None:
+                            raw_lucky_stacker.stop()   # arrête thread élite si actif
                         if ls_lucky_save_final == 1 and lucky_last_filtered_array is not None:
                             import time as _tsave
                             _ts = _tsave.strftime("%Y%m%d_%H%M%S")
@@ -22600,20 +23427,27 @@ while True:
                         _score_methods = ['laplacian', 'gradient', 'sobel', 'tenengrad', 'laplacian', 'laplacian']
                         _stack_methods  = ['mean', 'mean', 'sigma_clip']
                         raw_lucky_stacker = _mk_raw(
-                            buffer_size   = ls_lucky_buffer,
-                            keep_percent  = float(ls_lucky_keep),
-                            score_method  = _score_methods[min(ls_lucky_score, 5)],
-                            score_roi     = float(ls_lucky_roi) / 100.0,
-                            align_enabled = bool(ls_lucky_align),
-                            max_shift_px  = int(ls_lucky_max_shift),
-                            stack_method  = _stack_methods[min(ls_lucky_stack, 2)],
-                            sigma_kappa   = 2.5,
-                            bl_auto       = (ls_bl_per_channel_enable == 1),
-                            bl_r          = ls_bl_r  if ls_bl_per_channel_enable == 2 else 0.0,
-                            bl_g1         = ls_bl_g1 if ls_bl_per_channel_enable == 2 else 0.0,
-                            bl_g2         = ls_bl_g2 if ls_bl_per_channel_enable == 2 else 0.0,
-                            bl_b          = ls_bl_b  if ls_bl_per_channel_enable == 2 else 0.0,
+                            buffer_size          = ls_lucky_buffer,
+                            keep_percent         = float(ls_lucky_keep),
+                            score_method         = _score_methods[min(ls_lucky_score, 5)],
+                            score_roi            = float(ls_lucky_roi) / 100.0,
+                            align_enabled        = bool(ls_lucky_align),
+                            max_shift_px         = int(ls_lucky_max_shift),
+                            stack_method         = _stack_methods[min(ls_lucky_stack, 2)],
+                            sigma_kappa          = 2.5,
+                            bl_auto              = (ls_bl_per_channel_enable == 1),
+                            bl_r                 = ls_bl_r  if ls_bl_per_channel_enable == 2 else 0.0,
+                            bl_g1                = ls_bl_g1 if ls_bl_per_channel_enable == 2 else 0.0,
+                            bl_g2                = ls_bl_g2 if ls_bl_per_channel_enable == 2 else 0.0,
+                            bl_b                 = ls_bl_b  if ls_bl_per_channel_enable == 2 else 0.0,
+                            use_elite            = (ls_lucky_buffer_mode == 1),
+                            elite_pool_size      = int(ls_elite_pool_size),
+                            elite_stack_interval = float(ls_elite_stack_interval),
+                            elite_entry_mode     = ['min', 'mean'][min(ls_elite_entry_mode, 1)],
+                            elite_score_clip     = bool(ls_elite_score_clip),
+                            elite_score_kappa    = ls_elite_score_kappa / 10.0,
                         )
+                        raw_lucky_stacker.start()
                         lucky_raw_active = True
                         print("[LUCKY RAW] Stack RAW Bayer démarré")
                     else:
@@ -22630,7 +23464,7 @@ while True:
                         else:
                             luckystack.camera_params = _cam_params
                         from pathlib import Path as _Path
-                        luckystack.output_dir = get_dated_save_dir("/home/admin/stacks/lucky")
+                        luckystack.output_dir = get_dated_save_path("/home/admin/stacks/lucky")
                         luckystack.configure(
                             stacking_method=['mean', 'median', 'kappa_sigma', 'winsorized', 'weighted'][ls_stack_method],
                             kappa=ls_stack_kappa / 10.0,
