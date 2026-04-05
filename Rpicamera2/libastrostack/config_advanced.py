@@ -483,6 +483,9 @@ class AdvancedStackingConfig:
         legacy.quality.star_detection_sigma = self.quality.star_detection_sigma
         legacy.quality.min_star_separation = self.quality.min_star_separation
         
+        # Canvas expandable
+        legacy.canvas_margin_frac = getattr(self, 'canvas_margin_frac', 0.0)
+
         # ISP (nouveaux champs)
         legacy.isp_enable = getattr(self, 'isp_enable', False)
         legacy.isp_config_path = getattr(self, 'isp_config_path', None)

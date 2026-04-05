@@ -136,6 +136,12 @@ class StackingConfig:
         # Paramètres alignement avancés
         self.max_stars_alignment = 50     # Nb max étoiles pour alignement
 
+        # Canvas expandable : fraction de la taille de l'image ajoutée de chaque côté.
+        # 0.0 = taille fixe (comportement historique, bords noirs avec drift).
+        # 0.4 = +40% par côté → supporte un drift total de 80% de la plus petite dimension.
+        # Recommandé pour le mode fichiers avec recadrage : 0.35 à 0.5
+        self.canvas_margin_frac = 0.0
+
         # Paramètres méthode de stacking
         self.stacking_method = 'mean'     # 'mean', 'kappa_sigma', 'winsorized', 'median'
         self.stacking_kappa = 2.5         # Kappa pour sigma-clipping (kappa_sigma/winsorized)

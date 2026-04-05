@@ -155,14 +155,17 @@ class ImageStacker:
 
         if self.stacked_image is None:
             # Première image : initialisation
-            self.stacked_image = image.astype(np.float32)
+            # Les pixels NaN (marges canvas warpAffine) sont remplacés par 0
+            # et leur poids est 0 — ainsi les frames suivantes les remplissent
+            # correctement : (0 * 0 + val) / 1 = val (pas de propagation NaN).
+            init_valid = np.isfinite(image)
+            self.stacked_image = np.where(init_valid, image, 0.0).astype(np.float32)
 
             if is_color:
-                self.weight_map = np.ones(
-                    (image.shape[0], image.shape[1]), dtype=np.float32
-                )
+                # Poids 0 pour les pixels NaN, 1 pour les pixels valides
+                self.weight_map = np.isfinite(image[:, :, 0]).astype(np.float32)
             else:
-                self.weight_map = np.ones_like(image, dtype=np.float32)
+                self.weight_map = np.isfinite(image).astype(np.float32)
 
             # Init variance pour sigma-clipping (Welford)
             if method in ('kappa_sigma', 'winsorized'):
@@ -210,6 +213,14 @@ class ImageStacker:
                 cnt_c     = np.ascontiguousarray(cnt)
                 new_stacked_p, new_cnt = _halide_ls_stack_mean_frame(
                     stacked_p, cnt_c, img_p)
+                # Halide n'écarte pas les pixels NaN (bordures warpAffine canvas) :
+                # il incrémente cnt même si img=NaN → weight_map corrompu.
+                # Correction : restaurer cnt et stacked pour les pixels invalides.
+                _valid = np.all(np.isfinite(img), axis=2)  # (H, W) bool
+                if not _valid.all():
+                    new_cnt[~_valid] = cnt_c[~_valid]
+                    for _i in range(3):
+                        new_stacked_p[_i][~_valid] = stacked_p[_i][~_valid]
                 # Retranspose (3,H,W)→(H,W,3) et copie in-place
                 np.copyto(self.stacked_image, new_stacked_p.transpose(1, 2, 0))
                 np.copyto(self.weight_map, new_cnt)
@@ -258,6 +269,14 @@ class ImageStacker:
                 cnt_c     = np.ascontiguousarray(cnt)
                 new_stacked_p, new_cnt, new_m2_p = _halide_ls_stack_kappa_frame(
                     stacked_p, cnt_c, m2_p, img_p, float(kappa))
+                # Correction NaN canvas : Halide incrémente cnt même pour pixels
+                # invalides (bordures warpAffine) → restaurer pour pixels NaN.
+                _valid = np.all(np.isfinite(img), axis=2)  # (H, W) bool
+                if not _valid.all():
+                    new_cnt[~_valid] = cnt_c[~_valid]
+                    for _i in range(3):
+                        new_stacked_p[_i][~_valid] = stacked_p[_i][~_valid]
+                        new_m2_p[_i][~_valid]      = m2_p[_i][~_valid]
                 np.copyto(self.stacked_image, new_stacked_p.transpose(1, 2, 0))
                 np.copyto(self.weight_map,    new_cnt)
                 np.copyto(self._running_m2,   new_m2_p.transpose(1, 2, 0))

@@ -262,6 +262,8 @@ class RPiCameraLiveStackAdvanced:
             if mode in ['disk', 'surface', 'planetary']:
                 self.config.planetary.enable = True
                 self.use_planetary = True
+                # Le planetary aligner bypass session.stacker → besoin de advanced_stacker
+                self.use_advanced_stacking = True
         
         # Configuration planétaire
         if 'planetary_enable' in kwargs:
@@ -463,6 +465,28 @@ class RPiCameraLiveStackAdvanced:
             if self.lucky_stacker and isinstance(self.lucky_stacker, ElitePoolStacker):
                 self.lucky_stacker.configure(elite_score_kappa=new_kappa)
 
+        # Drizzle Lucky (accumule les frames sélectionnées par buffer en haute résolution)
+        if 'lucky_drizzle_enable' in kwargs:
+            enable = bool(kwargs['lucky_drizzle_enable'])
+            if hasattr(self.config, 'lucky'):
+                self.config.lucky.drizzle_enable = enable
+            if self.lucky_stacker:
+                self.lucky_stacker.configure(drizzle_enable=enable)
+        if 'lucky_drizzle_scale' in kwargs:
+            scale = float(kwargs['lucky_drizzle_scale'])
+            if hasattr(self.config, 'lucky'):
+                self.config.lucky.drizzle_scale = scale
+            if self.lucky_stacker:
+                self.lucky_stacker.configure(drizzle_scale=scale)
+        if 'lucky_drizzle_pixfrac' in kwargs:
+            pf = float(kwargs['lucky_drizzle_pixfrac'])
+            if self.lucky_stacker:
+                self.lucky_stacker.configure(drizzle_pixfrac=pf)
+        if 'lucky_drizzle_kernel' in kwargs:
+            k = str(kwargs['lucky_drizzle_kernel'])
+            if self.lucky_stacker:
+                self.lucky_stacker.configure(drizzle_kernel=k)
+
         # Contrôle qualité
         if 'enable_qc' in kwargs:
             self.config.quality.enable = bool(kwargs['enable_qc'])
@@ -474,16 +498,28 @@ class RPiCameraLiveStackAdvanced:
             self.config.quality.min_stars = int(kwargs['min_stars'])
         if 'max_drift' in kwargs:
             self.config.quality.max_drift = float(kwargs['max_drift'])
+        if 'max_rotation' in kwargs:
+            self.config.quality.max_rotation = float(kwargs['max_rotation'])
         if 'min_sharpness' in kwargs:
             self.config.quality.min_sharpness = float(kwargs['min_sharpness'])
+        if 'canvas_margin_frac' in kwargs:
+            # Fraction de la taille de l'image ajoutée de chaque côté du canvas
+            # 0.0 = taille fixe (défaut), 0.4 = +40% par côté
+            legacy = getattr(self, '_legacy_config', None)
+            if legacy is not None:
+                legacy.canvas_margin_frac = float(kwargs['canvas_margin_frac'])
+            # Stocker aussi sur l'objet pour to_legacy_config()
+            if not hasattr(self.config, 'canvas_margin_frac'):
+                from dataclasses import fields
+            self.config.canvas_margin_frac = float(kwargs['canvas_margin_frac'])
         
         # Stacking avancé
         if 'stacking_method' in kwargs:
             method = kwargs['stacking_method'].lower()
             if method in self.STACKING_METHODS:
                 self.config.stacking.method = self.STACKING_METHODS[method]
-                # Don't disable advanced stacking if Lucky mode is active
-                if not self.use_lucky:
+                # Ne pas désactiver advanced stacking si Lucky ou Planetary est actif
+                if not self.use_lucky and not self.use_planetary:
                     self.use_advanced_stacking = method != 'mean'
                 self.stats['stacking_method'] = method
         
@@ -893,17 +929,23 @@ class RPiCameraLiveStackAdvanced:
             if current_stacks_done > previous_stacks:
                 # Nouveau stack disponible !
                 self._last_stacks_count = current_stacks_done
-                
-                # Récupérer le résultat (consomme last_result)
+
+                # Récupérer le résultat normal et, si disponible, le résultat drizzle
                 new_result = self.lucky_stacker.get_result()
-                
+                drizzle_result = None
+                if getattr(self.lucky_stacker, 'use_drizzle', False):
+                    drizzle_result = getattr(self.lucky_stacker, 'last_drizzle_result', None)
+                    if drizzle_result is not None:
+                        drizzle_result = drizzle_result.copy()
+
                 if new_result is not None:
                     # MODE CUMULATIF : Envoyer le stack Lucky vers l'advanced_stacker
-                    if self.use_advanced_stacking and self.advanced_stacker:
+                    # (seulement si drizzle inactif — le drizzle accumule ses propres données)
+                    if self.use_advanced_stacking and self.advanced_stacker and drizzle_result is None:
                         # Pondération par le score moyen des frames sélectionnées du buffer
                         buffer_weight = float(lucky_stats.get('avg_score', 1.0)) or 1.0
                         self.advanced_stacker.add_image(new_result, weight=buffer_weight, quality_metrics={})
-                        
+
                         # Mettre à jour le compteur de frames acceptées
                         if hasattr(self.advanced_stacker, 'get_count'):
                             self.stats['accepted_frames'] = self.advanced_stacker.get_count()
@@ -924,8 +966,14 @@ class RPiCameraLiveStackAdvanced:
                             self._update_memory_stats()
                             self.frame_count += 1
                             return master_stack
+                    elif drizzle_result is not None:
+                        # Drizzle actif : retourner l'image haute résolution accumulée
+                        self.last_lucky_result = drizzle_result
+                        self._update_memory_stats()
+                        self.frame_count += 1
+                        return drizzle_result
                     else:
-                        # Mode non-cumulatif
+                        # Mode non-cumulatif sans drizzle
                         self.last_lucky_result = new_result.copy()
                         self._update_memory_stats()
                         self.frame_count += 1
@@ -1249,7 +1297,10 @@ class RPiCameraLiveStackAdvanced:
         
         if self.lucky_stacker:
             self.lucky_stacker.reset()
-        
+            # Réinitialiser aussi le drizzle Lucky entre sessions
+            if hasattr(self.lucky_stacker, 'reset_drizzle'):
+                self.lucky_stacker.reset_drizzle()
+
         self.aligned_buffer.clear()
         self.transform_buffer.clear()
         self.frame_count = 0

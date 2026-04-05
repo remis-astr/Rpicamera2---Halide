@@ -9,6 +9,43 @@ import cv2
 from .config import StretchMethod
 
 
+def wavelet_sharpen(img_float, weights):
+    """
+    Sharpening multi-échelles style Registax (décomposition pyramidale de Laplacien).
+
+    Principe : chaque niveau capture les détails à une échelle donnée via la
+    différence entre deux niveaux de flou gaussien consécutifs.  Le gain par
+    niveau est appliqué additivement : résultat = original + Σ(w_i × detail_i).
+
+    Args:
+        img_float : float32 ndarray (H,W) ou (H,W,3), valeurs dans [0,1]
+        weights   : séquence de 6 floats — gain par niveau
+                    L1 (~1px fins détails), …, L6 (~32px structures larges)
+                    0.0 = inactif, 1.0 = fort, 2.0 = très fort
+
+    Returns:
+        float32 ndarray même shape, clippé dans [0,1]
+    """
+    img = img_float.astype(np.float32)
+    # Sigmas absolus des 6 niveaux (feature size ≈ 2×sigma)
+    sigmas = [1.0, 2.0, 4.0, 8.0, 16.0, 32.0]
+
+    # Pré-calcul des pyramides gaussiennes depuis l'original
+    blurred_prev = img
+    blurred_next = None
+    sharpening = np.zeros_like(img)
+
+    for i, (sigma, w) in enumerate(zip(sigmas, weights[:6])):
+        ks = max(3, int(6 * sigma + 1)) | 1   # taille noyau impaire
+        blurred_next = cv2.GaussianBlur(img, (ks, ks), sigma)
+        if abs(w) > 0.001:
+            detail = blurred_prev - blurred_next
+            sharpening += w * detail
+        blurred_prev = blurred_next
+
+    return np.clip(img + sharpening, 0.0, 1.0)
+
+
 def stretch_linear(data, clip_low=1.0, clip_high=99.5):
     """
     Étirement linéaire simple

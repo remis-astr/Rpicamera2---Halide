@@ -27,6 +27,8 @@ import threading
 import logging
 import ctypes
 import os
+import heapq
+import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional, Tuple, List, Dict
 
@@ -777,6 +779,117 @@ def debayer_bayer_stack(bayer_stack: np.ndarray,
 
 
 # ---------------------------------------------------------------------------
+# Pool élite Bayer (min-heap, usage interne)
+# ---------------------------------------------------------------------------
+
+class _BayerElitePool:
+    """Pool des N meilleures frames Bayer — min-heap O(log N).
+
+    Principe identique à ElitePool de lucky_imaging.py mais autonome
+    (pas de dépendance croisée) et adapté aux frames Bayer float32 (H,W).
+    """
+
+    def __init__(self, max_size: int = 100, entry_mode: str = "min"):
+        self._max_size   = max_size
+        self._entry_mode = entry_mode   # "min" | "mean"
+        self._heap: List[Tuple[float, int, np.ndarray]] = []
+        self._counter    = 0
+        self._lock       = threading.RLock()
+        self.tested      = 0
+        self.accepted    = 0
+
+    # ── Propriétés ────────────────────────────────────────────────────────
+
+    @property
+    def size(self) -> int:
+        return len(self._heap)
+
+    @property
+    def is_full(self) -> bool:
+        return len(self._heap) >= self._max_size
+
+    @property
+    def min_score(self) -> float:
+        return self._heap[0][0] if self._heap else 0.0
+
+    @property
+    def mean_score(self) -> float:
+        if not self._heap:
+            return 0.0
+        return sum(s for s, _, _ in self._heap) / len(self._heap)
+
+    @property
+    def max_score(self) -> float:
+        if not self._heap:
+            return 0.0
+        return max(s for s, _, _ in self._heap)
+
+    @property
+    def accept_rate(self) -> float:
+        if self.tested == 0:
+            return 0.0
+        return self.accepted / self.tested * 100.0
+
+    # ── Méthodes ──────────────────────────────────────────────────────────
+
+    def try_add(self, score: float, frame: np.ndarray) -> bool:
+        """Insère une frame si elle améliore le pool. Retourne True si acceptée."""
+        with self._lock:
+            self.tested += 1
+            if len(self._heap) < self._max_size:
+                heapq.heappush(self._heap, (score, self._counter, frame.copy()))
+                self._counter += 1
+                self.accepted += 1
+                return True
+            threshold = (self.mean_score if self._entry_mode == "mean"
+                         else self._heap[0][0])
+            if score > threshold:
+                heapq.heapreplace(self._heap, (score, self._counter, frame.copy()))
+                self._counter += 1
+                self.accepted += 1
+                return True
+            return False
+
+    def get_frames_clipped(self, kappa: float = 2.0) -> Tuple[List[np.ndarray], int]:
+        """Retourne (frames retenues, n_clippées) après sigma-clipping des scores."""
+        with self._lock:
+            n = len(self._heap)
+            if n < 3:
+                return [f for _, _, f in self._heap], 0
+            scores = np.array([s for s, _, _ in self._heap], dtype=np.float64)
+            mean_s = scores.mean()
+            std_s  = scores.std()
+            if std_s < 1e-9:
+                return [f for _, _, f in self._heap], 0
+            threshold = mean_s - kappa * std_s
+            kept      = [f for s, _, f in self._heap if s >= threshold]
+            return kept, n - len(kept)
+
+    def get_frames(self) -> List[np.ndarray]:
+        """Retourne toutes les frames (copies)."""
+        with self._lock:
+            return [f.copy() for _, _, f in self._heap]
+
+    def resize(self, new_size: int):
+        """Redimensionne le pool. Si réduction, élimine les pires frames."""
+        with self._lock:
+            if new_size == self._max_size:
+                return
+            self._max_size = new_size
+            while len(self._heap) > self._max_size:
+                heapq.heappop(self._heap)
+
+    def update_entry_mode(self, mode: str):
+        self._entry_mode = mode
+
+    def clear(self):
+        with self._lock:
+            self._heap.clear()
+            self.tested   = 0
+            self.accepted = 0
+
+
+# ---------------------------------------------------------------------------
 # Classe principale
 # ---------------------------------------------------------------------------
 
@@ -815,6 +928,13 @@ class BayerLuckyStacker:
         bl_g2:                float = 0.0,
         bl_b:                 float = 0.0,
         hot_pixel_threshold:  float = 0.0,
+        # ── Mode Pool Élite ──────────────────────────────────────────────────
+        use_elite:            bool  = False,
+        elite_pool_size:      int   = 100,
+        elite_stack_interval: float = 5.0,
+        elite_entry_mode:     str   = 'min',
+        elite_score_clip:     bool  = True,
+        elite_score_kappa:    float = 2.0,
     ):
         self.buffer_size   = max(2, int(buffer_size))
         self.keep_percent  = float(keep_percent)
@@ -838,7 +958,7 @@ class BayerLuckyStacker:
         self._lock:    threading.RLock = threading.RLock()
         self._scores:  deque = deque(maxlen=self.buffer_size)
 
-        # ── Buffer 3D pré-alloué ─────────────────────────────────────────────
+        # ── Buffer 3D pré-alloué (mode ring) ────────────────────────────────
         # Alloué lors de la première frame (dimensions inconnues avant).
         # Élimine np.stack() dans _process_buffer() → direct (N,H,W) view pour Halide.
         # _ring_buf     : (buffer_size, H, W) float32  — frames Bayer BL-soustraites
@@ -861,19 +981,93 @@ class BayerLuckyStacker:
         self.last_bayer_stack: Optional[np.ndarray] = None
         self._align_ref_g1:    Optional[np.ndarray] = None
 
-        # Stack cumulatif inter-buffer pondéré par score
+        # Stack cumulatif inter-buffer pondéré par score (mode ring)
         # Chaque buffer est pondéré par le score moyen de ses frames sélectionnées
         # → les buffers avec de meilleures frames contribuent davantage au résultat final
-        self._cumul_stack:  Optional[np.ndarray] = None   # float64 (H, W) somme pondérée
+        self._cumul_stack:  Optional[np.ndarray] = None   # float32 (H, W) somme pondérée
         self._cumul_count:  int = 0                        # nombre de buffers accumulés
         self._cumul_weight: float = 0.0                    # somme des poids (scores moyens)
+
+        # ── Mode Pool Élite ──────────────────────────────────────────────────
+        self.use_elite            = bool(use_elite)
+        self.elite_pool_size      = max(5, int(elite_pool_size))
+        self.elite_stack_interval = float(elite_stack_interval)
+        self.elite_entry_mode     = str(elite_entry_mode)
+        self.elite_score_clip     = bool(elite_score_clip)
+        self.elite_score_kappa    = float(elite_score_kappa)
+
+        # Pool min-heap (créé seulement si use_elite)
+        self._elite_pool: Optional[_BayerElitePool] = None
+
+        # Warmup : accumulation initiale pour choisir la référence d'alignement
+        # [(score, processed_bayer, g1_half), ...]
+        self._elite_warmup:        List[Tuple[float, np.ndarray, np.ndarray]] = []
+        self._elite_warmup_needed: int  = 0
+        self._elite_ref_ready:     bool = False
+        # Référence fixe (FFT du G1 de la meilleure frame warmup)
+        self._elite_ref_fft:       Optional[np.ndarray] = None
+        self._elite_max_half:      int = 0   # max_shift_px // 2 pour G1 half-res
+
+        # Threading élite
+        self._elite_stop:          threading.Event = threading.Event()
+        self._elite_stack_now:     threading.Event = threading.Event()
+        self._elite_thread:        Optional[threading.Thread] = None
+        self._elite_last_stack_t:  float = 0.0
+
+        # Résultat élite : Bayer float32 (H,W) — débayérisé dans get_result()
+        self._elite_bayer_result:  Optional[np.ndarray] = None
+        self._elite_result_lock:   threading.Lock = threading.Lock()
+        self._elite_stacks_done:   int = 0
+        self._elite_last_clipped:  int = 0
+
+        if self.use_elite:
+            self._elite_pool = _BayerElitePool(self.elite_pool_size, self.elite_entry_mode)
+            self._elite_warmup_needed = max(5, min(20, self.elite_pool_size // 5))
+            self._elite_max_half = (self.max_shift_px // 2) if self.max_shift_px > 0 else 0
+
+    # ------------------------------------------------------------------
+    # Cycle de vie (élite)
+    # ------------------------------------------------------------------
+
+    def start(self):
+        """Lance le thread de stack périodique (mode élite uniquement)."""
+        if not self.use_elite:
+            return
+        self._elite_stop.clear()
+        self._elite_stack_now.clear()
+        self._elite_last_stack_t = time.time()
+        self._elite_thread = threading.Thread(
+            target=self._elite_stack_loop, name="BayerEliteStack", daemon=True)
+        self._elite_thread.start()
+        print(f"[Lucky RAW Elite] Démarré — pool={self.elite_pool_size} frames, "
+              f"intervalle={self.elite_stack_interval}s, "
+              f"critère={'moyenne' if self.elite_entry_mode == 'mean' else 'minimum'}, "
+              f"warmup={self._elite_warmup_needed} frames")
+
+    def stop(self):
+        """Arrête le thread de stack périodique (mode élite uniquement)."""
+        if not self.use_elite:
+            return
+        self._elite_stop.set()
+        self._elite_stack_now.set()
+        if self._elite_thread is not None:
+            self._elite_thread.join(timeout=5.0)
+            self._elite_thread = None
+        print(f"[Lucky RAW Elite] Arrêté — "
+              f"frames={self.frame_count}, stacks={self._elite_stacks_done}")
 
     # ------------------------------------------------------------------
     # Interface principale
     # ------------------------------------------------------------------
 
     def add_frame(self, raw: np.ndarray) -> float:
-        """Ajoute une frame Bayer, déclenche le stack si buffer plein.
+        """Ajoute une frame Bayer, déclenche le stack si buffer plein (ring)
+        ou tente l'insertion dans le pool (élite).
+
+        Args:
+            raw : uint8 (H, W*2) ou uint16 (H, W) Bayer RGGB, espace CSI-2 ×16
+                  Picamera2 livre parfois le Bayer comme buffer uint8 (2 octets/pixel).
+                  La conversion uint8→uint16 est faite ici, identique à debayer_raw_array().
 
         Args:
             raw : uint8 (H, W*2) ou uint16 (H, W) Bayer RGGB, espace CSI-2 ×16
@@ -922,6 +1116,34 @@ class BayerLuckyStacker:
         # Score de netteté sur G1 déjà extrait (évite une deuxième extraction)
         score = _score_g1(g1_half, self.score_method, self.score_roi)
 
+        # ── Mode Pool Élite ───────────────────────────────────────────────────
+        if self.use_elite:
+            with self._lock:
+                self.frame_count += 1
+
+                if not self._elite_ref_ready:
+                    # Warmup : accumulation pour choisir la référence d'alignement
+                    self._elite_warmup.append((score, processed.copy(), g1_half.copy()))
+                    if len(self._elite_warmup) >= self._elite_warmup_needed:
+                        self._elite_init_reference()
+                else:
+                    # Pré-filtrage rapide : évite l'alignement si le score ne peut
+                    # pas améliorer le pool (pool plein + score ≤ seuil)
+                    pool = self._elite_pool
+                    if pool.is_full:
+                        threshold = (pool.mean_score if self.elite_entry_mode == "mean"
+                                     else pool.min_score)
+                        if score <= threshold:
+                            return score
+
+                    # Aligner contre la référence fixe
+                    aligned = self._elite_align(processed, g1_half)
+                    if aligned is not None:
+                        pool.try_add(score, aligned)
+
+            return score
+
+        # ── Mode Ring (inchangé) ───────────────────────────────────────────────
         with self._lock:
             # Allocation lazy du buffer 3D (dimensions connues après la première frame)
             if self._ring_buf is None:
@@ -947,6 +1169,11 @@ class BayerLuckyStacker:
 
     def new_stack_available(self) -> bool:
         """True si un nouveau stack est prêt (consomme l'indicateur)."""
+        if self.use_elite:
+            result = self._elite_stacks_done > self._prev_stacks
+            if result:
+                self._prev_stacks = self._elite_stacks_done
+            return result
         result = self.stacks_done > self._prev_stacks
         if result:
             self._prev_stacks = self.stacks_done
@@ -970,6 +1197,18 @@ class BayerLuckyStacker:
             float32 (H, W, 3) [0-65535], ch0=R_phys, ch2=B_phys.
             Compatible avec apply_isp_to_preview().
         """
+        bl_was_applied = self.bl_auto or (self.bl_r + self.bl_g1 + self.bl_g2 + self.bl_b) > 0.0
+
+        # ── Mode élite : résultat = dernier stack du pool ─────────────────────
+        if self.use_elite:
+            with self._elite_result_lock:
+                if self._elite_bayer_result is None:
+                    return None
+                bayer = self._elite_bayer_result.copy()
+            return debayer_bayer_stack(bayer, red_gain, blue_gain, global_bl,
+                                       bl_applied=bl_was_applied)
+
+        # ── Mode ring : stack cumulatif pondéré ───────────────────────────────
         if self._cumul_stack is None or self._cumul_count == 0:
             return None
         # Division par la somme des poids (score-weighted mean inter-buffer)
@@ -977,12 +1216,33 @@ class BayerLuckyStacker:
         bayer_mean = self._cumul_stack / np.float32(divisor)   # float32 ÷ float32 → float32
         # bl_applied=True si une correction BL a été appliquée per-frame → évite
         # la double soustraction qui écrase les basses lumières de la planète.
-        bl_was_applied = self.bl_auto or (self.bl_r + self.bl_g1 + self.bl_g2 + self.bl_b) > 0.0
         return debayer_bayer_stack(bayer_mean, red_gain, blue_gain, global_bl,
                                    bl_applied=bl_was_applied)
 
     def get_stats(self) -> Dict:
         """Statistiques compatibles avec draw_lucky_stats_bar() de RPiCamera2.py."""
+        if self.use_elite and self._elite_pool is not None:
+            pool = self._elite_pool
+            next_in = max(0.0, self.elite_stack_interval
+                          - (time.time() - self._elite_last_stack_t))
+            return {
+                # Clés requises par draw_lucky_stats_bar()
+                'lucky_buffer_fill':  pool.size,
+                'lucky_buffer_size':  self.elite_pool_size,
+                'lucky_stacks_done':  self._elite_stacks_done,
+                'total_frames':       self.frame_count,
+                'lucky_avg_score':    pool.mean_score,
+                # Infos supplémentaires élite
+                'lucky_max_score':    pool.max_score,
+                'lucky_min_score':    pool.min_score,
+                'keep_percent':       100.0,   # pool conserve les N meilleures
+                'buffer_mode':        'elite',
+                'accept_rate':        pool.accept_rate,
+                'last_clipped':       self._elite_last_clipped,
+                'next_stack_in':      next_in,
+                'elite_phase':        ('warmup' if not self._elite_ref_ready else
+                                       ('filling' if not pool.is_full else 'active')),
+            }
         with self._lock:
             scores = list(self._scores)
             n = self._ring_head
@@ -996,11 +1256,11 @@ class BayerLuckyStacker:
             # Infos supplémentaires
             'lucky_max_score':    float(max(scores)) if scores else 0.0,
             'keep_percent':       self.keep_percent,
-            'buffer_mode':        'ring',  # Toujours ring pour RAW lucky
+            'buffer_mode':        'ring',
         }
 
     def reset(self):
-        """Réinitialise complètement le stacker (buffer + cumulatif)."""
+        """Réinitialise complètement le stacker (buffer + cumulatif + pool élite)."""
         with self._lock:
             self._scores.clear()
             # Le ring buffer est conservé (pré-alloué) mais le pointeur d'écriture
@@ -1016,33 +1276,149 @@ class BayerLuckyStacker:
             self._cumul_weight    = 0.0
             self._bl_cached       = None
             self._bl_cache_age    = 0
+            # Élite
+            if self.use_elite and self._elite_pool is not None:
+                self._elite_pool.clear()
+                self._elite_warmup       = []
+                self._elite_ref_ready    = False
+                self._elite_ref_fft      = None
+                self._elite_stacks_done  = 0
+                self._elite_last_clipped = 0
+                self._elite_last_stack_t = time.time()
+        with self._elite_result_lock:
+            self._elite_bayer_result = None
+        print("[Lucky RAW Elite] Pool réinitialisé — nouvelle référence à choisir")
 
     def update_config(self, **kwargs):
         """Met à jour la configuration à chaud (sans reset du buffer).
 
         Paramètres supportés : buffer_size, keep_percent, score_method,
         score_roi, align_enabled, max_shift_px, stack_method, sigma_kappa,
-        bl_auto, bl_r, bl_g1, bl_g2, bl_b, bl_cache_interval.
+        bl_auto, bl_r, bl_g1, bl_g2, bl_b, bl_cache_interval,
+        elite_pool_size, elite_stack_interval, elite_entry_mode,
+        elite_score_clip, elite_score_kappa.
         """
         for k, v in kwargs.items():
-            if hasattr(self, k):
-                if k == 'buffer_size':
-                    v = max(2, int(v))
-                    if v != self.buffer_size:
-                        # Re-allouer les buffers 3D (perte du buffer courant acceptable)
-                        self._ring_buf    = None   # Réalloué à la prochaine frame
-                        self._g1_ring     = None
-                        self._aligned_buf = None
-                        self._ring_head   = 0
-                        self._scores      = deque(maxlen=v)
-                elif k == 'bl_auto' and v != self.bl_auto:
-                    # Changement de mode BL → invalider le cache
+            if k == 'buffer_size':
+                v = max(2, int(v))
+                if v != self.buffer_size:
+                    self._ring_buf    = None
+                    self._g1_ring     = None
+                    self._aligned_buf = None
+                    self._ring_head   = 0
+                    self._scores      = deque(maxlen=v)
+                self.buffer_size = v
+            elif k == 'bl_auto':
+                if bool(v) != self.bl_auto:
                     self._bl_cached    = None
                     self._bl_cache_age = 0
+                self.bl_auto = bool(v)
+            elif k == 'elite_pool_size' and self._elite_pool is not None:
+                new_size = max(5, int(v))
+                self.elite_pool_size = new_size
+                self._elite_pool.resize(new_size)
+            elif k == 'elite_stack_interval':
+                self.elite_stack_interval = float(v)
+            elif k == 'elite_entry_mode' and self._elite_pool is not None:
+                self.elite_entry_mode = str(v)
+                self._elite_pool.update_entry_mode(str(v))
+            elif k == 'elite_score_clip':
+                self.elite_score_clip = bool(v)
+            elif k == 'elite_score_kappa':
+                self.elite_score_kappa = float(v)
+            elif hasattr(self, k):
                 setattr(self, k, v)
 
     # ------------------------------------------------------------------
-    # Méthodes internes
+    # Méthodes internes — Mode Pool Élite
+    # ------------------------------------------------------------------
+
+    def _elite_init_reference(self):
+        """Choisit la référence d'alignement parmi les frames warmup (meilleur score).
+        Insère ensuite toutes les frames warmup dans le pool.
+        Appelé sous self._lock.
+        """
+        best_score, best_bayer, best_g1 = max(self._elite_warmup, key=lambda x: x[0])
+        self._elite_ref_fft, _ = _precompute_ref_fft(best_g1)
+        self._elite_ref_ready  = True
+        print(f"[Lucky RAW Elite] Référence définie (score={best_score:.4f}, "
+              f"{len(self._elite_warmup)} frames warmup)")
+        # Insérer les frames warmup dans le pool (sans ré-alignement — warmup court)
+        for ws, wb, _ in self._elite_warmup:
+            self._elite_pool.try_add(ws, wb)
+        self._elite_warmup = []
+        if self._elite_pool.is_full:
+            # Déclencher le premier stack dès que le pool est plein
+            self._elite_stack_now.set()
+
+    def _elite_align(self, bayer: np.ndarray,
+                     g1_half: np.ndarray) -> Optional[np.ndarray]:
+        """Aligne une frame contre la référence fixe.
+
+        Returns:
+            Frame Bayer alignée (float32 H,W), ou None si décalage hors limite.
+        """
+        if not self.align_enabled or self._elite_ref_fft is None:
+            return bayer.copy()
+        dy, dx = _compute_bayer_shift_cached(
+            self._elite_ref_fft, g1_half, self._elite_max_half)
+        # _compute_bayer_shift_cached retourne (0,0) si hors limite → accepter quand même
+        # mais retourner None si décalage nul ET alignement explicitement demandé
+        # → ici on accepte (0,0) comme "pas de décalage détecté"
+        out = np.empty_like(bayer)
+        _shift_bayer_into(bayer, dy, dx, out)
+        return out
+
+    def _elite_stack_loop(self):
+        """Thread de stack périodique pour le mode élite."""
+        while not self._elite_stop.is_set():
+            self._elite_stack_now.wait(timeout=float(self.elite_stack_interval))
+            self._elite_stack_now.clear()
+            if self._elite_stop.is_set():
+                break
+            if self._elite_pool is not None and self._elite_pool.size >= 3:
+                self._do_elite_stack()
+
+    def _do_elite_stack(self):
+        """Stacke les frames du pool élite et stocke le résultat Bayer."""
+        try:
+            if self.elite_score_clip:
+                frames, n_clipped = self._elite_pool.get_frames_clipped(
+                    self.elite_score_kappa)
+                self._elite_last_clipped = n_clipped
+            else:
+                frames = self._elite_pool.get_frames()
+                self._elite_last_clipped = 0
+
+            if len(frames) < 1:
+                return
+
+            # Stack (même logique que _process_buffer)
+            use_sigma = self.stack_method == 'sigma_clip' and len(frames) >= 3
+            frames_3d = np.stack(frames, axis=0)   # (N, H, W) float32
+
+            if _halide_stack_available:
+                result = (_halide_sigma_clip(frames_3d, self.sigma_kappa)
+                          if use_sigma else _halide_stack_mean(frames_3d))
+            else:
+                result = (_stack_sigma_clip_3d(frames_3d, self.sigma_kappa)
+                          if use_sigma else _stack_mean_3d(frames_3d))
+
+            with self._elite_result_lock:
+                self._elite_bayer_result  = result
+                self._elite_stacks_done  += 1
+                self._elite_last_stack_t  = time.time()
+
+            print(f"[Lucky RAW Elite] Stack #{self._elite_stacks_done}: "
+                  f"{len(frames)}/{self._elite_pool.size} frames "
+                  f"({self._elite_last_clipped} clippées σ), "
+                  f"pool={self._elite_pool.size}/{self.elite_pool_size}")
+
+        except Exception as e:
+            logger.error("[Lucky RAW Elite] Erreur stack: %s", e)
+
+    # ------------------------------------------------------------------
+    # Méthodes internes — Mode Ring
     # ------------------------------------------------------------------
 
     def _process_buffer(self):
@@ -1175,33 +1551,45 @@ class BayerLuckyStacker:
 # ---------------------------------------------------------------------------
 
 def create_bayer_lucky_stacker(
-    buffer_size:   int   = 50,
-    keep_percent:  float = 20.0,
-    score_method:  str   = 'laplacian',
-    score_roi:     float = 0.50,
-    align_enabled: bool  = True,
-    max_shift_px:  int   = 30,
-    stack_method:  str   = 'mean',
-    sigma_kappa:   float = 2.5,
-    bl_auto:       bool  = False,
-    bl_r:          float = 0.0,
-    bl_g1:         float = 0.0,
-    bl_g2:         float = 0.0,
-    bl_b:          float = 0.0,
+    buffer_size:          int   = 50,
+    keep_percent:         float = 20.0,
+    score_method:         str   = 'laplacian',
+    score_roi:            float = 0.50,
+    align_enabled:        bool  = True,
+    max_shift_px:         int   = 30,
+    stack_method:         str   = 'mean',
+    sigma_kappa:          float = 2.5,
+    bl_auto:              bool  = False,
+    bl_r:                 float = 0.0,
+    bl_g1:                float = 0.0,
+    bl_g2:                float = 0.0,
+    bl_b:                 float = 0.0,
+    use_elite:            bool  = False,
+    elite_pool_size:      int   = 100,
+    elite_stack_interval: float = 5.0,
+    elite_entry_mode:     str   = 'min',
+    elite_score_clip:     bool  = True,
+    elite_score_kappa:    float = 2.0,
 ) -> BayerLuckyStacker:
     """Crée un BayerLuckyStacker depuis les globals RPiCamera2."""
     return BayerLuckyStacker(
-        buffer_size   = buffer_size,
-        keep_percent  = keep_percent,
-        score_method  = score_method,
-        score_roi     = score_roi,
-        align_enabled = align_enabled,
-        max_shift_px  = max_shift_px,
-        stack_method  = stack_method,
-        sigma_kappa   = sigma_kappa,
-        bl_auto       = bl_auto,
-        bl_r          = bl_r,
-        bl_g1         = bl_g1,
-        bl_g2         = bl_g2,
-        bl_b          = bl_b,
+        buffer_size          = buffer_size,
+        keep_percent         = keep_percent,
+        score_method         = score_method,
+        score_roi            = score_roi,
+        align_enabled        = align_enabled,
+        max_shift_px         = max_shift_px,
+        stack_method         = stack_method,
+        sigma_kappa          = sigma_kappa,
+        bl_auto              = bl_auto,
+        bl_r                 = bl_r,
+        bl_g1                = bl_g1,
+        bl_g2                = bl_g2,
+        bl_b                 = bl_b,
+        use_elite            = use_elite,
+        elite_pool_size      = elite_pool_size,
+        elite_stack_interval = elite_stack_interval,
+        elite_entry_mode     = elite_entry_mode,
+        elite_score_clip     = elite_score_clip,
+        elite_score_kappa    = elite_score_kappa,
     )

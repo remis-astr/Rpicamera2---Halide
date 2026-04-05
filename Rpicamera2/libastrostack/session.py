@@ -327,7 +327,7 @@ class LiveStackSession:
         """
         return self.stacker.get_result()
     
-    def _remove_gradient(self, image, n_tiles=8, flat_strength=0, poly_degree=2, grid_sigma=2.0):
+    def _remove_gradient(self, image, n_tiles=8, flat_strength=0, poly_degree=2, grid_sigma=2.0, intensity=100):
         """
         Supprime le gradient de fond et optionnellement le vignetage.
 
@@ -472,7 +472,11 @@ class LiveStackSession:
                 coeffs_bg_c = np.ascontiguousarray(coeffs_bg_arr.T)           # (3,15)
                 coeff_fl_c  = np.ascontiguousarray(coeff_fl_arr)              # (15,)
                 result_p    = _halide_poly_bg_apply(frame_p, coeffs_bg_c, coeff_fl_c, alpha_f)
-                return np.ascontiguousarray(result_p.transpose(1, 2, 0))
+                removed = np.ascontiguousarray(result_p.transpose(1, 2, 0))
+                if intensity >= 100:
+                    return removed
+                _a = float(intensity) / 100.0
+                return np.clip(image * (1.0 - _a) + removed * _a, 0.0, 1.0).astype(np.float32)
             except Exception:
                 pass  # fallback NumPy
 
@@ -515,13 +519,17 @@ class LiveStackSession:
         flat_full = np.clip(1.0 + alpha_f * (flat_full - 1.0), 0.05, 2.0).astype(np.float32)
 
         if is_color:
-            return np.clip(
+            removed = np.clip(
                 (image - bg_full) / np.maximum(flat_full[:, :, None], 0.01), 0.0, 1.0
             ).astype(np.float32)
         else:
-            return np.clip(
+            removed = np.clip(
                 (image - bg_full) / np.maximum(flat_full, 0.01), 0.0, 1.0
             ).astype(np.float32)
+        if intensity >= 100:
+            return removed
+        _a = float(intensity) / 100.0
+        return np.clip(image * (1.0 - _a) + removed * _a, 0.0, 1.0).astype(np.float32)
 
     def get_preview_png(self):
         """

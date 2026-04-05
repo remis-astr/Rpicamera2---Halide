@@ -865,6 +865,14 @@ class LuckyImagingStacker:
         # Timing
         self._scoring_times: deque = deque(maxlen=100)
         self._stack_times: deque = deque(maxlen=100)
+
+        # Drizzle (optionnel, accumulé cross-buffers)
+        self.use_drizzle = False
+        self.drizzle_scale = 2.0
+        self.drizzle_pixfrac = 0.8
+        self.drizzle_kernel = 'square'
+        self.drizzle_stacker = None       # DrizzleStackerFast instancié à la demande
+        self.last_drizzle_result = None   # Dernier résultat drizzle (float32)
     
     def start(self):
         """Démarre le stacker"""
@@ -1069,33 +1077,62 @@ class LuckyImagingStacker:
         t_align = time.perf_counter()
         _align_active = (getattr(self.config, 'align_mode', 1 if self.config.align_enabled else 0) != 0)
         if _align_active and len(selected_frames) > 1:
-            aligned_frames = self._align_frames(selected_frames)
+            aligned_frames, align_params = self._align_frames(selected_frames)
         else:
             aligned_frames = selected_frames
+            align_params = [{'dx': 0.0, 'dy': 0.0, 'angle': 0.0}] * len(selected_frames)
         time_align = (time.perf_counter() - t_align) * 1000
 
-        # 5. Stacker
+        # 5. Stacker (moyenne/médiane/sigma-clip)
         t_stack = time.perf_counter()
         result = self._stack_frames(aligned_frames)
         time_stack = (time.perf_counter() - t_stack) * 1000
-        
+
+        # 6. Drizzle (optionnel, accumule cross-buffers sur la même session)
+        time_drizzle = 0.0
+        if self.use_drizzle and aligned_frames:
+            t_drizzle = time.perf_counter()
+            try:
+                from .drizzle import DrizzleStackerFast
+                if self.drizzle_stacker is None:
+                    self.drizzle_stacker = DrizzleStackerFast(
+                        scale=self.drizzle_scale,
+                        pixfrac=self.drizzle_pixfrac,
+                        kernel=self.drizzle_kernel,
+                    )
+                for frame, params in zip(aligned_frames, align_params):
+                    self.drizzle_stacker.add_image(
+                        frame.astype(np.float32),
+                        dx=params['dx'],
+                        dy=params['dy'],
+                        angle=params['angle'],
+                    )
+                drizzle_out = self.drizzle_stacker.combine()
+                if drizzle_out is not None:
+                    self.last_drizzle_result = drizzle_out  # float32, même plage que frames
+            except Exception as _e:
+                print(f"[LUCKY DRIZZLE] Erreur: {_e}")
+                self.last_drizzle_result = None
+            time_drizzle = (time.perf_counter() - t_drizzle) * 1000
+
         # Timing et stats
         stack_time = (time.perf_counter() - t0) * 1000
         self._stack_times.append(stack_time)
-        
+
         self.last_result = result
         self.last_stack_time = time.time()
         self.total_stacks_done += 1
-        
+
         # Mettre à jour stats
         self._update_stats(buffer_stats, len(selected_frames))
 
         # DEBUG: Afficher décomposition du temps
+        _drz_str = f", Drizzle: {time_drizzle:.1f}ms ({self.drizzle_scale}×)" if self.use_drizzle else ""
         print(f"[LUCKY] Stack #{self.total_stacks_done}: {len(selected_frames)} images, "
               f"{stack_time:.1f}ms total")
         print(f"  └─ Sélection: {time_select:.1f}ms, "
               f"Alignement: {time_align:.1f}ms, "
-              f"Stack: {time_stack:.1f}ms")
+              f"Stack: {time_stack:.1f}ms{_drz_str}")
 
         # Vider le buffer pour le prochain cycle
         self.buffer.clear()
@@ -1109,7 +1146,7 @@ class LuckyImagingStacker:
 
         return result
     
-    def _align_frames(self, frames: List[np.ndarray]) -> List[np.ndarray]:
+    def _align_frames(self, frames: List[np.ndarray]):
         """
         Aligne une liste de frames.
 
@@ -1118,9 +1155,13 @@ class LuckyImagingStacker:
         Modes 2/3 (disk/hybrid) :
           - PlanetaryAligner gère la référence en interne sur le premier appel.
           - Toutes les frames sont passées à align() y compris la première.
+
+        Returns:
+            (aligned_frames, params_list) — params_list[i] = {'dx', 'dy', 'angle'}
+            La frame de référence a params {'dx': 0.0, 'dy': 0.0, 'angle': 0.0}.
         """
         if not frames:
-            return frames
+            return frames, []
 
         align_mode = getattr(self.config, 'align_mode', 1 if self.config.align_enabled else 0)
 
@@ -1135,44 +1176,62 @@ class LuckyImagingStacker:
             else:
                 # Disk/Hybrid : PlanetaryAligner auto-set référence sur le 1er appel
                 aligned = []
+                params_list = []
                 failed_count = 0
                 for frame in frames:
                     aligned_frame, params = self.aligner.align(frame)
                     if params.get('align_failed', False):
                         failed_count += 1
-                        # Frame non alignée : exclus du stack pour ne pas le dégrader
                     else:
                         aligned.append(aligned_frame)
+                        params_list.append({
+                            'dx': float(params.get('dx', 0.0)),
+                            'dy': float(params.get('dy', 0.0)),
+                            'angle': float(params.get('angle', 0.0)),
+                        })
                 if failed_count > 0:
                     print(f"[LUCKY ALIGN] {failed_count}/{len(frames)} frames rejetées "
                           f"(align_failed) — seuil max_shift ou corrélation trop faible")
-                # Si toutes les frames ont échoué, fallback sur frames originales non alignées
-                return aligned if aligned else list(frames)
+                if not aligned:
+                    # Fallback : frames originales sans transform
+                    return list(frames), [{'dx': 0.0, 'dy': 0.0, 'angle': 0.0}] * len(frames)
+                return aligned, params_list
 
         # Mode 1 (surface/phase) — logique d'origine
         if not self.aligner.reference_is_explicit:
             self.aligner.set_reference(frames[0], explicit=False)
-            aligned = [frames[0]]  # La référence est déjà alignée
+            aligned = [frames[0]]
+            params_list = [{'dx': 0.0, 'dy': 0.0, 'angle': 0.0}]  # référence = offset nul
             start_idx = 1
         else:
             aligned = []
+            params_list = []
             start_idx = 0
             print(f"[LUCKY ALIGN] Utilisation référence explicite pour aligner {len(frames)} frames")
 
         to_align = frames[start_idx:]
         if len(to_align) < 3 or self.config.align_method != "phase":
-            # Séquentiel si peu de frames ou ECC (non thread-safe)
             for frame in to_align:
                 aligned_frame, params = self.aligner.align(frame)
                 aligned.append(aligned_frame)
+                params_list.append({
+                    'dx': float(params.get('dx', 0.0)),
+                    'dy': float(params.get('dy', 0.0)),
+                    'angle': float(params.get('angle', 0.0)),
+                })
         else:
-            # Parallèle : ref_fft est en lecture seule, warpAffine opère sur des buffers distincts
+            # Parallèle
             futures = [self.executor.submit(self.aligner.align, f) for f in to_align]
             for fut in futures:
                 aligned_frame, params = fut.result()
                 aligned.append(aligned_frame)
+                params_list.append({
+                    'dx': float(params.get('dx', 0.0)),
+                    'dy': float(params.get('dy', 0.0)),
+                    'angle': float(params.get('angle', 0.0)),
+                })
 
-        return aligned
+        return aligned, params_list
     
     def _stack_frames(self, frames: List[np.ndarray]) -> np.ndarray:
         """Combine les frames selon la méthode configurée"""
@@ -1254,6 +1313,26 @@ class LuckyImagingStacker:
         if self.last_result is None:
             return None
         return self.last_result.copy()
+
+    def get_drizzle_result(self) -> Optional[np.ndarray]:
+        """
+        Retourne le dernier résultat drizzle accumulé (haute résolution).
+
+        Accumule à travers tous les buffers de la session.
+        Appeler reset_drizzle() pour réinitialiser entre sessions.
+
+        Returns:
+            Image float32 haute résolution (scale× la taille originale), ou None.
+        """
+        if self.last_drizzle_result is None:
+            return None
+        return self.last_drizzle_result.copy()
+
+    def reset_drizzle(self):
+        """Réinitialise le drizzle stacker (à appeler entre sessions)."""
+        if self.drizzle_stacker is not None:
+            self.drizzle_stacker.reset()
+        self.last_drizzle_result = None
     
     def get_preview(self, as_uint8: bool = True) -> Optional[np.ndarray]:
         """
@@ -1378,6 +1457,34 @@ class LuckyImagingStacker:
 
         if 'sigma_clip_kappa' in kwargs:
             self.config.sigma_clip_kappa = float(kwargs['sigma_clip_kappa'])
+
+        # Drizzle
+        if 'drizzle_enable' in kwargs:
+            enable = bool(kwargs['drizzle_enable'])
+            if enable != self.use_drizzle:
+                self.use_drizzle = enable
+                if not enable:
+                    self.reset_drizzle()
+                print(f"[LUCKY CONFIG] drizzle: {'ON' if enable else 'OFF'}")
+        if 'drizzle_scale' in kwargs:
+            new_scale = float(kwargs['drizzle_scale'])
+            if new_scale != self.drizzle_scale:
+                self.drizzle_scale = max(1.0, min(4.0, new_scale))
+                # Réinitialiser le stacker si la taille change
+                if self.drizzle_stacker is not None:
+                    self.drizzle_stacker.reset()
+                    self.drizzle_stacker.scale = self.drizzle_scale
+                print(f"[LUCKY CONFIG] drizzle_scale: {self.drizzle_scale:.1f}×")
+        if 'drizzle_pixfrac' in kwargs:
+            self.drizzle_pixfrac = max(0.1, min(1.0, float(kwargs['drizzle_pixfrac'])))
+            if self.drizzle_stacker is not None:
+                self.drizzle_stacker.pixfrac = self.drizzle_pixfrac
+        if 'drizzle_kernel' in kwargs:
+            k = str(kwargs['drizzle_kernel']).lower()
+            if k in ('point', 'square', 'gaussian'):
+                self.drizzle_kernel = k
+                if self.drizzle_stacker is not None:
+                    self.drizzle_stacker.kernel = k
 
         # Nouveaux paramètres de normalisation RAW (correction bug image blanche)
         if 'raw_format' in kwargs:

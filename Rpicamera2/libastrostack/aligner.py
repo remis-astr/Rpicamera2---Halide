@@ -11,6 +11,12 @@ from astropy.stats import sigma_clipped_stats
 from skimage.feature import peak_local_max
 from .config import AlignmentMode
 
+try:
+    import astroalign as _aa
+    _ASTROALIGN_AVAILABLE = True
+except ImportError:
+    _ASTROALIGN_AVAILABLE = False
+
 
 class StarDetector:
     """Détecteur d'étoiles pour alignement"""
@@ -69,14 +75,25 @@ class AdvancedAligner:
     
     def set_reference(self, image):
         """
-        Définit l'image de référence
-        
-        Args:
-            image: Image de référence (float array)
+        Définit l'image de référence et calcule les dimensions du canvas.
+
+        Si config.canvas_margin_frac > 0, le canvas est élargi de chaque côté
+        pour que les frames décalées ne perdent pas leurs bords.
         """
         self.reference_image = image.copy()
         self.is_color = len(image.shape) == 3
-        
+
+        h, w = image.shape[:2]
+        frac = getattr(self.config, 'canvas_margin_frac', 0.0)
+        self._canvas_mx = int(w * frac)   # marge horizontale (px par côté)
+        self._canvas_my = int(h * frac)   # marge verticale  (px par côté)
+        self._canvas_w  = w + 2 * self._canvas_mx
+        self._canvas_h  = h + 2 * self._canvas_my
+
+        if self._canvas_mx > 0 or self._canvas_my > 0:
+            print(f"  [Canvas] {w}×{h} → {self._canvas_w}×{self._canvas_h} "
+                  f"(marge {self._canvas_mx}×{self._canvas_my}px par côté)")
+
         # Détecter étoiles de référence (luminance pour robustesse sur toutes cibles)
         if self.is_color:
             ref_gray = (0.299 * image[:, :, 0] +
@@ -84,28 +101,29 @@ class AdvancedAligner:
                         0.114 * image[:, :, 2])
         else:
             ref_gray = image
-        
+
         self.reference_stars = self.star_detector.detect_stars(ref_gray)
-        
+
         shape_str = f"{image.shape} RGB" if self.is_color else f"{image.shape} MONO"
         print(f"Référence: {shape_str}, {len(self.reference_stars)} étoiles")
-    
+
     def align(self, image):
         """
-        Aligne une image sur la référence
-        
-        Args:
-            image: Image à aligner (float array)
-        
+        Aligne une image sur la référence.
+
+        Si canvas_margin_frac > 0, l'image alignée est placée sur un canvas
+        élargi (marge de chaque côté). La frame de référence est aussi centrée
+        sur ce canvas. Le stacker reçoit donc toujours des images canvas-size.
+
         Returns:
             (aligned_image, params, success)
-            - aligned_image: Image alignée
-            - params: dict avec dx, dy, angle, scale, etc.
-            - success: True si alignement réussi
         """
         if self.reference_image is None:
             self.set_reference(image)
-            return image, {'dx': 0, 'dy': 0, 'angle': 0, 'scale': 1.0}, True
+            # Placer la frame de référence sur le canvas (décalée de la marge)
+            identity = np.eye(3, dtype=np.float64)
+            ref_on_canvas = self._apply_transform(image, identity)
+            return ref_on_canvas, {'dx': 0, 'dy': 0, 'angle': 0, 'scale': 1.0}, True
         
         if image.shape != self.reference_image.shape:
             print(f"[WARN] Dimensions différentes")
@@ -193,62 +211,65 @@ class AdvancedAligner:
         ref_pts = ref_stars[:n_ref]
         cur_pts = cur_stars[:n_cur]
 
-        # Calculer toutes les distances entre étoiles ref et cur
-        # Pour chaque étoile de référence, trouver la plus proche dans l'image courante
-        matches = []
-        match_distances = []
-
-        # Seuil adaptatif : 15% de la plus petite dimension, entre 50px et 500px
-        # 5% était trop restrictif pour des séquences avec dérive > ~50px (images 1080p → 54px seulement)
-        # 15% → 162px pour 1080p, bien en dessous de l'espacement moyen des étoiles (~218px pour 43 étoiles)
+        # Seuil adaptatif : 25% de la plus petite dimension, entre 50px et 600px
+        # 15% (162px pour 1080p) était trop restrictif pour des drifts > ~160px
+        # qui surviennent après plusieurs frames ou sans guidage.
         if self.reference_image is not None:
             h, w = self.reference_image.shape[:2]
-            match_threshold = max(50, min(500, int(0.15 * min(h, w))))
+            match_threshold = max(50, min(600, int(0.25 * min(h, w))))
         else:
-            match_threshold = 150
+            match_threshold = 200
 
-        for i, ref_pt in enumerate(ref_pts):
-            # Distances à toutes les étoiles courantes
-            distances = np.sqrt(np.sum((cur_pts - ref_pt)**2, axis=1))
-            min_idx = np.argmin(distances)
-            min_dist = distances[min_idx]
-
-            # Accepter seulement les matches proches
-            if min_dist < match_threshold:
-                matches.append((ref_pt, cur_pts[min_idx]))
-                match_distances.append(min_dist)
+        # ── Hough voting pour trouver la translation consensus ────────────────
+        # NNN échoue quand le drift est grand (ex: 85px) et qu'un faux voisin
+        # est plus proche que la vraie cible. Hough : toutes les paires ref×cur
+        # votent pour leur translation ; le vrai drift accumule N votes, les
+        # faux matches se dispersent → pic robuste même avec des clusters d'étoiles.
+        bin_size = 15  # px par bin
+        vote_grid = {}
+        candidate_pairs = []  # (ref_pt, cur_pt, dist, dy, dx)
+        for ref_pt in ref_pts:
+            for cur_pt in cur_pts:
+                dist = float(np.sqrt(np.sum((cur_pt - ref_pt)**2)))
+                if dist < match_threshold:
+                    dy_pair = float(ref_pt[0] - cur_pt[0])
+                    dx_pair = float(ref_pt[1] - cur_pt[1])
+                    key = (round(dy_pair / bin_size), round(dx_pair / bin_size))
+                    vote_grid[key] = vote_grid.get(key, 0) + 1
+                    candidate_pairs.append((ref_pt, cur_pt, dist, dy_pair, dx_pair))
 
         # Exiger au moins 25% des étoiles testées ET un minimum absolu de 5
         min_required = max(5, int(0.25 * min(n_ref, n_cur)))
-        if len(matches) < min_required:
-            print(f"  [WARN] Pas assez de matches: {len(matches)}/{min(n_ref, n_cur)} (requis {min_required})")
+        if not candidate_pairs:
+            print(f"  [WARN] Aucune paire dans le seuil {match_threshold}px "
+                  f"(drift > {match_threshold}px ?)")
             return None, {}
 
-        # ── RANSAC simplifié en 2 passes ─────────────────────────────────────
-        # Problème avec grand seuil (162px) : avec une dérive de ~86px, la probabilité
-        # qu'une étoile voisine soit plus proche que la vraie cible est ~32% par étoile.
-        # La médiane seule ne suffit plus quand la direction de dérive varie d'une frame
-        # à l'autre (oscillation du guidage). Solution : passe 1 grossière → passe 2
-        # affinée qui ne garde que les paires cohérentes avec la translation consensus.
+        # Pic Hough → translation consensus
+        best_key = max(vote_grid, key=lambda k: vote_grid[k])
+        best_dy = best_key[0] * bin_size
+        best_dx = best_key[1] * bin_size
+        peak_votes = vote_grid[best_key]
+        peak_drift = float(np.sqrt(best_dx**2 + best_dy**2))
+        print(f"  [Hough] consensus: dy={best_dy:.0f} dx={best_dx:.0f} "
+              f"drift={peak_drift:.0f}px votes={peak_votes}/{len(candidate_pairs)}")
 
-        # Passe 1 : estimation grossière (médiane brute sur tous les matches)
-        translations = np.array([ref - cur for ref, cur in matches])
-        dy_rough = float(np.median(translations[:, 0]))
-        dx_rough = float(np.median(translations[:, 1]))
-
-        # Passe 2 : ne garder que les matches dont la translation est dans ±refine_tol
-        # de la translation grossière.  15px couvre les erreurs de centroïde tout en
-        # rejetant les faux appariements (translation aléatoire ≠ consensus).
-        refine_tol = 15.0
-        refined = [(ref, cur) for ref, cur in matches
-                   if (abs((ref[0] - cur[0]) - dy_rough) < refine_tol and
-                       abs((ref[1] - cur[1]) - dx_rough) < refine_tol)]
+        # Garder paires dans ±1.5 bins du consensus + exclusivité cur
+        tight_tol = bin_size * 1.5  # ±22.5 px
+        _best_for_cur = {}  # tuple(cur_pt) → (dist, ref_pt, cur_pt)
+        for ref_pt, cur_pt, dist, dy_pair, dx_pair in candidate_pairs:
+            if abs(dy_pair - best_dy) < tight_tol and abs(dx_pair - best_dx) < tight_tol:
+                key = (cur_pt[0], cur_pt[1])
+                if key not in _best_for_cur or dist < _best_for_cur[key][0]:
+                    _best_for_cur[key] = (dist, ref_pt, cur_pt)
+        refined = [(ref_pt, cur_pt) for _, ref_pt, cur_pt in _best_for_cur.values()]
 
         if len(refined) < min_required:
-            # Raffinement trop agressif (cas rare) → réutiliser les matches bruts
-            refined = matches
+            print(f"  [WARN] Pas assez de matches après Hough: {len(refined)}/{min(n_ref, n_cur)} "
+                  f"(requis {min_required}, seuil {match_threshold}px)")
+            return None, {}
 
-        # Translation finale sur les matches raffinés
+        # Translation finale : médiane sur les paires raffinées (robuste aux outliers résiduels)
         translations_refined = np.array([ref - cur for ref, cur in refined])
         dy = float(np.median(translations_refined[:, 0]))
         dx = float(np.median(translations_refined[:, 1]))
@@ -257,7 +278,7 @@ class AdvancedAligner:
             'dx': dx, 'dy': dy, 'angle': 0, 'scale': 1.0,
             'matches': len(refined),
             'total': len(ref_pts),
-            'raw_matches': len(matches),
+            'raw_matches': len(candidate_pairs),
         }
 
         transform = np.array([
@@ -268,98 +289,134 @@ class AdvancedAligner:
 
         return transform, params
     
-    def _compute_rotation(self, ref_stars, cur_stars, image_shape):
-        """Calcule rotation + translation avec matching d'étoiles puis RANSAC rigide.
+    def _hough_match(self, ref_pts, cur_pts, match_threshold, bin_size=15):
+        """Retourne liste de paires (ref_pt, cur_pt) via vote Hough sur la translation.
 
-        Ancienne implémentation : passait les 30 étoiles ref et 30 étoiles courantes
-        triées INDÉPENDAMMENT par luminosité à estimateAffinePartial2D → faux car
-        l'algo attend des paires correspondantes.
-
-        Nouvelle implémentation :
-          1. Matching NNN (même pipeline que translation, tolérance élargie à 25px
-             pour conserver les étoiles déplacées par rotation)
-          2. estimateAffinePartial2D sur les paires matchées → rotation + translation
+        Toutes les paires ref×cur dans match_threshold votent pour leur vecteur
+        de translation (binné à bin_size px). Le pic = drift consensus.
+        Exclusivité : une étoile courante ne peut être utilisée qu'une seule fois.
         """
-        n_ref = min(30, len(ref_stars))
-        n_cur = min(30, len(cur_stars))
+        vote_grid = {}
+        candidate_pairs = []
+        for ref_pt in ref_pts:
+            for cur_pt in cur_pts:
+                dist = float(np.sqrt(np.sum((cur_pt - ref_pt)**2)))
+                if dist < match_threshold:
+                    dy = float(ref_pt[0] - cur_pt[0])
+                    dx = float(ref_pt[1] - cur_pt[1])
+                    key = (round(dy / bin_size), round(dx / bin_size))
+                    vote_grid[key] = vote_grid.get(key, 0) + 1
+                    candidate_pairs.append((ref_pt, cur_pt, dist, dy, dx))
+
+        if not candidate_pairs:
+            return []
+
+        best_key = max(vote_grid, key=lambda k: vote_grid[k])
+        best_dy = best_key[0] * bin_size
+        best_dx = best_key[1] * bin_size
+        peak_drift = float(np.sqrt(best_dx**2 + best_dy**2))
+        print(f"  [Hough] dy={best_dy:.0f} dx={best_dx:.0f} drift={peak_drift:.0f}px "
+              f"votes={vote_grid[best_key]}/{len(candidate_pairs)}")
+
+        tight_tol = bin_size * 1.5  # ±22.5 px
+        best_for_cur = {}
+        for ref_pt, cur_pt, dist, dy, dx in candidate_pairs:
+            if abs(dy - best_dy) < tight_tol and abs(dx - best_dx) < tight_tol:
+                key = (cur_pt[0], cur_pt[1])
+                if key not in best_for_cur or dist < best_for_cur[key][0]:
+                    best_for_cur[key] = (dist, ref_pt, cur_pt)
+        return [(ref_pt, cur_pt) for _, ref_pt, cur_pt in best_for_cur.values()]
+
+    def _compute_rotation(self, ref_stars, cur_stars, image_shape):
+        """Rotation + translation : Hough en passe 1, astroalign (triangles) en passe 2.
+
+        Passe 1 — Hough : rapide, O(N²). Suffit quand le champ est stable
+        (drift cohérent d'une frame à l'autre). Échoue si le drift est trop grand
+        ou si les étoiles communes sont trop rares (< 25 % en commun).
+
+        Passe 2 — astroalign : matching par invariants géométriques de triangles,
+        indépendant du drift et de l'orientation. Fonctionne avec seulement 30-40 %
+        de recouvrement, n'importe quelle amplitude de dérive.
+        """
+        n_ref = min(50, len(ref_stars))
+        n_cur = min(50, len(cur_stars))
         ref_pts_all = ref_stars[:n_ref]
         cur_pts_all = cur_stars[:n_cur]
+        min_required = max(5, int(0.25 * min(n_ref, n_cur)))
 
-        # ── Seuil adaptatif identique au mode translation ──────────────────────
         if self.reference_image is not None:
             h, w = self.reference_image.shape[:2]
-            match_threshold = max(50, min(500, int(0.15 * min(h, w))))
+            match_threshold = max(50, min(600, int(0.25 * min(h, w))))
         else:
-            match_threshold = 150
+            match_threshold = 200
 
-        # ── Matching NNN ───────────────────────────────────────────────────────
-        matches = []
-        for ref_pt in ref_pts_all:
-            distances = np.sqrt(np.sum((cur_pts_all - ref_pt)**2, axis=1))
-            min_idx = np.argmin(distances)
-            if distances[min_idx] < match_threshold:
-                matches.append((ref_pt, cur_pts_all[min_idx]))
+        # ── Passe 1 : Hough + estimateAffinePartial2D ────────────────────────
+        refined = self._hough_match(ref_pts_all, cur_pts_all, match_threshold)
 
-        min_required = max(5, int(0.25 * min(n_ref, n_cur)))
-        if len(matches) < min_required:
-            print(f"  [WARN] Pas assez de matches: {len(matches)}/{min(n_ref, n_cur)}")
+        if len(refined) >= min_required:
+            matched_ref = np.array([pt[[1, 0]] for pt, _ in refined], dtype=np.float32)
+            matched_cur = np.array([pt[[1, 0]] for _, pt in refined], dtype=np.float32)
+            try:
+                M, inliers = cv2.estimateAffinePartial2D(
+                    matched_cur, matched_ref,
+                    method=cv2.RANSAC,
+                    ransacReprojThreshold=5.0,
+                    maxIters=2000,
+                    confidence=0.99
+                )
+                if M is not None:
+                    n_inliers = int(np.sum(inliers)) if inliers is not None else 0
+                    inliers_ratio = n_inliers / len(matched_cur)
+                    if inliers_ratio >= self.config.quality.min_inliers_ratio:
+                        angle = np.arctan2(M[1, 0], M[0, 0]) * 180 / np.pi
+                        scale = np.sqrt(M[0, 0]**2 + M[1, 0]**2)
+                        params = {
+                            'dx': float(M[0, 2]), 'dy': float(M[1, 2]),
+                            'angle': angle, 'scale': scale,
+                            'inliers': n_inliers, 'total': len(matched_ref),
+                            'method': 'hough',
+                        }
+                        return np.vstack([M, [0, 0, 1]]), params
+                    else:
+                        print(f"  [Hough] inliers insuffisants: {n_inliers}/{len(matched_cur)} "
+                              f"({inliers_ratio*100:.1f}%) → essai astroalign")
+            except Exception as e:
+                print(f"  [Hough] erreur RANSAC: {e} → essai astroalign")
+        else:
+            print(f"  [Hough] matches insuffisants: {len(refined)}/{min(n_ref, n_cur)} "
+                  f"(requis {min_required}) → essai astroalign")
+
+        # ── Passe 2 : astroalign (triangle matching) ─────────────────────────
+        if not _ASTROALIGN_AVAILABLE:
+            print(f"  [FAIL] astroalign non disponible (pip3 install astroalign)")
             return None, {}
 
-        # ── RANSAC 2-pass pour éliminer les faux matches ──────────────────────
-        # Tolérance volontairement large (25px) pour ne PAS éliminer les étoiles
-        # dont la translation brute dévie à cause de la rotation de champ.
-        # L'étape suivante (estimateAffinePartial2D) gère correctement la rotation.
-        translations = np.array([ref - cur for ref, cur in matches])
-        dy_rough = float(np.median(translations[:, 0]))
-        dx_rough = float(np.median(translations[:, 1]))
-        refine_tol = 25.0
-        refined = [(ref, cur) for ref, cur in matches
-                   if (abs((ref[0] - cur[0]) - dy_rough) < refine_tol and
-                       abs((ref[1] - cur[1]) - dx_rough) < refine_tol)]
-        if len(refined) < min_required:
-            refined = matches
-
-        # ── Ajustement rigide (rotation + translation) sur paires matchées ────
-        # Convertir (y, x) → (x, y) pour OpenCV
-        matched_ref = np.array([pt[[1, 0]] for pt, _ in refined], dtype=np.float32)
-        matched_cur = np.array([pt[[1, 0]] for _, pt in refined], dtype=np.float32)
-
         try:
-            M, inliers = cv2.estimateAffinePartial2D(
-                matched_cur, matched_ref,
-                method=cv2.RANSAC,
-                ransacReprojThreshold=5.0,
-                maxIters=2000,
-                confidence=0.99
-            )
+            # astroalign attend (x, y) — nos étoiles sont (row=y, col=x)
+            ref_xy = ref_pts_all[:, [1, 0]].astype(np.float64)
+            cur_xy = cur_pts_all[:, [1, 0]].astype(np.float64)
 
-            if M is None:
-                return None, {}
+            T, (matched_src, matched_dst) = _aa.find_transform(cur_xy, ref_xy)
 
-            n_inliers = int(np.sum(inliers)) if inliers is not None else 0
-            inliers_ratio = n_inliers / len(matched_cur) if len(matched_cur) > 0 else 0
-
-            if inliers_ratio < self.config.quality.min_inliers_ratio:
-                print(f"  [WARN] Pas assez d'inliers rotation: {n_inliers}/{len(matched_cur)} "
-                      f"({inliers_ratio*100:.1f}%)")
-                return None, {}
-
-            angle = np.arctan2(M[1, 0], M[0, 0]) * 180 / np.pi
-            scale = np.sqrt(M[0, 0]**2 + M[1, 0]**2)
-            dx = float(M[0, 2])
-            dy = float(M[1, 2])
+            # T.params est 3×3 SimilarityTransform (x,y) compatible cv2.warpAffine
+            M = T.params[:2, :].astype(np.float32)
+            angle = float(np.degrees(T.rotation))
+            scale = float(T.scale)
+            dx = float(T.translation[0])
+            dy = float(T.translation[1])
+            drift = float(np.sqrt(dx**2 + dy**2))
+            print(f"  [astroalign] angle={angle:.3f}° drift={drift:.1f}px "
+                  f"scale={scale:.4f} matches={len(matched_src)}")
 
             params = {
                 'dx': dx, 'dy': dy, 'angle': angle, 'scale': scale,
-                'inliers': n_inliers,
-                'total': len(matched_ref),
+                'inliers': len(matched_src), 'total': len(matched_src),
+                'method': 'astroalign',
             }
-
-            transform = np.vstack([M, [0, 0, 1]])
-            return transform, params
+            return np.vstack([M, [0, 0, 1]]), params
 
         except Exception as e:
-            print(f"  [ALIGN] Erreur _compute_rotation: {e}")
+            print(f"  [FAIL] astroalign: {e}")
             return None, {}
 
     def _compute_affine(self, ref_stars, cur_stars, image_shape):
@@ -406,45 +463,51 @@ class AdvancedAligner:
             return None, {}
 
     def _apply_transform(self, image, transform):
-        """Applique transformation à l'image.
+        """Applique transformation à l'image sur le canvas de sortie.
 
-        Les pixels de bordure introduits par le décalage sont mis à NaN (pas 0)
-        afin que le stacker (weight_map + np.isfinite) les ignore dans la moyenne.
-        Un borderValue=0 causerait un assombrissement progressif des bords quand
-        le télescope dérive, car les 0 seraient comptés comme des vraies mesures.
+        Si canvas_margin_frac > 0, compose la transformation avec un décalage
+        de marge afin que la frame de référence soit centrée dans le canvas
+        élargi. Les frames décalées n'ont donc plus de bord coupé.
+
+        Les pixels de bordure sont mis à NaN pour que le stacker les ignore.
         """
-        M = transform[:2, :]
+        mx = getattr(self, '_canvas_mx', 0)
+        my = getattr(self, '_canvas_my', 0)
+        cw = getattr(self, '_canvas_w', None)
+        ch = getattr(self, '_canvas_h', None)
+
+        h_img, w_img = image.shape[:2]
+        out_w = cw if cw is not None else w_img
+        out_h = ch if ch is not None else h_img
+
+        # Composer la transformation avec le décalage de marge (canvas offset)
+        # M_out = M_offset @ M_align  où M_offset = [[1,0,mx],[0,1,my]]
+        if mx > 0 or my > 0:
+            M3 = np.vstack([transform[:2, :], [0, 0, 1]]).astype(np.float64)
+            shift3 = np.array([[1, 0, mx], [0, 1, my], [0, 0, 1]], dtype=np.float64)
+            M = (shift3 @ M3)[:2, :].astype(np.float32)
+        else:
+            M = transform[:2, :].astype(np.float32)
+
+        _ones = np.ones((h_img, w_img), dtype=np.float32)
+        valid_mask = cv2.warpAffine(
+            _ones, M, (out_w, out_h),
+            flags=cv2.INTER_NEAREST,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=0
+        ) > 0.5
 
         if self.is_color and len(image.shape) == 3:
-            h, w = image.shape[:2]
-            # Masque de validité : 1 là où l'image source contribue, 0 aux bordures
-            _ones = np.ones((h, w), dtype=np.float32)
-            valid_mask = cv2.warpAffine(
-                _ones, M, (w, h),
-                flags=cv2.INTER_NEAREST,
-                borderMode=cv2.BORDER_CONSTANT,
-                borderValue=0
-            ) > 0.5
-
             aligned = cv2.warpAffine(
-                image.astype(np.float32), M, (w, h),
+                image.astype(np.float32), M, (out_w, out_h),
                 flags=cv2.INTER_LINEAR,
                 borderMode=cv2.BORDER_CONSTANT,
                 borderValue=0
             )
             aligned[~valid_mask] = np.nan
         else:
-            h, w = image.shape
-            _ones = np.ones((h, w), dtype=np.float32)
-            valid_mask = cv2.warpAffine(
-                _ones, M, (w, h),
-                flags=cv2.INTER_NEAREST,
-                borderMode=cv2.BORDER_CONSTANT,
-                borderValue=0
-            ) > 0.5
-
             aligned = cv2.warpAffine(
-                image.astype(np.float32), M, (w, h),
+                image.astype(np.float32), M, (out_w, out_h),
                 flags=cv2.INTER_LINEAR,
                 borderMode=cv2.BORDER_CONSTANT,
                 borderValue=0
@@ -472,7 +535,8 @@ class AdvancedAligner:
                 print(f"  Translation: drift={drift:.2f}px, dx={dx:+.1f} dy={dy:+.1f}, "
                       f"matches={matches}/{total}")
         elif mode == AlignmentMode.ROTATION:
-            print(f"  Rotation: angle={params.get('angle', 0):.3f}°, "
+            method = params.get('method', 'hough')
+            print(f"  Rotation [{method}]: angle={params.get('angle', 0):.3f}°, "
                   f"drift={drift:.2f}px, "
                   f"inliers={params.get('inliers', 0)}/{params.get('total', 0)}")
         else:
