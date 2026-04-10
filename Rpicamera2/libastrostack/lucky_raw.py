@@ -32,6 +32,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional, Tuple, List, Dict
 
+
 logger = logging.getLogger(__name__)
 
 # =============================================================================
@@ -523,13 +524,22 @@ def _compute_bayer_shift(ref_g1: np.ndarray, frame_g1: np.ndarray,
     """Décalage par corrélation de phase sur G1 (demi-résolution).
 
     Principe :
-      - Phase correlation sur G1 → décalage en pixels G1 (dx_half, dy_half)
-      - Arrondi entier en espace G1, puis × 2 → toujours pair en espace Bayer
-      - Garantit la préservation du pattern RGGB après translation
+      - Soustraction de la moyenne (mean-sub) avant FFT : supprime la composante
+        DC dominante (fond continu) qui crée un faux pic en (0,0) et masque les
+        petits décalages avec de grandes PSF planétaires (sigma > 10 px G1).
+      - Cross-spectre normalisé → pic à (-dr, -dc) en espace G1.
+      - Arrondi entier en espace G1, puis × 2 → toujours pair en espace Bayer.
+      - Garantit la préservation du pattern RGGB après translation.
+      - Les hot pixels de bord sont exclus AVANT cet appel par _g1_roi().
+
+    Convention signe :
+      Le résultat (dy_full, dx_full) est le décalage À APPLIQUER pour aligner
+      frame sur ref, directement compatible avec _shift_bayer_into(bayer, dy, dx, out).
+      → si frame dérive de (+2 row, +3 col) vs ref : retourne (-4, -6) en Bayer.
 
     Args:
-        ref_g1        : float32 (H/2, W/2) — référence
-        frame_g1      : float32 (H/2, W/2) — image à aligner
+        ref_g1        : float32 (H/2, W/2) — référence (ROI déjà appliquée)
+        frame_g1      : float32 (H/2, W/2) — image à aligner (ROI déjà appliquée)
         max_shift_half: décalage max en pixels G1 (0 = pas de limite).
                         Correspond à max_shift_px // 2.
 
@@ -537,23 +547,37 @@ def _compute_bayer_shift(ref_g1: np.ndarray, frame_g1: np.ndarray,
         (dy_full, dx_full) en pixels Bayer complets (toujours pair).
         (0, 0) si le décalage dépasse max_shift_half.
     """
-    ref_max = ref_g1.max()
-    frm_max = frame_g1.max()
-    if ref_max < 1e-6 or frm_max < 1e-6:
+    # Suppression hot pixels + soustraction DC :
+    #   - medianBlur 3×3 : élimine les FPN isolés (pixels très brillants vs voisins)
+    #     sans altérer le Gaussien planétaire (voisins similaires → médiane ≈ valeur)
+    #   - mean-sub : élimine la composante DC dominante (fond continu)
+    #     qui crée sinon un faux pic en (0,0) masquant les petits décalages
+    rn = cv2.medianBlur(np.ascontiguousarray(ref_g1,   dtype=np.float32), 3)
+    fn = cv2.medianBlur(np.ascontiguousarray(frame_g1, dtype=np.float32), 3)
+    rn -= rn.mean()
+    fn -= fn.mean()
+
+    rm = np.abs(rn).max()
+    fm = np.abs(fn).max()
+    if rm < 1e-6 or fm < 1e-6:
         return 0, 0
 
-    ref_n = ref_g1 / ref_max
-    frm_n = frame_g1 / frm_max
+    R = np.fft.fft2(rn / rm)
+    F = np.fft.fft2(fn / fm)
+    cross = R * np.conj(F)
+    denom = np.abs(cross)
+    denom[denom < 1e-10] = 1e-10
+    cross /= denom
 
-    try:
-        shift, _resp = cv2.phaseCorrelate(ref_n, frm_n)
-    except Exception:
-        return 0, 0
+    corr = np.fft.ifft2(cross).real
+    h, w = corr.shape
+    pk = np.unravel_index(np.argmax(corr), corr.shape)
 
-    dx_half, dy_half = shift  # OpenCV retourne (x, y)
+    dy_half = pk[0] if pk[0] < h // 2 else pk[0] - h
+    dx_half = pk[1] if pk[1] < w // 2 else pk[1] - w
 
     if max_shift_half > 0:
-        if abs(dx_half) > max_shift_half or abs(dy_half) > max_shift_half:
+        if abs(dy_half) > max_shift_half or abs(dx_half) > max_shift_half:
             return 0, 0  # Rejet : trop grande dérive
 
     dy_full = int(round(dy_half)) * 2
@@ -561,21 +585,25 @@ def _compute_bayer_shift(ref_g1: np.ndarray, frame_g1: np.ndarray,
     return dy_full, dx_full
 
 
-def _precompute_ref_fft(ref_g1: np.ndarray) -> Tuple[np.ndarray, float]:
-    """Pré-calcule la FFT normalisée de la frame de référence.
+def _precompute_ref_fft(ref_g1: np.ndarray) -> Tuple[Optional[np.ndarray], float]:
+    """Pré-calcule la FFT de la référence après soustraction DC (mean-sub).
 
     À appeler une fois avant la boucle d'alignement dans _process_buffer.
     Évite de recalculer FFT(ref) pour chaque frame à aligner.
+    La soustraction de la moyenne élimine la composante DC dominante (fond
+    continu) cohérente avec ce que fait _compute_bayer_shift_cached côté frame.
 
     Returns:
-        (ref_fft, ref_max) : FFT complexe de ref_g1/ref_max, et ref_max
-        (None, 0) si ref_g1 est vide (protection)
+        (ref_fft, 0.0) : FFT complexe de (ref_g1 - mean)/max_abs — le 2e
+                          élément est conservé par compatibilité (non utilisé).
+        (None, 0.0) si ref_g1 est vide (protection).
     """
-    ref_max = ref_g1.max()
-    if ref_max < 1e-6:
+    rn = cv2.medianBlur(np.ascontiguousarray(ref_g1, dtype=np.float32), 3)
+    rn -= rn.mean()
+    rm = np.abs(rn).max()
+    if rm < 1e-6:
         return None, 0.0
-    ref_n = ref_g1 / ref_max
-    return np.fft.fft2(ref_n), ref_max
+    return np.fft.fft2(rn / rm), 0.0
 
 
 def _compute_bayer_shift_cached(ref_fft: np.ndarray, frame_g1: np.ndarray,
@@ -584,41 +612,42 @@ def _compute_bayer_shift_cached(ref_fft: np.ndarray, frame_g1: np.ndarray,
 
     Identique à _compute_bayer_shift mais évite de recalculer FFT(ref)
     à chaque appel. Gain : (keep-1) FFTs économisées par buffer.
+    La soustraction DC (mean-sub) est appliquée côté frame pour cohérence
+    avec _precompute_ref_fft qui fait de même côté référence.
 
     Args:
-        ref_fft       : FFT complexe de ref_g1 normalisé (depuis _precompute_ref_fft)
-        frame_g1      : float32 (H/2, W/2) — image à aligner
+        ref_fft       : FFT complexe de (ref-mean)/max_abs (depuis _precompute_ref_fft)
+        frame_g1      : float32 (H/2, W/2) — image à aligner (ROI déjà appliquée)
         max_shift_half: décalage max en pixels G1 (0 = pas de limite)
 
     Returns:
         (dy_full, dx_full) en pixels Bayer complets (toujours pair).
         (0, 0) si le décalage dépasse max_shift_half ou frame vide.
     """
-    frm_max = frame_g1.max()
-    if frm_max < 1e-6:
+    fn = cv2.medianBlur(np.ascontiguousarray(frame_g1, dtype=np.float32), 3)
+    fn -= fn.mean()
+    fm = np.abs(fn).max()
+    if fm < 1e-6:
         return 0, 0
 
-    frm_n   = frame_g1 / frm_max
-    frm_fft = np.fft.fft2(frm_n)
+    frm_fft = np.fft.fft2(fn / fm)
 
-    # Spectre de puissance croisé normalisé (même formule que cv2.phaseCorrelate)
+    # Spectre de puissance croisé normalisé
     cross = ref_fft * np.conj(frm_fft)
     denom = np.abs(cross)
     denom[denom < 1e-10] = 1e-10
     cross /= denom
 
-    correlation = np.fft.ifft2(cross).real
-    # Pic de corrélation → décalage (convention OpenCV : origine au centre)
-    peak_idx = np.unravel_index(np.argmax(correlation), correlation.shape)
-    dy_half_raw, dx_half_raw = peak_idx
+    corr = np.fft.ifft2(cross).real
+    h, w = frame_g1.shape
+    pk = np.unravel_index(np.argmax(corr), corr.shape)
 
     # Ramener dans [-H/2, H/2] × [-W/2, W/2]
-    h2, w2 = correlation.shape
-    dy_half = dy_half_raw if dy_half_raw < h2 // 2 else dy_half_raw - h2
-    dx_half = dx_half_raw if dx_half_raw < w2 // 2 else dx_half_raw - w2
+    dy_half = pk[0] if pk[0] < h // 2 else pk[0] - h
+    dx_half = pk[1] if pk[1] < w // 2 else pk[1] - w
 
     if max_shift_half > 0:
-        if abs(dx_half) > max_shift_half or abs(dy_half) > max_shift_half:
+        if abs(dy_half) > max_shift_half or abs(dx_half) > max_shift_half:
             return 0, 0
 
     dy_full = int(round(dy_half)) * 2
@@ -979,6 +1008,13 @@ class BayerLuckyStacker:
         self._bl_cache_age:  int = 0                  # frames depuis le dernier calcul
 
         self.last_bayer_stack: Optional[np.ndarray] = None
+
+        # Référence fixe inter-buffer : G1 extrait du résultat stacké du 1er buffer.
+        # Initialisée après le 1er buffer, puis jamais mise à jour.
+        # Utiliser le stacké (et non un frame individuel) donne un bien meilleur
+        # SNR → corrélation de phase plus fiable, hot pixels moyennés/clippés.
+        # Référence fixe (vs. chaîne cumulative) → pas d'accumulation d'erreurs :
+        # chaque buffer est aligné directement sur le référentiel absolu du 1er.
         self._align_ref_g1:    Optional[np.ndarray] = None
 
         # Stack cumulatif inter-buffer pondéré par score (mode ring)
@@ -1326,6 +1362,9 @@ class BayerLuckyStacker:
                 self.elite_score_clip = bool(v)
             elif k == 'elite_score_kappa':
                 self.elite_score_kappa = float(v)
+            elif k == 'max_shift_px':
+                self.max_shift_px = int(v)
+                self._elite_max_half = (self.max_shift_px // 2) if self.max_shift_px > 0 else 0
             elif hasattr(self, k):
                 setattr(self, k, v)
 
@@ -1333,13 +1372,33 @@ class BayerLuckyStacker:
     # Méthodes internes — Mode Pool Élite
     # ------------------------------------------------------------------
 
+    def _g1_roi(self, g1: np.ndarray) -> np.ndarray:
+        """Retourne la ROI centrale du G1 pour la corrélation de phase.
+
+        Utilise max(score_roi, 0.6) pour garantir ≥ 60 % du champ et
+        éviter que la planète soit en dehors de la zone de corrélation.
+        Une ROI concentrée sur le centre réduit les faux pics dus aux
+        hot pixels et artefacts de bord qui dominent sinon le plein champ.
+        """
+        roi = max(float(self.score_roi), 0.6)
+        if roi >= 1.0:
+            return g1
+        h2, w2 = g1.shape
+        mh = int(h2 * (1.0 - roi) / 2)
+        mw = int(w2 * (1.0 - roi) / 2)
+        if mh <= 0 and mw <= 0:
+            return g1
+        r0 = max(0, mh);      r1 = max(r0 + 1, h2 - mh)
+        c0 = max(0, mw);      c1 = max(c0 + 1, w2 - mw)
+        return g1[r0:r1, c0:c1]
+
     def _elite_init_reference(self):
         """Choisit la référence d'alignement parmi les frames warmup (meilleur score).
         Insère ensuite toutes les frames warmup dans le pool.
         Appelé sous self._lock.
         """
         best_score, best_bayer, best_g1 = max(self._elite_warmup, key=lambda x: x[0])
-        self._elite_ref_fft, _ = _precompute_ref_fft(best_g1)
+        self._elite_ref_fft, _ = _precompute_ref_fft(self._g1_roi(best_g1))
         self._elite_ref_ready  = True
         print(f"[Lucky RAW Elite] Référence définie (score={best_score:.4f}, "
               f"{len(self._elite_warmup)} frames warmup)")
@@ -1361,7 +1420,7 @@ class BayerLuckyStacker:
         if not self.align_enabled or self._elite_ref_fft is None:
             return bayer.copy()
         dy, dx = _compute_bayer_shift_cached(
-            self._elite_ref_fft, g1_half, self._elite_max_half)
+            self._elite_ref_fft, self._g1_roi(g1_half), self._elite_max_half)
         # _compute_bayer_shift_cached retourne (0,0) si hors limite → accepter quand même
         # mais retourner None si décalage nul ET alignement explicitement demandé
         # → ici on accepte (0,0) comme "pas de décalage détecté"
@@ -1439,8 +1498,9 @@ class BayerLuckyStacker:
         best_idx   = idx_sorted[:keep]
 
         # ── Référence = meilleure frame (G1 depuis le cache) ──────────────────
-        ref_idx = best_idx[0]
-        ref_g1  = self._g1_ring[ref_idx]
+        ref_idx    = best_idx[0]
+        ref_g1     = self._g1_ring[ref_idx]
+        ref_g1_roi = self._g1_roi(ref_g1)   # ROI central pour la corrélation
 
         max_half = (self.max_shift_px // 2) if self.max_shift_px > 0 else 0
 
@@ -1450,17 +1510,14 @@ class BayerLuckyStacker:
             self._aligned_buf = np.empty((self.buffer_size, fh, fw), dtype=np.float32)
 
         # ── Alignement → écriture directe dans _aligned_buf ───────────────────
-        # Chaque frame est écrite dans son slot sans allocation intermédiaire :
-        #   dy=dx=0  → np.copyto (1 copie mémoire)
-        #   sinon    → _shift_bayer_into() remplit le slot directement (1 copie)
+        # ROI centré sur score_roi (≥ 60 %) : élimine hot pixels et artefacts de
+        # bord qui peuvent dominer la corrélation plein-champ et produire de faux
+        # décalages (pic à (0,0) sur FPN > pic Jupiter).
         #
-        # Opt. 1 — FFT(ref) pré-calculée une fois : (keep-1) FFTs économisées.
-        # Opt. 3 — Parallélisme (keep ≥ 3) : chaque frame est indépendante
-        #   (lecture de slots distincts, écriture dans des slots distincts de
-        #   _aligned_buf) → ThreadPoolExecutor libère le GIL sur les ops NumPy.
-        #   Seuil keep ≥ 3 : en dessous l'overhead thread dépasse le gain.
+        # Opt. 1 — FFT(ref ROI) pré-calculée une fois : (keep-1) FFTs économisées.
+        # Opt. 3 — Parallélisme (keep ≥ 3) : chaque frame est indépendante.
         if self.align_enabled and keep > 1:
-            ref_fft, _ = _precompute_ref_fft(ref_g1)
+            ref_fft, _ = _precompute_ref_fft(ref_g1_roi)
             use_cached = ref_fft is not None
         else:
             use_cached = False
@@ -1471,11 +1528,12 @@ class BayerLuckyStacker:
             _ring_buf    = self._ring_buf
             _g1_ring     = self._g1_ring
             _aligned_buf = self._aligned_buf
+            _g1_roi_fn   = self._g1_roi   # méthode capturable sans référence à self
 
             def _align_one(args):
                 rank, orig_idx = args
-                fg1 = _g1_ring[orig_idx]
-                dy, dx = _compute_bayer_shift_cached(ref_fft, fg1, max_half)
+                fg1_roi = _g1_roi_fn(_g1_ring[orig_idx])
+                dy, dx = _compute_bayer_shift_cached(ref_fft, fg1_roi, max_half)
                 _shift_bayer_into(_ring_buf[orig_idx], dy, dx, _aligned_buf[rank])
 
             n_workers = min(4, keep)
@@ -1487,11 +1545,11 @@ class BayerLuckyStacker:
                 frame = self._ring_buf[orig_idx]
                 dst   = self._aligned_buf[rank]
                 if self.align_enabled and keep > 1:
-                    fg1 = self._g1_ring[orig_idx]
+                    fg1_roi = self._g1_roi(self._g1_ring[orig_idx])
                     if use_cached:
-                        dy, dx = _compute_bayer_shift_cached(ref_fft, fg1, max_half)
+                        dy, dx = _compute_bayer_shift_cached(ref_fft, fg1_roi, max_half)
                     else:
-                        dy, dx = _compute_bayer_shift(ref_g1, fg1, max_half)
+                        dy, dx = _compute_bayer_shift(ref_g1_roi, fg1_roi, max_half)
                     _shift_bayer_into(frame, dy, dx, dst)
                 else:
                     np.copyto(dst, frame)
@@ -1525,9 +1583,39 @@ class BayerLuckyStacker:
                       f"keep={keep}/{n}  "
                       f"(recompiler jsk_halide.so pour Halide)")
 
+        # ── Alignement inter-buffer (compensation dérive table équatoriale) ────
+        # On compare le G1 extrait du résultat *stacké* (et non d'un frame individuel) :
+        #   • SNR bien meilleur (moyenne de keep frames)
+        #   • Hot pixels moyennés / supprimés par sigma-clip
+        #   → corrélation de phase plus robuste
+        #
+        # Référence fixe = G1 stacké du 1er buffer (initialisée ci-dessous).
+        # Chaque buffer est aligné directement sur ce référentiel absolu,
+        # sans chaîne cumulative → une erreur ponctuelle n'affecte pas les buffers suivants.
+        curr_g1_stacked = _extract_g1(result)
+
+        if self._align_ref_g1 is not None and self.align_enabled:
+            # Limite inter-buffer large : on compare des stacks (SNR élevé, corrélation robuste)
+            # et la dérive télescope peut dépasser max_shift sur la durée d'une session.
+            # On garde une borne de sécurité (200 G1-px = 400 px plein champ) pour rejeter
+            # les corrélations aberrantes sans bloquer les dérives légitimes.
+            # ROI centré : même bénéfice qu'en intra-buffer (SNR elevé mais hot pixels
+            # toujours présents dans le stack moyen s'ils ne sont pas corrigés).
+            interbuf_max_half = max(max_half * 4, 200) if max_half > 0 else 0
+            dy, dx = _compute_bayer_shift(
+                self._g1_roi(self._align_ref_g1),
+                self._g1_roi(curr_g1_stacked),
+                interbuf_max_half)
+            if dy != 0 or dx != 0:
+                result = _shift_bayer(result, dy, dx)
+
         self.last_bayer_stack = result
-        self._align_ref_g1    = ref_g1
-        self.stacks_done     += 1
+
+        # Référence fixe : initialisée avec le 1er buffer, jamais modifiée ensuite.
+        if self._align_ref_g1 is None:
+            self._align_ref_g1 = curr_g1_stacked.copy()
+
+        self.stacks_done += 1
 
         # ── Accumulation inter-buffer pondérée par score moyen ────────────────
         buffer_score = float(np.mean([scores[i] for i in best_idx]))

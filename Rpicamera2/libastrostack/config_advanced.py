@@ -371,7 +371,9 @@ class OutputConfig:
     
     def validate(self) -> bool:
         """Valide la configuration"""
-        if self.png_stretch_factor <= 0:
+        _factor_methods = {StretchMethod.ASINH, StretchMethod.LINEAR, StretchMethod.SQRT,
+                           StretchMethod.HISTOGRAM, StretchMethod.AUTO}
+        if self.png_stretch_method in _factor_methods and self.png_stretch_factor <= 0:
             raise ValueError("png_stretch_factor doit être > 0")
         
         if not 0 <= self.png_clip_low < self.png_clip_high <= 100:

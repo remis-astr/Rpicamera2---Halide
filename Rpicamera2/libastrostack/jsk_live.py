@@ -417,6 +417,9 @@ class JSKLiveProcessor:
         self.bayer_pattern = cv2.COLOR_BayerRG2BGR
         self.crop_square = False   # True = crop carré 1080×1080 centré avant traitement
 
+        # Soustraction fond de ciel (avant HDR, espace 12-bit 0-4095)
+        self.bg_offset = 0         # 0-1000 ADU 12-bit (0 = désactivé)
+
         # Couleur & Contraste (LUT par canal pour perf maximale)
         self.color_enabled = False # True = actif
         self.r_gain = 1.0          # 0.5-2.0 (1.0 = neutre)
@@ -494,6 +497,8 @@ class JSKLiveProcessor:
         if 'contrast' in kwargs:
             self.contrast = max(0.5, min(2.0, float(kwargs['contrast'])))
             self._lut_dirty = True
+        if 'bg_offset' in kwargs:
+            self.bg_offset = max(0, min(1000, int(kwargs['bg_offset'])))
         if 'use_ema' in kwargs:
             new_ema = bool(kwargs['use_ema'])
             if new_ema != self.use_ema:
@@ -591,6 +596,10 @@ class JSKLiveProcessor:
                     return None
                 n = len(self._raw_buf)
                 raw_mean = np.clip(self._raw_sum / n, 0, 4095).astype(np.uint16)
+
+        # Soustraction fond de ciel — sur moyenne RAW avant HDR (espace 12-bit)
+        if self.bg_offset > 0:
+            raw_mean = np.clip(raw_mean.astype(np.int32) - self.bg_offset, 0, 4095).astype(np.uint16)
 
         # HDR + debayer sur la moyenne RAW (hors lock)
         if self.hdr_method == 0 or self.hdr_bits_clip == 0:
