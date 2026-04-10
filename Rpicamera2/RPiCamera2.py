@@ -1969,7 +1969,7 @@ tshots      = 10   # number of timelapse shots
 saturation  = 10   # picture colour saturation
 meter       = 2    # metering mode (2 = average), see meters below
 awb         = 1    # auto white balance mode, off, auto etc (1 = auto), see awbs below
-sharpness   = 15   # set sharpness level
+sharpness   = 10   # set sharpness level
 denoise     = 1    # set denoise level, see denoises below
 fix_bad_pixels = 0  # auto-fix bad/hot pixels in RAW mode (0=off, 1=on)
 fix_bad_pixels_sigma = 40  # threshold for bad pixel detection (×10, 50=5.0 sigma)
@@ -2096,6 +2096,7 @@ jsk_r_gain = 100            # 50-200 → 0.5x-2.0x (100 = neutre)
 jsk_g_gain = 100            # 50-200
 jsk_b_gain = 100            # 50-200
 jsk_contrast = 100          # 50-200 → 0.5x-2.0x (100 = neutre)
+jsk_bg_offset = 0           # 0-1000 ADU 12-bit — soustraction fond de ciel avant HDR
 jsk_settings_tab = 0        # 0=Image (HDR/Denoise/Stretch), 1=Couleur
 
 # MINERAL MOON Settings
@@ -2436,7 +2437,7 @@ planetary_modes = ['Disk', 'Surface', 'Hybrid']
 planetary_windows = [128, 256, 512]
 
 # Lucky Imaging parameters
-ls_lucky_buffer = 10  # Taille buffer (10-200)
+ls_lucky_buffer = 10  # Taille buffer (10-400)
 ls_lucky_keep = 10  # % à garder (1-50)
 ls_lucky_score = 1  # 0=laplacian, 1=gradient, 2=sobel, 3=tenengrad
 ls_lucky_stack = 0  # 0=mean, 1=median, 2=sigma_clip
@@ -2576,7 +2577,7 @@ isp_wb_red = 100              # 0.5-2.0 → 50-200 (défaut 1.0)
 isp_wb_green = 100            # 0.5-2.0 → 50-200 (défaut 1.0)
 isp_wb_blue = 100             # 0.5-2.0 → 50-200 (défaut 1.0)
 isp_gamma = 100               # 0.5-3.0 → 50-300 (défaut 1.0, correspond à gamma 2.2)
-isp_black_level = 256         # 0-500 direct (défaut 256 pour IMX585 12-bit)
+isp_black_level = 30          # 0-500 direct (défaut 30 : correction minimale fond de ciel)
 ls_gradient_removal = 0       # 0=OFF, 1=ON  (suppression gradient fond de ciel, RAW uniquement)
 ls_gradient_intensity = 0     # 0-100 % intensité du retrait (0=désactivé)
 ls_gradient_flat_strength = 0 # 0-100 : intensité correction vignetage (0=BG seulement, 100=flat complet)
@@ -2586,7 +2587,7 @@ ls_raw_awb_auto = 0           # 0=OFF, 1=ON  (AWB auto grey-world pour preview s
 
 # Correction FPN 2×2 : soustraction black level per-canal Bayer avant débayérisation
 # 0=OFF  1=auto-estimation (percentile bas de chaque sous-canal)  2=valeurs manuelles
-ls_bl_per_channel_enable = 1
+ls_bl_per_channel_enable = 0  # 0=Global (défaut), 1=Auto, 2=Manuel par canal
 ls_bl_r  = 256  # ADU 12-bit canal R   (IMX585 nominal ≈ 256)
 ls_bl_g1 = 258  # ADU 12-bit canal G1  (position pair,impair)
 ls_bl_g2 = 260  # ADU 12-bit canal G2  (position impair,pair)
@@ -2878,7 +2879,7 @@ ls_save_progress = 1         # 0=OFF, 1=ON (sauvegarder PNG intermédiaires Live
 ls_save_final = 1            # 0=OFF, 1=ON (sauvegarder PNG/FITS final LiveStack)
 ls_lucky_save_final = 1      # 0=OFF, 1=ON (sauvegarder PNG/FITS final LuckyStack)
 
-still_limits = ['mode',0,len(modes)-1,'speed',0,len(shutters)-1,'gain',0,30,'brightness',-100,100,'contrast',0,200,'ev',-10,10,'blue',1,80,'sharpness',0,30,
+still_limits = ['mode',0,len(modes)-1,'speed',0,len(shutters)-1,'gain',0,30,'brightness',-100,100,'contrast',0,200,'ev',-10,10,'blue',1,80,'sharpness',0,160,
                 'denoise',0,len(denoises)-1,'quality',0,100,'red',1,80,'extn',0,len(extns)-1,'saturation',0,20,'meter',0,len(meters)-1,'awb',0,len(awbs)-1,
                 'histogram',0,len(histograms)-1,'v3_f_speed',0,len(v3_f_speeds)-1,'v3_hdr',0,len(v3_hdrs)-1,'focus_method',0,4,'star_metric',0,2,'snr_display',0,1,'metrics_interval',1,10]
 video_limits = ['vlen',0,3600,'fps',1,180,'v5_focus',10,2500,'vformat',0,7,'0',0,0,'zoom',0,5,'Focus',0,1,'tduration',1,86400,'tinterval',0.01,10,'tshots',1,999,
@@ -2919,11 +2920,11 @@ livestack_limits = [
     'ls_planetary_corr',10,90,
     'ls_planetary_max_shift',10,200,
     # Lucky Imaging
-    'ls_lucky_buffer',10,200,
+    'ls_lucky_buffer',10,400,
     'ls_lucky_keep',1,50,
     'ls_lucky_score',0,3,
     'ls_lucky_stack',0,2,
-    'ls_lucky_align',0,1,
+    'ls_lucky_align',0,2,
     'ls_lucky_roi',20,100,
     'ls_lucky_max_shift',0,200
 ]
@@ -3284,11 +3285,11 @@ ls_planetary_corr = max(10, min(ls_planetary_corr, 100))
 ls_planetary_max_shift = max(10, min(ls_planetary_max_shift, 500))
 
 # Lucky Imaging parameters
-ls_lucky_buffer = max(10, min(ls_lucky_buffer, 200))
+ls_lucky_buffer = max(10, min(ls_lucky_buffer, 400))
 ls_lucky_keep = max(1, min(ls_lucky_keep, 50))
 ls_lucky_score = max(0, min(ls_lucky_score, 5))  # 0-5: laplacian/gradient/sobel/tenengrad/local_variance/psd
 ls_lucky_stack = max(0, min(ls_lucky_stack, 2))  # 0-2: mean/median/sigma_clip
-ls_lucky_align = max(0, min(ls_lucky_align, 1))  # 0=off, 1=surface
+ls_lucky_align = max(0, min(ls_lucky_align, 2))  # 0=off, 1=surface, 2=AP
 ls_lucky_roi = max(20, min(ls_lucky_roi, 100))
 ls_lucky_max_shift = max(0, min(ls_lucky_max_shift, 200))  # 0=désactivé, 1-200px
 ls_lucky_save_progress = max(0, min(ls_lucky_save_progress, 1))  # 0-1: off/on
@@ -7319,8 +7320,12 @@ def handle_ls_slider_click(mx, my, control_rects):
             # Re-appliquer les filtres si stack en pause
             if name.startswith(('ls_wav_', 'ls_lucky_', 'ls_post_', 'ls_wpsf_')) and ls_paused and ls_pre_filter_array is not None:
                 try:
-                    ls_last_filtered_array = apply_lucky_post_stack_filters(
-                        ls_pre_filter_array.copy(), color_correction=True)
+                    if raw_format >= 2:
+                        ls_last_filtered_array = apply_lucky_post_stack_filters(
+                            ls_pre_filter_array[:, :, [2, 1, 0]].copy(), color_correction=True)[:, :, [2, 1, 0]]
+                    else:
+                        ls_last_filtered_array = apply_lucky_post_stack_filters(
+                            ls_pre_filter_array.copy(), color_correction=True)
                 except Exception:
                     pass
 
@@ -8769,7 +8774,7 @@ def draw_files_controls(screen_width, screen_height):
             start_y += 16
             control_rects['fx_lucky_buffer'] = draw_jsk_slider(
                 panel_x, start_y, slider_w, slider_h,
-                f"Buffer: {ls_lucky_buffer} imgs", ls_lucky_buffer, 10, 200, (60, 100, 180))
+                f"Buffer: {ls_lucky_buffer} imgs", ls_lucky_buffer, 10, 400, (60, 100, 180))
             start_y += slider_h + margin
             control_rects['fx_lucky_keep'] = draw_jsk_slider(
                 panel_x, start_y, slider_w, slider_h,
@@ -8780,7 +8785,7 @@ def draw_files_controls(screen_width, screen_height):
             start_y += 16
             control_rects['fx_elite_pool_size'] = draw_jsk_slider(
                 panel_x, start_y, slider_w, slider_h,
-                f"Pool: {ls_elite_pool_size} imgs", ls_elite_pool_size, 20, 300, (50, 150, 120))
+                f"Pool: {ls_elite_pool_size} imgs", ls_elite_pool_size, 20, 400, (50, 150, 120))
             start_y += slider_h + margin
             control_rects['fx_elite_stack_interval'] = draw_jsk_slider(
                 panel_x, start_y, slider_w, slider_h,
@@ -8799,10 +8804,11 @@ def draw_files_controls(screen_width, screen_height):
             panel_x, start_y, slider_w, slider_h,
             f"Stack: {_stack_names[min(ls_lucky_stack, 2)]}", ls_lucky_stack, 0, 2, (80, 120, 200))
         start_y += slider_h + margin
-        _align_names = ['OFF', 'Surface']
+        _align_names = ['OFF', 'Surface', 'AP']
+        _align_color = (80, 120, 200) if ls_lucky_align < 2 else (50, 150, 120)
         control_rects['fx_lucky_align'] = draw_jsk_slider(
             panel_x, start_y, slider_w, slider_h,
-            f"Alignement: {_align_names[min(ls_lucky_align, 1)]}", ls_lucky_align, 0, 1, (80, 120, 200))
+            f"Alignement: {_align_names[min(ls_lucky_align, 2)]}", ls_lucky_align, 0, 2, _align_color)
         start_y += slider_h + margin
         if ls_lucky_align > 0:
             control_rects['fx_lucky_max_shift'] = draw_jsk_slider(
@@ -8814,19 +8820,52 @@ def draw_files_controls(screen_width, screen_height):
             panel_x, start_y, slider_w, slider_h,
             f"ROI score: {ls_lucky_roi}%", ls_lucky_roi, 20, 100, (80, 120, 200))
         start_y += slider_h + margin + 6
-        # Stats Lucky si traitement actif
-        if files_active and files_livestack is not None:
+        # Stats Lucky si traitement actif ou en pause
+        if (files_active or files_paused) and files_livestack is not None:
             _lk_stats = files_livestack.stats
-            _bf = _lk_stats.get('lucky_buffer_fill', 0)
-            _bs = _lk_stats.get('lucky_buffer_size', ls_lucky_buffer)
             _sd = _lk_stats.get('lucky_stacks_done', 0)
             _fr = getattr(files_livestack, '_video_frame_idx', 0)
             _ft = getattr(files_livestack, '_video_total_frames', 0)
-            windowSurfaceObj.blit(_font_cache[ck_s].render(f"Buffer: {_bf}/{_bs}  Stacks: {_sd}", True, (120, 180, 255)), (panel_x + 2, start_y))
-            start_y += 16
-            if _ft > 0:
-                windowSurfaceObj.blit(_font_cache[ck_s].render(f"Frame: {_fr}/{_ft}", True, (120, 180, 255)), (panel_x + 2, start_y))
+            _is_elite = (_lk_stats.get('buffer_mode', 'ring') == 'elite')
+            if _is_elite:
+                # Pool Élite : barre de remplissage + scores
+                _ps  = _lk_stats.get('lucky_buffer_fill', 0)
+                _pc  = (_lk_stats.get('lucky_buffer_size', ls_elite_pool_size) or ls_elite_pool_size) or 1
+                _ph  = _lk_stats.get('phase', '?')
+                _mn  = _lk_stats.get('min_score', 0.0)
+                _mx2 = _lk_stats.get('max_score', 0.0)
+                _tf  = _lk_stats.get('total_frames', 0)
+                # Barre pool
+                _bar_w = slider_w - 4
+                pygame.draw.rect(windowSurfaceObj, (20, 40, 20),
+                                 pygame.Rect(panel_x + 2, start_y, _bar_w, 10))
+                _fill = int(_bar_w * min(_ps / max(_pc, 1), 1.0))
+                _bar_c = (60, 200, 80) if _ph == 'active' else (60, 140, 180)
+                if _fill > 0:
+                    pygame.draw.rect(windowSurfaceObj, _bar_c,
+                                     pygame.Rect(panel_x + 2, start_y, _fill, 10))
+                pygame.draw.rect(windowSurfaceObj, (60, 100, 70),
+                                 pygame.Rect(panel_x + 2, start_y, _bar_w, 10), 1)
+                windowSurfaceObj.blit(_font_cache[ck_s].render(
+                    f"Pool: {_ps}/{_pc}  [{_ph}]  Stacks: {_sd}", True, (120, 200, 130)),
+                    (panel_x + 2, start_y + 11))
+                start_y += 27
+                windowSurfaceObj.blit(_font_cache[ck_s].render(
+                    f"Score min:{_mn:.3f}  max:{_mx2:.3f}", True, (160, 220, 160)),
+                    (panel_x + 2, start_y))
                 start_y += 16
+                windowSurfaceObj.blit(_font_cache[ck_s].render(
+                    f"Frames: {_tf}  ({_fr}/{_ft})" if _ft > 0 else f"Frames: {_tf}",
+                    True, (120, 180, 255)), (panel_x + 2, start_y))
+                start_y += 16
+            else:
+                _bf = _lk_stats.get('lucky_buffer_fill', 0)
+                _bs = _lk_stats.get('lucky_buffer_size', ls_lucky_buffer)
+                windowSurfaceObj.blit(_font_cache[ck_s].render(f"Buffer: {_bf}/{_bs}  Stacks: {_sd}", True, (120, 180, 255)), (panel_x + 2, start_y))
+                start_y += 16
+                if _ft > 0:
+                    windowSurfaceObj.blit(_font_cache[ck_s].render(f"Frame: {_fr}/{_ft}", True, (120, 180, 255)), (panel_x + 2, start_y))
+                    start_y += 16
         # ─ Super-résolution Lanczos ───────────────────────────────────────────
         start_y += 4
         windowSurfaceObj.blit(_font_cache[ck_s].render("Super-résolution", True, (90, 160, 220)), (panel_x + 2, start_y))
@@ -9310,11 +9349,11 @@ def handle_files_slider_click(mx, my, control_rects):
             if name == 'fx_lucky_buffer_mode':
                 ls_lucky_buffer_mode = 1 if ratio > 0.5 else 0
             elif name == 'fx_elite_pool_size':
-                ls_elite_pool_size = max(20, min(300, int(20 + ratio * 280)))
+                ls_elite_pool_size = max(20, min(400, int(20 + ratio * 380)))
             elif name == 'fx_elite_stack_interval':
                 ls_elite_stack_interval = max(2, min(15, int(2 + ratio * 13)))
             elif name == 'fx_lucky_buffer':
-                ls_lucky_buffer = max(10, min(200, int(10 + ratio * 190)))
+                ls_lucky_buffer = max(10, min(400, int(10 + ratio * 390)))
             elif name == 'fx_lucky_keep':
                 ls_lucky_keep = max(1, min(50, int(1 + ratio * 49)))
             elif name == 'fx_lucky_score':
@@ -9322,7 +9361,10 @@ def handle_files_slider_click(mx, my, control_rects):
             elif name == 'fx_lucky_stack':
                 ls_lucky_stack = max(0, min(2, int(ratio * 2 + 0.5)))
             elif name == 'fx_lucky_align':
-                ls_lucky_align = max(0, min(1, int(ratio + 0.5)))
+                ls_lucky_align = max(0, min(2, int(ratio * 2 + 0.5)))
+                # AP nécessite Pool Élite
+                if ls_lucky_align == 2 and ls_lucky_buffer_mode == 0:
+                    ls_lucky_buffer_mode = 1
             elif name == 'fx_lucky_max_shift':
                 ls_lucky_max_shift = max(0, min(200, int(ratio * 200)))
             elif name == 'fx_lucky_roi':
@@ -9685,8 +9727,9 @@ def handle_galaxy_slider_click(mx, my, control_rects):
                                'gx_wpsf_', 'gx_post_', 'gx_img_r_', 'gx_img_g_', 'gx_img_b_',
                                'gx_img_color_', 'gx_struct_')) and galaxy_paused and galaxy_pre_filter_array is not None:
                 try:
+                    # Galaxy toujours en [R,G,B] → swap BGR pour la fonction → swap retour [R,G,B]
                     galaxy_last_filtered_array = apply_lucky_post_stack_filters(
-                        galaxy_pre_filter_array.copy(), color_correction=True)
+                        galaxy_pre_filter_array[:, :, [2, 1, 0]].copy(), color_correction=True)[:, :, [2, 1, 0]]
                 except Exception:
                     pass
 
@@ -10506,7 +10549,7 @@ def draw_lucky_controls(screen_width, screen_height):
 
             control_rects['ls_lucky_buffer'] = draw_jsk_slider(
                 panel_x, start_y, slider_w, slider_h,
-                f"Buffer: {ls_lucky_buffer} imgs", ls_lucky_buffer, 10, 200, (60, 100, 180))
+                f"Buffer: {ls_lucky_buffer} imgs", ls_lucky_buffer, 10, 400, (60, 100, 180))
             start_y += slider_h + margin
 
             control_rects['ls_lucky_keep'] = draw_jsk_slider(
@@ -10523,7 +10566,7 @@ def draw_lucky_controls(screen_width, screen_height):
 
             control_rects['ls_elite_pool_size'] = draw_jsk_slider(
                 panel_x, start_y, slider_w, slider_h,
-                f"Pool: {ls_elite_pool_size} imgs", ls_elite_pool_size, 20, 300, (50, 150, 120))
+                f"Pool: {ls_elite_pool_size} imgs", ls_elite_pool_size, 20, 400, (50, 150, 120))
             start_y += slider_h + margin
 
             control_rects['ls_elite_stack_interval'] = draw_jsk_slider(
@@ -10572,11 +10615,12 @@ def draw_lucky_controls(screen_width, screen_height):
             f"Stack: {cur_stack}", ls_lucky_stack, 0, 2, (80, 120, 200))
         start_y += slider_h + margin
 
-        _align_names = ['OFF', 'Surface']
-        cur_align = _align_names[ls_lucky_align] if 0 <= ls_lucky_align < len(_align_names) else "?"
+        _align_names = ['OFF', 'Surface', 'AP']
+        cur_align = _align_names[min(ls_lucky_align, 2)] if 0 <= ls_lucky_align <= 2 else "?"
+        _align_color2 = (80, 120, 200) if ls_lucky_align < 2 else (50, 150, 120)
         control_rects['ls_lucky_align'] = draw_jsk_slider(
             panel_x, start_y, slider_w, slider_h,
-            f"Alignement: {cur_align}", ls_lucky_align, 0, 1, (80, 120, 200))
+            f"Alignement: {cur_align}", ls_lucky_align, 0, 2, _align_color2)
         start_y += slider_h + margin
 
         if ls_lucky_align > 0:
@@ -10944,7 +10988,7 @@ def handle_lucky_slider_click(mx, my, control_rects):
                 if luckystack is not None:
                     luckystack.configure(lucky_buffer_mode=['ring', 'elite'][ls_lucky_buffer_mode])
             elif name == 'ls_elite_pool_size':
-                ls_elite_pool_size = max(20, min(300, int(20 + ratio * 280)))
+                ls_elite_pool_size = max(20, min(400, int(20 + ratio * 380)))
                 if luckystack is not None:
                     luckystack.configure(lucky_elite_pool_size=ls_elite_pool_size)
             elif name == 'ls_elite_stack_interval':
@@ -10964,7 +11008,7 @@ def handle_lucky_slider_click(mx, my, control_rects):
                 if luckystack is not None:
                     luckystack.configure(lucky_elite_score_kappa=ls_elite_score_kappa / 10.0)
             elif name == 'ls_lucky_buffer':
-                ls_lucky_buffer = max(10, min(200, int(10 + ratio * 190)))
+                ls_lucky_buffer = max(10, min(400, int(10 + ratio * 390)))
             elif name == 'ls_lucky_keep':
                 ls_lucky_keep = max(1, min(50, int(1 + ratio * 49)))
             elif name == 'ls_lucky_score':
@@ -10972,7 +11016,10 @@ def handle_lucky_slider_click(mx, my, control_rects):
             elif name == 'ls_lucky_stack':
                 ls_lucky_stack = max(0, min(2, int(ratio * 2 + 0.5)))
             elif name == 'ls_lucky_align':
-                ls_lucky_align = max(0, min(1, int(ratio + 0.5)))
+                ls_lucky_align = max(0, min(2, int(ratio * 2 + 0.5)))
+                # AP nécessite Pool Élite
+                if ls_lucky_align == 2 and ls_lucky_buffer_mode == 0:
+                    ls_lucky_buffer_mode = 1
             elif name == 'ls_lucky_max_shift':
                 ls_lucky_max_shift = max(0, min(200, int(ratio * 200)))
                 # Propagation live si le stacker tourne
@@ -10980,6 +11027,8 @@ def handle_lucky_slider_click(mx, my, control_rects):
                     luckystack.configure(lucky_max_shift=float(ls_lucky_max_shift))
                 elif livestack is not None:
                     livestack.configure(lucky_max_shift=float(ls_lucky_max_shift))
+                if raw_lucky_stacker is not None:
+                    raw_lucky_stacker.update_config(max_shift_px=ls_lucky_max_shift)
             elif name == 'ls_lucky_roi':
                 ls_lucky_roi = max(20, min(100, int(20 + ratio * 80)))
             elif name == 'ls_lucky_save_progress':
@@ -12146,7 +12195,8 @@ def apply_isp_to_preview(array):
         return (img * 255).astype(np.float32)
 
 
-def save_with_external_processing(stacker_obj, filename=None, raw_format_name=None):
+def save_with_external_processing(stacker_obj, filename=None, raw_format_name=None,
+                                   preview_override=None):
     """
     Sauvegarde le résultat stacké avec ISP+stretch externe (pour mode RAW).
 
@@ -12157,6 +12207,9 @@ def save_with_external_processing(stacker_obj, filename=None, raw_format_name=No
         stacker_obj: livestack ou luckystack object
         filename: Nom fichier (optionnel)
         raw_format_name: Format RAW pour le nom de fichier
+        preview_override: Si fourni (uint8 ndarray), utilisé directement comme PNG
+                          au lieu de recalculer via session.get_preview_png().
+                          Doit avoir ch0=R_physique (format affichage pygame/RAW).
 
     Returns:
         Path du fichier sauvegardé ou None
@@ -12184,16 +12237,20 @@ def save_with_external_processing(stacker_obj, filename=None, raw_format_name=No
         print(f"[SAVE] Erreur récupération résultat: {e}")
         return None
 
-    # Générer le PNG via session.get_preview_png() = même pipeline que l'affichage
-    # (normalisation, BL, gradient removal, EMA percentile, stretch configuré)
-    processed_png = None
-    if hasattr(stacker_obj, 'session') and stacker_obj.session is not None:
-        _orig_stack = stacker_obj.session.stacker.stacked_image
-        stacker_obj.session.stacker.stacked_image = raw_result
-        try:
-            processed_png = stacker_obj.session.get_preview_png()
-        finally:
-            stacker_obj.session.stacker.stacked_image = _orig_stack
+    # Générer le PNG : utiliser preview_override si fourni (= image affichée à l'écran),
+    # sinon recalculer via session.get_preview_png() (pipeline complet avec EMA vmin).
+    # preview_override garantit que le PNG FIT = PNG bouton PNG (même luminosité).
+    if preview_override is not None:
+        processed_png = preview_override
+    else:
+        processed_png = None
+        if hasattr(stacker_obj, 'session') and stacker_obj.session is not None:
+            _orig_stack = stacker_obj.session.stacker.stacked_image
+            stacker_obj.session.stacker.stacked_image = raw_result
+            try:
+                processed_png = stacker_obj.session.get_preview_png()
+            finally:
+                stacker_obj.session.stacker.stacked_image = _orig_stack
 
     # Fallback si session indisponible
     if processed_png is None:
@@ -12243,11 +12300,11 @@ def save_with_external_processing(stacker_obj, filename=None, raw_format_name=No
     try:
         import cv2
 
-        # Convertir processed_png en uint16 pour PNG 16-bit
-        if processed_png.dtype == np.uint16:
+        # Conserver uint8 tel quel (8-bit PNG), convertir float→uint16 (16-bit PNG)
+        if processed_png.dtype == np.uint8:
             png_data = processed_png
-        elif processed_png.dtype == np.uint8:
-            png_data = (processed_png.astype(np.uint16) * 257)  # 0-255 → 0-65535
+        elif processed_png.dtype == np.uint16:
+            png_data = processed_png
         elif processed_png.dtype == np.float32 or processed_png.dtype == np.float64:
             _pmax = processed_png.max()
             if _pmax <= 1.0:
@@ -12548,7 +12605,7 @@ def draw_jsk_controls(screen_width, screen_height, image_array=None):
     global stretch_preset, ghs_D, ghs_b, ghs_SP, ghs_LP, ghs_HP
     global stretch_factor
     global log_factor, mtf_shadows, mtf_midtone, mtf_highlights
-    global jsk_color_enabled, jsk_r_gain, jsk_g_gain, jsk_b_gain, jsk_contrast
+    global jsk_color_enabled, jsk_r_gain, jsk_g_gain, jsk_b_gain, jsk_contrast, jsk_bg_offset
     global jsk_settings_tab
 
     control_rects = {}
@@ -12782,6 +12839,14 @@ def draw_jsk_controls(screen_width, screen_height, image_array=None):
                 panel_x, start_y, slider_width, slider_height,
                 f"Contraste: {jsk_contrast/100:.2f}x", jsk_contrast, 50, 200, (200, 200, 80)
             )
+            start_y += slider_height + margin
+
+        # Fond de ciel — toujours visible (indépendant de color_enabled)
+        start_y += 6
+        control_rects['jsk_bg_offset'] = draw_jsk_slider(
+            panel_x, start_y, slider_width, slider_height,
+            f"Fond ciel: {jsk_bg_offset} ADU", jsk_bg_offset, 0, 1000, (100, 160, 200)
+        )
 
     # ===== Panneau gauche : HDR Weights (uniquement en mode Mean) =====
     if jsk_hdr_method == 2:
@@ -13580,7 +13645,7 @@ def draw_home_settings_panel(sw, sh):
         _sl('cfg_meter',      f"Mesure: {_meter_nm}",             meter,           0, _nmeters,   (90, 90, 130))
         _sl('cfg_blue',       f"Bal. bleu: {blue/10:.1f}",        blue,            1, 80,         (60, 90, 160))
         _sl('cfg_red',        f"Bal. rouge: {red/10:.1f}",        red,             1, 80,         (160, 60, 60))
-        _sl('cfg_sharpness',  f"Nettete: {sharpness}",            sharpness,       0, 32,         (80, 130, 110))
+        _sl('cfg_sharpness',  f"Nettete: {sharpness/10:.1f}",       sharpness,       0, 160,        (80, 130, 110))
         _sl('cfg_denoise',    f"Denoise: {_dnoise_nm}",           int(denoise),    0, 3,          (70, 120, 120))
         _sl('cfg_rotate',     f"Rotation: {_rot_nm}",             rotate,          0, 3,          (80, 90, 120))
         _sl('cfg_vflip',      f"Flip V: {_yn(vflip)}",            vflip,           0, 1,          (70, 80, 110))
@@ -14405,7 +14470,7 @@ def handle_home_click(mx, my):
                 red = max(1, int(1 + ratio * 79 + 0.5))
                 _apply_home_live_controls()
             elif key == 'cfg_sharpness':
-                sharpness = int(ratio * 32 + 0.5)
+                sharpness = int(ratio * 160 + 0.5)
                 _apply_home_live_controls()
             elif key == 'cfg_denoise':
                 denoise = int(ratio * 3 + 0.5)
@@ -14696,7 +14761,8 @@ def handle_home_click(mx, my):
                 denoise_strength=jsk_denoise_strength, hdr_weights=jsk_hdr_weights,
                 color_enabled=jsk_color_enabled == 1,
                 r_gain=jsk_r_gain/100.0, g_gain=jsk_g_gain/100.0, b_gain=jsk_b_gain/100.0,
-                contrast=jsk_contrast/100.0, use_ema=jsk_use_ema == 1)
+                contrast=jsk_contrast/100.0, bg_offset=jsk_bg_offset,
+                use_ema=jsk_use_ema == 1)
             jsk_recorder = JSKVideoRecorder()
             if capture_thread is not None:
                 capture_thread.set_capture_params({'type': 'raw'})
@@ -14842,6 +14908,7 @@ def handle_jsk_slider_click(mousex, mousey, control_rects):
     """
     global jsk_stack_count, jsk_hdr_bits_clip, jsk_hdr_method, jsk_use_ema
     global jsk_denoise_type, jsk_denoise_strength, jsk_hdr_weights
+    global jsk_bg_offset
     global stretch_preset, ghs_D, ghs_b, ghs_SP, ghs_LP, ghs_HP
     global stretch_factor
     global log_factor, mtf_shadows, mtf_midtone, mtf_highlights
@@ -14930,6 +14997,9 @@ def handle_jsk_slider_click(mousex, mousey, control_rects):
             elif name == 'jsk_contrast':
                 jsk_contrast = int(50 + ratio * 150)
                 jsk_contrast = max(50, min(200, jsk_contrast))
+            elif name == 'jsk_bg_offset':
+                jsk_bg_offset = int(ratio * 1000)
+                jsk_bg_offset = max(0, min(1000, jsk_bg_offset))
 
             # Mettre à jour le processeur JSK
             if jsk_processor is not None:
@@ -14945,6 +15015,7 @@ def handle_jsk_slider_click(mousex, mousey, control_rects):
                     g_gain=jsk_g_gain / 100.0,
                     b_gain=jsk_b_gain / 100.0,
                     contrast=jsk_contrast / 100.0,
+                    bg_offset=jsk_bg_offset,
                     use_ema=jsk_use_ema == 1
                 )
 
@@ -17273,52 +17344,75 @@ def draw_collimation_radius_buttons(screen_width, screen_height, selected_circle
 
 def calculate_fwhm(image_surface, center_x, center_y, area_size):
     """
-    Calcule le FWHM pour mesurer la netteté
-    Version corrigée qui ne verrouille pas la surface
+    Calcule le FWHM via moments d'inertie 2D (même algorithme que quality.py QC stacking).
+    Formule : FWHM = 2.355 * sqrt((lambda1 + lambda2) / 2)
+    Résultat directement comparable au seuil max_fwhm du contrôle qualité.
     """
     try:
-        # IMPORTANT : Utiliser array3d au lieu de pixels3d (ne verrouille pas)
         image_array = pygame.surfarray.array3d(image_surface)
-        
-        # Extraire la région d'intérêt
+
+        # Extraire ROI — pygame.surfarray retourne (W, H, C), on transpose en (H, W, C)
         y1 = max(0, center_y - area_size)
-        y2 = min(image_array.shape[1], center_y + area_size)  # Note: shape[1] pour y
+        y2 = min(image_array.shape[1], center_y + area_size)
         x1 = max(0, center_x - area_size)
-        x2 = min(image_array.shape[0], center_x + area_size)  # Note: shape[0] pour x
-        
-        # pygame.surfarray retourne (width, height, channels), donc on transpose
-        roi = image_array[x1:x2, y1:y2, :]
-        roi = np.transpose(roi, (1, 0, 2))  # Convertir en (height, width, channels)
-        
-        # Convertir en niveaux de gris
-        if len(roi.shape) == 3:
-            gray = cv2.cvtColor(roi, cv2.COLOR_RGB2GRAY)
-        else:
-            gray = roi
-        
-        # Trouver le point le plus brillant dans la ROI
-        min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(gray)
-        
-        # Profils horizontal et vertical passant par le point le plus brillant
-        profile_h = gray[max_loc[1], :]
-        profile_v = gray[:, max_loc[0]]
-        
-        # Calculer FWHM pour chaque profil
-        fwhm_h = calculate_fwhm_1d(profile_h)
-        fwhm_v = calculate_fwhm_1d(profile_v)
-        
-        # Retourner la moyenne
-        if fwhm_h is not None and fwhm_v is not None:
-            return (fwhm_h + fwhm_v) / 2.0
-        elif fwhm_h is not None:
-            return fwhm_h
-        elif fwhm_v is not None:
-            return fwhm_v
-        else:
+        x2 = min(image_array.shape[0], center_x + area_size)
+        roi = np.transpose(image_array[x1:x2, y1:y2, :], (1, 0, 2))
+
+        # Canal vert (même choix que quality.py ligne 41)
+        gray = roi[:, :, 1].astype(np.float64)
+
+        # Trouver l'étoile la plus brillante dans la ROI (pic maximal)
+        min_val, max_val, _, max_loc = cv2.minMaxLoc(gray.astype(np.float32))
+        if max_val <= min_val or (max_val - min_val) < 5:
             return None
-            
+
+        # Extraire une boîte 15px autour du pic (même taille que quality.py)
+        box = 15
+        py, px = max_loc[1], max_loc[0]
+        cy1 = max(0, py - box)
+        cy2 = min(gray.shape[0], py + box)
+        cx1 = max(0, px - box)
+        cx2 = min(gray.shape[1], px + box)
+        cutout = gray[cy1:cy2, cx1:cx2]
+
+        if cutout.size == 0:
+            return None
+
+        # Soustraire fond local (percentile 20, identique à quality.py)
+        background = np.percentile(cutout, 20)
+        cutout = np.maximum(cutout - background, 0)
+
+        total = np.sum(cutout)
+        if total == 0:
+            return None
+
+        # Centroïde pondéré par flux
+        yy, xx = np.indices(cutout.shape)
+        cy = np.sum(yy * cutout) / total
+        cx = np.sum(xx * cutout) / total
+
+        # Moments d'inertie 2D
+        yy_c = yy - cy
+        xx_c = xx - cx
+        Mxx = np.sum(cutout * xx_c**2) / total
+        Myy = np.sum(cutout * yy_c**2) / total
+        Mxy = np.sum(cutout * xx_c * yy_c) / total
+
+        # Valeurs propres du tenseur de moments
+        a = (Mxx + Myy) / 2.0
+        b = np.sqrt(((Mxx - Myy) / 2.0)**2 + Mxy**2)
+        lambda1 = a + b
+        lambda2 = a - b
+
+        if lambda2 <= 0 or lambda1 <= 0:
+            return None
+
+        # FWHM gaussien — formule identique quality.py:179
+        fwhm = 2.355 * np.sqrt((lambda1 + lambda2) / 2.0)
+
+        return float(fwhm)
+
     except Exception as e:
-        print(f"Erreur FWHM: {e}")
         return None
 
 def calculate_fwhm_1d(profile):
@@ -19987,7 +20081,8 @@ while True:
                             _fa[:,:,2] = np.clip(_fa[:,:,2] * galaxy_b_gain / 100.0, 0, 255)
                             stacked_array = _fa.astype(np.uint8)
                         galaxy_pre_filter_array = stacked_array.copy()
-                        stacked_array = apply_lucky_post_stack_filters(stacked_array, color_correction=True)
+                        # Galaxy toujours en [R,G,B] → swap BGR pour la fonction → swap retour [R,G,B]
+                        stacked_array = apply_lucky_post_stack_filters(stacked_array[:, :, [2, 1, 0]], color_correction=True)[:, :, [2, 1, 0]]
                         galaxy_last_filtered_array = stacked_array.copy()
                     _gx_display = galaxy_last_filtered_array
 
@@ -20022,7 +20117,8 @@ while True:
                         _fa[:,:,2] = np.clip(_fa[:,:,2] * galaxy_b_gain / 100.0, 0, 255)
                         stacked_array = _fa.astype(np.uint8)
                     galaxy_pre_filter_array = stacked_array.copy()
-                    stacked_array = apply_lucky_post_stack_filters(stacked_array, color_correction=True)
+                    # Galaxy toujours en [R,G,B] → swap BGR pour la fonction → swap retour [R,G,B]
+                    stacked_array = apply_lucky_post_stack_filters(stacked_array[:, :, [2, 1, 0]], color_correction=True)[:, :, [2, 1, 0]]
                     galaxy_last_filtered_array = stacked_array.copy()
                     _gx_display = stacked_array
 
@@ -20066,6 +20162,28 @@ while True:
                     }
                 _fxp = pygame._fx_proc
 
+                # ── Détection nouveau stack Elite Pool (indépendant du thread frame) ──
+                # Permet d'afficher le stack périodique même si le thread n'a pas encore retourné
+                def _elite_result_to_display(lk_obj):
+                    """Extrait last_lucky_result → uint8 [0,255] pour affichage."""
+                    _r = getattr(lk_obj, 'last_lucky_result', None)
+                    if _r is None:
+                        return None
+                    _mx = float(_r.max())
+                    if _mx <= 0:
+                        return None
+                    return np.clip(np.clip(_r * (1.0 / _mx), 0.0, 1.0) * 255.0, 0, 255).astype(np.uint8)
+
+                if files_livestack is not None and (files_active or files_paused):
+                    _cur_stacks = files_livestack.stats.get('lucky_stacks_done', 0)
+                    _prev_stacks = _fxp.get('_prev_stacks', 0)
+                    if _cur_stacks > _prev_stacks:
+                        _fxp['_prev_stacks'] = _cur_stacks
+                        _disp_new = _elite_result_to_display(files_livestack)
+                        if _disp_new is not None:
+                            _fxp['last_display'] = _disp_new
+                            _fxp['_last_shown'] = None  # forcer re-render stretch+filtres
+
                 # Récupérer résultat du thread précédent
                 if _fxp['future'] is not None and _fxp['future'].done():
                     try:
@@ -20085,9 +20203,13 @@ while True:
                     if _video_file_done and files_index >= len(files_list):
                         files_active = False
                         # Stocker le dernier résultat pour le mode pause interactif
-                        if _fxp['last_display'] is not None:
+                        # Priorité : last_lucky_result (stack) > last_display (frame brute)
+                        _final_disp = _elite_result_to_display(files_livestack)
+                        if _final_disp is not None:
+                            files_pre_stretch_array = _final_disp
+                        elif _fxp['last_display'] is not None:
                             files_pre_stretch_array = _fxp['last_display'].copy()
-                            files_last_filtered_array = None  # forcer re-render en pause
+                        files_last_filtered_array = None  # forcer re-render en pause
                         files_paused = True
                         print(f"[FILES] Traitement terminé: {files_index} fichier(s) — pause automatique")
 
@@ -20464,7 +20586,11 @@ while True:
                             # Stocker avant filtres pour re-filtrage interactif en pause
                             ls_pre_filter_array = stacked_array.copy()
                             # Appliquer les filtres post-stack (CLAHE, USM, déconvolution, balance)
-                            stacked_array = apply_lucky_post_stack_filters(stacked_array, color_correction=True)
+                            # RAW : données [R,G,B] → swap BGR pour la fonction → swap retour [R,G,B]
+                            if raw_format >= 2:
+                                stacked_array = apply_lucky_post_stack_filters(stacked_array[:, :, [2, 1, 0]], color_correction=True)[:, :, [2, 1, 0]]
+                            else:
+                                stacked_array = apply_lucky_post_stack_filters(stacked_array, color_correction=True)
                             # Conserver pour le bouton SAVE PNG
                             ls_last_filtered_array = stacked_array.copy()
 
@@ -20582,7 +20708,10 @@ while True:
                             if _pre.dtype != np.uint8:
                                 _pre = np.clip(_pre, 0, 255).astype(np.uint8)
                             ls_pre_filter_array = _pre  # Mettre à jour pour cohérence
-                            _disp = apply_lucky_post_stack_filters(_pre, color_correction=True)
+                            if raw_format >= 2:
+                                _disp = apply_lucky_post_stack_filters(_pre[:, :, [2, 1, 0]], color_correction=True)[:, :, [2, 1, 0]]
+                            else:
+                                _disp = apply_lucky_post_stack_filters(_pre, color_correction=True)
                             ls_last_filtered_array = _disp
                         else:
                             _disp = ls_last_filtered_array
@@ -20803,7 +20932,9 @@ while True:
                                     _raw_disp = np.clip(_raw_disp, 0, 255).astype(np.uint8)
 
                                 lucky_last_stack_before_filter = _raw_disp.copy()
-                                _raw_disp = apply_lucky_post_stack_filters(_raw_disp)
+                                # RAW : données en [R,G,B] → swap vers BGR pour la fonction (BGR attendu),
+                                # puis swap retour vers [R,G,B] pour l'affichage pygame
+                                _raw_disp = apply_lucky_post_stack_filters(_raw_disp[:, :, [2, 1, 0]])[:, :, [2, 1, 0]]
                                 lucky_last_filtered_array = _raw_disp.copy()
 
                                 pygame._lucky_raw_last_displayed = _raw_stacks
@@ -20821,7 +20952,8 @@ while True:
                                         pygame._lucky_raw_last_saved = 0
                                     if _raw_stacks > pygame._lucky_raw_last_saved:
                                         try:
-                                            save_lucky_filtered_png(_raw_disp, filename=f"lucky_raw_progress_{_raw_stacks:04d}")
+                                            # _raw_disp est [R,G,B] → swap vers BGR pour cv2.imwrite
+                                            save_lucky_filtered_png(_raw_disp[:, :, [2, 1, 0]], filename=f"lucky_raw_progress_{_raw_stacks:04d}")
                                             pygame._lucky_raw_last_saved = _raw_stacks
                                         except Exception:
                                             pass
@@ -20870,7 +21002,13 @@ while True:
                             if _pre.dtype != np.uint8:
                                 _pre = np.clip(_pre, 0, 255).astype(np.uint8)
                             lucky_last_stack_before_filter = _pre
-                        _disp = apply_lucky_post_stack_filters(lucky_last_stack_before_filter.copy(), color_correction=True)
+                        _pre_filter = lucky_last_stack_before_filter.copy()
+                        _is_raw_pause = (lucky_raw_pre_stretch_array is not None)
+                        if _is_raw_pause:
+                            # RAW : [R,G,B] → swap BGR pour la fonction → swap retour [R,G,B]
+                            _disp = apply_lucky_post_stack_filters(_pre_filter[:, :, [2, 1, 0]], color_correction=True)[:, :, [2, 1, 0]]
+                        else:
+                            _disp = apply_lucky_post_stack_filters(_pre_filter, color_correction=True)
                         lucky_last_filtered_array = _disp
                         if len(_disp.shape) == 3:
                             _t = np.swapaxes(_disp, 0, 1)
@@ -22296,7 +22434,9 @@ while True:
                     try:
                         # Mode RAW: utiliser traitement externe pour cohérence preview/stack
                         if raw_format >= 2:
-                            save_with_external_processing(livestack, raw_format_name=raw_formats[raw_format])
+                            save_with_external_processing(livestack,
+                                raw_format_name=raw_formats[raw_format],
+                                preview_override=ls_last_filtered_array)
                         else:
                             livestack.save(raw_format_name=raw_formats[raw_format])
                         print("[LIVESTACK] Image finale sauvegardée")
@@ -22392,7 +22532,9 @@ while True:
                 if galaxy_livestack is not None:
                     try:
                         if raw_format >= 2:
-                            save_with_external_processing(galaxy_livestack, raw_format_name=raw_formats[raw_format])
+                            save_with_external_processing(galaxy_livestack,
+                                raw_format_name=raw_formats[raw_format],
+                                preview_override=galaxy_last_filtered_array)
                         else:
                             galaxy_livestack.save(raw_format_name=raw_formats[raw_format])
                         print("[GALAXY] Stack FITS sauvegardé")
@@ -22403,7 +22545,9 @@ while True:
             # SAVE PNG
             if is_click_on_galaxy_save_png(mousex, mousey, fs_width):
                 if galaxy_last_filtered_array is not None:
-                    save_ls_filtered_png(galaxy_last_filtered_array)
+                    # Galaxy est toujours en RAW : ch0=R_physique → imwrite attend BGR (ch0=B)
+                    # → swap R/B avant écriture pour PNG avec couleurs correctes
+                    save_ls_filtered_png(galaxy_last_filtered_array[:, :, [2, 1, 0]])
                 else:
                     print("[GALAXY PNG] Aucune image disponible")
                 continue
@@ -22726,6 +22870,12 @@ while True:
                             lucky_align_mode=ls_lucky_align,
                             lucky_score_roi_percent=float(ls_lucky_roi),
                             lucky_max_shift=float(ls_lucky_max_shift),
+                            lucky_buffer_mode=['ring', 'elite'][min(ls_lucky_buffer_mode, 1)],
+                            lucky_elite_pool_size=ls_elite_pool_size,
+                            lucky_elite_stack_interval=float(ls_elite_stack_interval),
+                            lucky_elite_entry_mode=['min', 'mean'][min(ls_elite_entry_mode, 1)],
+                            lucky_elite_score_clip=bool(ls_elite_score_clip),
+                            lucky_elite_score_kappa=ls_elite_score_kappa / 10.0,
                             lucky_drizzle_enable=_fx_is_video and files_drizzle_en,
                             lucky_drizzle_scale=files_drizzle_scale / 10.0,
                             png_stretch=['off', 'ghs', 'asinh', 'log', 'mtf'][min(stretch_preset, 4)],
@@ -22778,7 +22928,8 @@ while True:
                         _fit_fname = f"files_stack_{files_index:04d}_{_ts_fit}"
                         if raw_format >= 2:
                             save_with_external_processing(files_livestack, filename=_fit_fname,
-                                                          raw_format_name=raw_formats[raw_format])
+                                                          raw_format_name=raw_formats[raw_format],
+                                                          preview_override=files_last_filtered_array)
                         else:
                             files_livestack.save(filename=_fit_fname)
                         print("[FILES] Stack FITS sauvegardé")
@@ -22897,7 +23048,9 @@ while True:
                 if livestack is not None and livestack.session is not None:
                     try:
                         if raw_format >= 2:
-                            save_with_external_processing(livestack, raw_format_name=raw_formats[raw_format])
+                            save_with_external_processing(livestack,
+                                raw_format_name=raw_formats[raw_format],
+                                preview_override=ls_last_filtered_array)
                         else:
                             livestack.save(raw_format_name=raw_formats[raw_format])
                         print("[LS INTERFACE] Stack sauvegardé")
@@ -22910,7 +23063,11 @@ while True:
             # SAVE PNG → sauvegarder l'image filtrée en PNG
             if is_click_on_ls_save_png_ls(mousex, mousey, fs_width):
                 if ls_last_filtered_array is not None:
-                    save_ls_filtered_png(ls_last_filtered_array)
+                    # RAW (raw_format >= 2) : ch0=R_physique → imwrite attend BGR (ch0=B)
+                    # → swap R/B pour PNG avec couleurs correctes
+                    _arr_to_save = (ls_last_filtered_array[:, :, [2, 1, 0]]
+                                    if raw_format >= 2 else ls_last_filtered_array)
+                    save_ls_filtered_png(_arr_to_save)
                 else:
                     print("[LS PNG] Aucune image disponible (pas encore de stack)")
                 continue
@@ -23144,7 +23301,9 @@ while True:
                         if ls_save_final == 1:
                             try:
                                 if raw_format >= 2:
-                                    save_with_external_processing(livestack, raw_format_name=raw_formats[raw_format])
+                                    save_with_external_processing(livestack,
+                                        raw_format_name=raw_formats[raw_format],
+                                        preview_override=ls_last_filtered_array)
                                 else:
                                     livestack.save(raw_format_name=raw_formats[raw_format])
                                 print("[LS INTERFACE] Stack final sauvegardé à la sortie")
@@ -23242,7 +23401,10 @@ while True:
             # SAVE PNG → sauvegarder l'image filtrée courante en PNG
             if is_click_on_ls_save_png(mousex, mousey, fs_width):
                 if lucky_last_filtered_array is not None:
-                    save_lucky_filtered_png(lucky_last_filtered_array)
+                    # Mode RAW : lucky_last_filtered_array est en [R,G,B] (ch0=R_phys)
+                    # cv2.imwrite attend du BGR → swap avant sauvegarde
+                    _to_save = lucky_last_filtered_array[:, :, [2, 1, 0]] if _is_raw_lucky else lucky_last_filtered_array
+                    save_lucky_filtered_png(_to_save)
                 else:
                     print("[LUCKY PNG] Aucune image disponible (pas encore de stack)")
                 continue
@@ -23426,6 +23588,9 @@ while True:
                         from libastrostack.lucky_raw import create_bayer_lucky_stacker as _mk_raw
                         _score_methods = ['laplacian', 'gradient', 'sobel', 'tenengrad', 'laplacian', 'laplacian']
                         _stack_methods  = ['mean', 'mean', 'sigma_clip']
+                        # Mode AP (ls_lucky_align==2) non implémenté en RAW — corrélation de phase globale seulement
+                        if ls_lucky_align == 2:
+                            print("[LUCKY RAW] Mode AP non disponible en RAW Bayer — alignement surface (corrélation G1) utilisé")
                         raw_lucky_stacker = _mk_raw(
                             buffer_size          = ls_lucky_buffer,
                             keep_percent         = float(ls_lucky_keep),
@@ -26671,7 +26836,9 @@ while True:
                                 try:
                                     # Mode RAW: utiliser traitement externe pour cohérence avec preview
                                     if raw_format >= 2:
-                                        save_with_external_processing(livestack, raw_format_name=raw_formats[raw_format])
+                                        save_with_external_processing(livestack,
+                                            raw_format_name=raw_formats[raw_format],
+                                            preview_override=ls_last_filtered_array)
                                     else:
                                         # Mode RGB/YUV: utiliser libastrostack normalement
                                         livestack.save(raw_format_name=raw_formats[raw_format])
