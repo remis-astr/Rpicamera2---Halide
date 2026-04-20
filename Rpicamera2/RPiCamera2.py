@@ -1569,9 +1569,19 @@ def _files_load_and_stack(file_path, ls_obj):
                 _bayer = _arr.reshape(_img_h, _img_w)
                 if _bpp > 1 and _endian != 0:          # big-endian → swap
                     _bayer = _bayer.byteswap()
-                _bayer8 = (_bayer >> ((_bit_depth - 8) if _bit_depth > 8 else 0)).astype(np.uint8)
-                _rgb8 = _cv2.cvtColor(_bayer8, _SER_BAYER[_color_id])
-                rgb = _rgb8.astype(np.float32) / 255.0
+                if _bpp == 1:
+                    # 8-bit Bayer : débayer directement en uint8
+                    _rgb = _cv2.cvtColor(_bayer, _SER_BAYER[_color_id])
+                    rgb = _rgb.astype(np.float32) / 255.0
+                else:
+                    # 12-bit (MSB-justifié ×16) ou 16-bit : débayer en uint16 natif.
+                    # NE PAS passer par uint8 intermédiaire : pour du 12-bit MSB-justifié
+                    # (_bit_depth=12, valeurs=ADU×16 range 0..65520), >> (_bit_depth-8)=>> 4
+                    # donnerait des valeurs 0..4095 qui débordent uint8 → image corrompue.
+                    # cvtColor accepte uint16 directement ; normaliser par 65535 est correct
+                    # pour 16-bit pur et pour du 12-bit MSB (max ≈ 65520 ≈ 65535).
+                    _rgb16 = _cv2.cvtColor(_bayer, _SER_BAYER[_color_id])
+                    rgb = _rgb16.astype(np.float32) / 65535.0
             else:
                 # MONO → répliquer en 3 canaux
                 _gray = _arr.reshape(_img_h, _img_w).astype(np.float32)
@@ -2627,10 +2637,10 @@ extns        = ['jpg','png','bmp','rgb','yuv420','raw']
 extns2       = ['jpg','png','bmp','data','data','dng']
 vwidths      = [640,720,800,1280,1280,1296,1332,1456,1536,1640,1920,1928,2028,2028,2304,2880,2592,3280,3840,3856,4032,4056,4608,4656,5472,8000,9152,9248]
 vheights     = [480,540,600, 720, 960, 972, 990,1088, 864,1232,1080,1090,1080,1520,1296,2160,1944,2464,2160,2180,3024,3040,2592,3496,3648,6000,6944,6944]
-v_max_fps    = [200,120, 40,  40,  40,  30,  60,  30,  30,  30,  30,  30,  50,  40,  25,  40,  20,  20,  20,  20,  20,  10,  20,  20,  20,  20,  20,  20]
+v_max_fps    = [220,120, 40,  40,  40,  30,  60,  30,  30,  30,  30,  30,  50,  40,  25,  40,  20,  20,  20,  20,  20,  10,  20,  20,  20,  20,  20,  20]
 v3_max_fps   = [200,120,125, 120, 120, 120, 120, 120, 120, 100, 100,  50, 100,  56,  56,  40,  20,  20,  20,  20,  20,  15,  20,  20,  20  ,20,  20,  20]
 v9_max_fps   = [240, 200, 150, 120, 100, 100, 80, 60, 60, 60, 60]
-v10_max_fps  = [178,150,178, 150, 150, 150, 150, 150, 150, 150, 100, 50, 100,  60,  56,  51,  43,  43,  43,  43,  43,  43,  43,  43,  43,  43,  43,  43]  # IMX585 modes réels (178fps@800x600, 150fps@720p, 100fps@1080p, 51fps@2.8K, 43fps@4K)
+v10_max_fps  = [220,150,178, 150, 150, 150, 150, 150, 150, 150, 100, 50, 100,  60,  56,  51,  43,  43,  43,  43,  43,  43,  43,  43,  43,  43,  43,  43]  # IMX585 modes réels (220fps@640x480, 178fps@800x600, 150fps@720p, 100fps@1080p, 51fps@2.8K, 43fps@4K)
 v15_max_fps  = [240,200,200, 130]
 zwidths      = [640,800,1280,2592,3280,4056,4656,9152]
 zheights     = [480,600, 960,1944,2464,3040,3496,6944]
@@ -2646,7 +2656,7 @@ imx585_crop_modes = {
     2: (1920, 1080, "Mode 3 Crop", 90),   # Hardware 1080p crop
     3: (1280, 720, "Mode 4 Crop", 120),   # Hardware 720p crop
     4: (800, 600, "Mode 5 Crop", 150),    # Hardware 800x600 crop
-    5: (640, 480, "Mode 6 Crop", 200)     # Hardware 640x480 crop (VGA haute fréquence)
+    5: (640, 480, "Mode 6 Crop", 220)     # Hardware 640x480 crop (VGA haute fréquence)
 }
 
 # Résolutions RAW validées pour IMX585 (testées et fonctionnelles)
@@ -2679,7 +2689,7 @@ zoom_optimal_fps = {
     2: (60, 100, 120, 100),  # 1920x1080 - Mode 3 hardware (IMX585: 100 fps)
     3: (120, 120, 150, 150), # 1280x720  - Mode 4 hardware (IMX585: 150.02 fps)
     4: (200, 200, 240, 178), # 800x600   - Mode 5 hardware (IMX585: 178.57 fps)
-    5: (200, 200, 240, 200)  # 640x480   - Mode 6 hardware (IMX585: ~200 fps VGA)
+    5: (200, 200, 240, 220)  # 640x480   - Mode 6 hardware (IMX585: 220 fps VGA)
 }
 
 def sync_video_resolution_with_zoom():
@@ -2805,9 +2815,9 @@ def get_imx585_sensor_mode(zoom_level, use_native=False):
 shutters     = [-4000,-2000,-1600,-1250,-1000,-800,-640,-500,-400,-320,-288,-250,-240,-200,-160,-144,-125,-120,-100,-96,-80,-60,-50,-48,-40,-30,-25,
                 -20,-15,-13,-10,-8,-6,-5,-4,-3,0.4,0.5,0.6,0.8,1,1.1,1.2,2,3,4,5,6,7,8,9,10,11,15,20,25,30,40,50,60,75,100,112,120,150,200,220,230,
                 239,435,500,600,650,660,670]
-codecs       = ['h264','mjpeg','yuv420','raw','ser_yuv','ser_rgb','ser_xrgb']
-codecs2      = ['h264','mjpeg','data','raw','SER-YUV','SER-RGB','SER-XRGB']
-ser_formats  = ['YUV420', 'RGB888', 'XRGB8888']
+codecs       = ['h264','mjpeg','yuv420','raw','ser_yuv','ser_rgb','ser_xrgb','ser_raw12']
+codecs2      = ['h264','mjpeg','data','raw','SER-YUV','SER-RGB','SER-XRGB','SER-RAW12']
+ser_formats  = ['YUV420', 'RGB888', 'XRGB8888', 'RAW12 Bayer']
 h264profiles = ['baseline 4','baseline 4.1','baseline 4.2','main 4','main 4.1','main 4.2','high 4','high 4.1','high 4.2']
 meters       = ['centre','spot','average']
 awbs         = ['off','auto','incandescent','tungsten','fluorescent','indoor','daylight','cloudy']
@@ -2882,7 +2892,7 @@ ls_lucky_save_final = 1      # 0=OFF, 1=ON (sauvegarder PNG/FITS final LuckyStac
 still_limits = ['mode',0,len(modes)-1,'speed',0,len(shutters)-1,'gain',0,30,'brightness',-100,100,'contrast',0,200,'ev',-10,10,'blue',1,80,'sharpness',0,160,
                 'denoise',0,len(denoises)-1,'quality',0,100,'red',1,80,'extn',0,len(extns)-1,'saturation',0,20,'meter',0,len(meters)-1,'awb',0,len(awbs)-1,
                 'histogram',0,len(histograms)-1,'v3_f_speed',0,len(v3_f_speeds)-1,'v3_hdr',0,len(v3_hdrs)-1,'focus_method',0,4,'star_metric',0,2,'snr_display',0,1,'metrics_interval',1,10]
-video_limits = ['vlen',0,3600,'fps',1,180,'v5_focus',10,2500,'vformat',0,7,'0',0,0,'zoom',0,5,'Focus',0,1,'tduration',1,86400,'tinterval',0.01,10,'tshots',1,999,
+video_limits = ['vlen',0,3600,'fps',1,220,'v5_focus',10,2500,'vformat',0,7,'0',0,0,'zoom',0,5,'Focus',0,1,'tduration',1,86400,'tinterval',0.01,10,'tshots',1,999,
                 'flicker',0,3,'codec',0,len(codecs)-1,'ser_format',0,len(ser_formats)-1,'profile',0,len(h264profiles)-1,'v3_focus',10,2000,'histarea',10,300,'v3_f_range',0,len(v3_f_ranges)-1,
                 'str_cap',0,len(strs)-1,'v6_focus',10,1020,'stretch_p_low',0,2,'stretch_p_high',9995,10000,'stretch_factor',0,1500,'stretch_preset',0,4,
                 'log_factor',0,1000,'mtf_shadows',0,50,'mtf_midtone',1,99,'mtf_highlights',50,100,
@@ -13675,7 +13685,7 @@ def draw_home_settings_panel(sw, sh):
         _sl('cfg_vformat', f"Resolution: {_vfmt_nm}",  vformat, 0, _nvfmt_max,  (100, 110, 80))
         _sl('cfg_codec',   f"Codec: {_codec_nm}",      codec,   0, _ncodec_max, (100, 100, 80))
         _sl('cfg_vlen',    f"Duree: {vlen}s",           vlen,    1, 60,          (110, 90, 70))
-        _sl('cfg_fps',     f"FPS: {fps}",               fps,     1, 60,          (110, 100, 60))
+        _sl('cfg_fps',     f"FPS: {fps}",               fps,     1, video_limits[5], (110, 100, 60))
         _sl('cfg_profile', f"H264 profil: {_prof_nm}", profile, 0, len(h264profiles)-1 if 'h264profiles' in globals() else 8, (70, 80, 100))
         _sl('cfg_level',   f"H264 niveau: {_lvl_nm}",  level,   0, 2,           (70, 80, 90))
 
@@ -14420,7 +14430,8 @@ def handle_home_click(mx, my):
             elif key == 'cfg_vlen':
                 vlen = max(1, int(ratio * 59 + 1 + 0.5))
             elif key == 'cfg_fps':
-                fps = max(1, min(60, int(1 + ratio * 59 + 0.5)))
+                _fps_max = video_limits[5]
+                fps = max(1, min(_fps_max, int(1 + ratio * (_fps_max - 1) + 0.5)))
             elif key == 'cfg_str_cap':
                 _ns = len(strs)-1 if 'strs' in globals() else 3
                 str_cap = int(ratio * _ns + 0.5)
@@ -24892,6 +24903,8 @@ while True:
                             ser_format = 1  # RGB888
                         elif codecs[codec] == 'ser_xrgb':
                             ser_format = 2  # XRGB8888
+                        elif codecs[codec] == 'ser_raw12':
+                            ser_format = 3  # RAW12 Bayer
 
                         # Choix de la méthode selon ser_format:
                         # 0 = YUV420 (rpicam-vid)
@@ -25015,7 +25028,7 @@ while True:
                             else:
                                 speed7 = sspeed
                                 speed7 = max(speed7,int((1/fps)*1000000))
-                                datastr += " --framerate " + str(max(1, min(180, int(1000000/speed7))))
+                                datastr += " --framerate " + str(max(1, min(220, int(1000000/speed7))))
 
                             if vpreview == 0:
                                 datastr += " -n "
@@ -25062,7 +25075,7 @@ while True:
                             else:
                                 speed7 = sspeed
                                 speed7 = max(speed7,int((1/fps)*1000000))
-                                actual_fps = max(1, min(180, int(1000000/speed7)))
+                                actual_fps = max(1, min(220, int(1000000/speed7)))
 
                             num_frames = int(duration_sec * actual_fps)
                             # YUV420 = 1.5 bytes per pixel (Y + U/4 + V/4)
@@ -25109,7 +25122,7 @@ while True:
                                 else:
                                     speed7 = sspeed
                                     speed7 = max(speed7,int((1/fps)*1000000))
-                                    actual_fps = max(1, min(180, int(1000000/speed7)))
+                                    actual_fps = max(1, min(220, int(1000000/speed7)))
 
                                 # Vérifier que le fichier vidéo YUV420 existe
                                 if not os.path.exists(temp_video):
@@ -25219,7 +25232,7 @@ while True:
                             else:
                                 speed7 = sspeed
                                 speed7 = max(speed7,int((1/fps)*1000000))
-                                actual_fps = max(1, min(180, int(1000000/speed7)))
+                                actual_fps = max(1, min(220, int(1000000/speed7)))
 
                             # Calculer la durée et le nombre de frames
                             # IMPORTANT: vlen est en SECONDES (pas en millisecondes)
@@ -25528,6 +25541,218 @@ while True:
                                     resume_picamera2()
 
 
+                        elif ser_format == 3:
+                            # ==== MÉTHODE RAW12 BAYER (Picamera2 — écriture directe SER) ====
+                            # Pas de fichier temporaire : le SER est écrit frame par frame
+                            # directement dans le fichier final. color_id=8 (BAYER_RGGB), pixel_depth=12.
+                            text(0,0,6,2,1,"Recording RAW12 Bayer SER...",int(fv*1.7),1)
+
+                            actual_vwidth, actual_vheight = vwidth, vheight
+
+                            if mode != 0:
+                                actual_fps = fps
+                            else:
+                                speed7 = sspeed
+                                speed7 = max(speed7, int((1/fps)*1000000))
+                                actual_fps = max(1, min(220, int(1000000/speed7)))
+
+                            duration_sec = vlen
+                            num_frames = int(duration_sec * actual_fps)
+
+                            print(f"[DEBUG SER RAW12] vlen={vlen}s, fps={actual_fps}, expected frames={num_frames}")
+
+                            # Vérifier espace disque (2 octets/pixel, pas de temp)
+                            estimated_size = num_frames * actual_vwidth * actual_vheight * 2
+                            try:
+                                import shutil as _shutil
+                                _stat = _shutil.disk_usage(vid_dir)
+                                print(f"[DEBUG SER RAW12] Estimated: {estimated_size/(1024*1024):.1f} MB, Free: {_stat.free/(1024*1024):.1f} MB")
+                                if _stat.free < estimated_size * 1.1:
+                                    _msg = f"Espace disque insuffisant ! Nécessaire: {estimated_size/(1024*1024):.1f} MB, Disponible: {_stat.free/(1024*1024):.1f} MB"
+                                    print(f"[ERROR] {_msg}")
+                                    text(0,0,6,2,1,_msg,int(fv*1.7),1)
+                                    time.sleep(3)
+                                    picam2_was_paused = pause_picamera2()
+                                    if picam2_was_paused:
+                                        resume_picamera2()
+                                    continue
+                            except Exception as _dce:
+                                print(f"[WARNING] Could not check disk space: {_dce}")
+
+                            picam2_was_paused = pause_picamera2()
+                            temp_picam2 = None
+
+                            try:
+                                from picamera2 import Picamera2
+
+                                tuning_file = None
+                                if Pi_Cam == 9 and os.path.exists("/home/" + Home_Files[0] + "/imx290a.json") and Pi == 5:
+                                    tuning_file = "/home/" + Home_Files[0] + "/imx290a.json"
+                                elif Pi_Cam == 10 and os.path.exists("/home/" + Home_Files[0] + "/imx585_lowlight.json") and Pi == 5:
+                                    tuning_file = "/home/" + Home_Files[0] + "/imx585_lowlight.json"
+
+                                print(f"[DEBUG SER RAW12] Creating Picamera2 instance on camera {camera}")
+                                if tuning_file:
+                                    temp_picam2 = Picamera2(camera, tuning=Picamera2.load_tuning_file(tuning_file))
+                                else:
+                                    temp_picam2 = Picamera2(camera)
+
+                                # Configuration video avec stream raw SRGGB12 activé
+                                # Le stream main est requis par Picamera2 en mode video,
+                                # mais on lit uniquement le stream raw dans le callback.
+                                if Pi_Cam == 10:
+                                    sensor_mode = get_imx585_sensor_mode(zoom, use_native_sensor_mode == 1)
+                                    raw_size = sensor_mode if sensor_mode else (actual_vwidth, actual_vheight)
+                                else:
+                                    raw_size = (actual_vwidth, actual_vheight)
+
+                                config = temp_picam2.create_video_configuration(
+                                    main={"size": (actual_vwidth, actual_vheight), "format": "RGB888"},
+                                    raw={"size": raw_size, "format": "SRGGB12"},
+                                )
+
+                                if mode == 0:
+                                    config["controls"]["ExposureTime"] = get_sspeed()
+                                    config["controls"]["AnalogueGain"] = gain
+
+                                temp_picam2.configure(config)
+
+                                # Récupérer les dimensions réelles du stream raw après configure
+                                _actual_cfg = temp_picam2.camera_configuration()
+                                _raw_cfg = _actual_cfg.get('raw', {})
+                                raw_actual_w = _raw_cfg.get('size', (actual_vwidth, actual_vheight))[0]
+                                raw_actual_h = _raw_cfg.get('size', (actual_vwidth, actual_vheight))[1]
+                                print(f"[DEBUG SER RAW12] Raw stream config: {raw_actual_w}x{raw_actual_h} {_raw_cfg.get('format','?')}")
+
+                                import numpy as _np_raw
+                                import threading as _th_raw
+
+                                capture_state = {
+                                    'frame_count': 0,
+                                    'write_error': None,
+                                    'output_file': None,
+                                    'timestamps': [],
+                                    'lock': _th_raw.Lock(),
+                                }
+
+                                def frame_callback_raw12(request):
+                                    if capture_state['write_error'] is not None:
+                                        return
+                                    if capture_state['frame_count'] >= num_frames:
+                                        return
+                                    try:
+                                        raw_arr = request.make_array("raw")  # uint8 (h × stride)
+                                        # Vue uint16 (CSI-2 ×16) puis strip padding de stride
+                                        u16 = raw_arr.view(_np_raw.uint16).reshape(raw_arr.shape[0], -1)
+                                        u16 = u16[:, :raw_actual_w]
+                                        raw_bytes = u16.astype('<u2').tobytes()
+                                        ts_us = int(time.time() * 1_000_000)
+                                        with capture_state['lock']:
+                                            if capture_state['output_file'] is not None:
+                                                capture_state['output_file'].write(raw_bytes)
+                                                capture_state['timestamps'].append(ts_us)
+                                                capture_state['frame_count'] += 1
+                                                if capture_state['frame_count'] % 50 == 0:
+                                                    text(0,0,6,2,1,f"Recording RAW12: {capture_state['frame_count']}/{num_frames} frames",int(fv*1.7),1)
+                                    except (OSError, IOError) as _we:
+                                        capture_state['write_error'] = _we
+                                        print(f"\n[ERROR SER RAW12] Write error at frame {capture_state['frame_count']}: {_we}")
+                                    except Exception as _ce:
+                                        capture_state['write_error'] = _ce
+                                        print(f"\n[ERROR SER RAW12] Callback error: {_ce}")
+
+                                try:
+                                    # Écrire l'en-tête SER directement dans le fichier final
+                                    capture_state['output_file'] = open(vname, 'wb')
+                                    capture_state['output_file'].write(
+                                        create_ser_header(raw_actual_w, raw_actual_h, pixel_depth=12, color_id=8)
+                                    )
+
+                                    frame_duration_us = int(1_000_000 / actual_fps)
+                                    temp_picam2.set_controls({"FrameDurationLimits": (frame_duration_us, frame_duration_us)})
+
+                                    # Désactiver denoise ISP (inutile en RAW, réduit latence)
+                                    try:
+                                        from picamera2.controls import NoiseReductionModeEnum
+                                        temp_picam2.set_controls({"NoiseReductionMode": NoiseReductionModeEnum.Off})
+                                    except Exception:
+                                        pass
+
+                                    temp_picam2.start()
+
+                                    if mode == 0:
+                                        temp_picam2.set_controls({"ExposureTime": get_sspeed(), "AnalogueGain": gain})
+
+                                    temp_picam2.post_callback = frame_callback_raw12
+
+                                    start_time = time.time()
+                                    print(f"[DEBUG SER RAW12] Capture started: {raw_actual_w}x{raw_actual_h} @ {actual_fps} fps ({num_frames} frames)")
+
+                                    while capture_state['frame_count'] < num_frames and capture_state['write_error'] is None:
+                                        if time.time() - start_time > duration_sec + 2:
+                                            break
+                                        time.sleep(0.1)
+
+                                    elapsed_time = time.time() - start_time
+                                    _fps_real = capture_state['frame_count'] / elapsed_time if elapsed_time > 0 else 0
+                                    print(f"[DEBUG SER RAW12] Done: {capture_state['frame_count']} frames in {elapsed_time:.2f}s ({_fps_real:.1f} fps)")
+
+                                except (OSError, IOError) as _fe:
+                                    capture_state['write_error'] = _fe
+                                    print(f"[ERROR SER RAW12] Cannot open file: {_fe}")
+
+                                finally:
+                                    temp_picam2.post_callback = None
+                                    temp_picam2.stop()
+                                    temp_picam2.close()
+
+                                    if capture_state['output_file'] is not None:
+                                        # Écrire le trailer timestamps (SER v3)
+                                        for _ts in capture_state['timestamps']:
+                                            capture_state['output_file'].write(struct.pack('<Q', _ts))
+                                        capture_state['output_file'].close()
+                                        # Mettre à jour FrameCount dans l'en-tête
+                                        update_ser_frame_count(vname, capture_state['frame_count'])
+
+                                # Résultat
+                                if capture_state['write_error'] is not None:
+                                    _emsg = f"ERREUR RAW12: {str(capture_state['write_error'])}"
+                                    if "No space left" in str(capture_state['write_error']) or "Errno 28" in str(capture_state['write_error']):
+                                        _emsg = f"Espace disque insuffisant ! ({capture_state['frame_count']}/{num_frames} frames)"
+                                    print(f"[ERROR] {_emsg}")
+                                    text(0,0,6,2,1,_emsg,int(fv*1.7),1)
+                                    try:
+                                        if os.path.exists(vname):
+                                            os.remove(vname)
+                                    except Exception:
+                                        pass
+                                    time.sleep(3)
+                                else:
+                                    _fc = capture_state['frame_count']
+                                    _sz = os.path.getsize(vname) / (1024*1024) if os.path.exists(vname) else 0
+                                    text(0,0,6,2,1,f"{vname} - {_fc} frames @ {actual_fps} fps ({_sz:.0f} MB)",int(fv*1.5),1)
+                                    time.sleep(2)
+
+                            except Exception as e:
+                                print(f"[ERROR SER RAW12] {e}")
+                                import traceback
+                                traceback.print_exc()
+                                text(0,0,6,2,1,f"RAW12 capture error: {str(e)}",int(fv*1.7),1)
+                                time.sleep(2)
+
+                            finally:
+                                if temp_picam2 is not None:
+                                    try:
+                                        temp_picam2.stop()
+                                    except Exception:
+                                        pass
+                                    try:
+                                        temp_picam2.close()
+                                    except Exception:
+                                        pass
+                                if picam2_was_paused:
+                                    resume_picamera2()
+
                     elif codecs2[codec] != 'raw' and not codecs[codec].startswith('ser_'):
                         # Code existant pour les autres formats (sauf SER et RAW)
                         if lver != "bookwo" and lver != "trixie":
@@ -25546,7 +25771,7 @@ while True:
                         else:
                             speed7 = sspeed
                             speed7 = max(speed7,int((1/fps)*1000000))
-                            datastr += " --framerate " + str(max(1, min(180, int(1000000/speed7))))
+                            datastr += " --framerate " + str(max(1, min(220, int(1000000/speed7))))
                         if codecs[codec] != 'h264' and codecs[codec] != 'mp4':
                             datastr += " --codec " + codecs[codec]
                         elif codecs[codec] != 'mp4':
@@ -25789,7 +26014,7 @@ while True:
                         else:
                             speed7 = sspeed
                             speed7 = max(speed7, int((1/fps)*1000000))
-                            fps_used = max(1, min(180, int(1000000/speed7)))
+                            fps_used = max(1, min(220, int(1000000/speed7)))
 
                         # Appeler la fonction de correction des timestamps
                         success = fix_video_timestamps(vname, fps_used, quality_preset="ultrafast")
@@ -25841,7 +26066,7 @@ while True:
                     else:
                         speed7 = sspeed
                         speed7 = max(speed7,int((1/fps)*1000000))
-                        datastr += " --framerate " + str(max(1, min(180, int(1000000/speed7))))
+                        datastr += " --framerate " + str(max(1, min(220, int(1000000/speed7))))
                     # Ajouter les options de sortie APRES framerate
                     if stream_type == 0:
                         datastr += " --inline --listen -o tcp://0.0.0.0:" + str(stream_port)
