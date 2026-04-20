@@ -1,0 +1,22 @@
+{
+  "black_level": 0,
+  "wb_red_gain": 1.0,
+  "wb_green_gain": 1.0,
+  "wb_blue_gain": 1.1,
+  "ccm": [
+    [1.0, 0.0, 0.0],
+    [0.0, 1.0, 0.0],
+    [0.0, 0.0, 1.0]
+  ],
+  "gamma": 1.0,
+  "brightness_offset": 0.0,
+  "contrast": 1.8,
+  "saturation": 1.0,
+  "sharpening": 0.0,
+  "calibration_info": {
+    "source": "manual",
+    "description": "ISP neutre pour astrophotographie - paramètres transparents (mappable depuis GUI)",
+    "target": "preview_only",
+    "note": "N'affecte QUE les PNG de prévisualisation, PAS les fichiers FITS. Les paramètres brightness/contrast/saturation/sharpness peuvent être mappés depuis l'interface GUI en mode RAW."
+  }
+}

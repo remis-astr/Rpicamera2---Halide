@@ -1,0 +1,34 @@
+{
+  "wb_red_gain": 0.568242719227675,
+  "wb_green_gain": 1.0,
+  "wb_blue_gain": 0.5742882542236525,
+  "black_level": 3200,
+  "gamma": 3.0,
+  "contrast": 1.1,
+  "saturation": 1.2,
+  "sharpening": 0.0,
+  "calibration_info": {
+    "source": "imx585_lowlight.json",
+    "target_ct": 5500,
+    "method": "libcamera_conversion",
+    "version": 2.0,
+    "target": "pisp"
+  },
+  "ccm": [
+    [
+      1.4293899536132812,
+      -0.4079200029373169,
+      -0.021469999104738235
+    ],
+    [
+      -0.2771899998188019,
+      1.4617700576782227,
+      -0.184579998254776
+    ],
+    [
+      0.0895799994468689,
+      -0.633620023727417,
+      1.5440399646759033
+    ]
+  ]
+}

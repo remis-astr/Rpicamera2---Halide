@@ -15,12 +15,15 @@ class AlignmentMode:
 
 class StretchMethod:
     """Méthodes d'étirement PNG"""
+    OFF = "off"                     # Pas de stretch
     LINEAR = "linear"
     ASINH = "asinh"
     LOG = "log"
     SQRT = "sqrt"
     HISTOGRAM = "histogram"
     AUTO = "auto"
+    GHS = "ghs"                     # Generalized Hyperbolic Stretch
+    MTF = "mtf"                     # Midtone Transfer Function (PixInsight)
 
 
 class QualityConfig:
@@ -41,7 +44,7 @@ class QualityConfig:
         self.max_rotation = 5.0           # Rotation max en degrés
         self.min_scale = 0.95             # Scale minimum (défaut 0.95)
         self.max_scale = 1.05             # Scale maximum (défaut 1.05)
-        self.min_inliers_ratio = 0.3      # Ratio minimum d'inliers RANSAC (30%)
+        self.min_inliers_ratio = 0.5      # Ratio minimum d'inliers RANSAC (50%)
         
         # Paramètres détection étoiles
         self.star_detection_sigma = 5.0   # Seuil sigma pour détection
@@ -54,32 +57,98 @@ class QualityConfig:
 
 class StackingConfig:
     """Configuration principale du stacking"""
-    
+
     def __init__(self):
         # Mode d'alignement
         self.alignment_mode = AlignmentMode.ROTATION
-        
+
         # Configuration qualité
         self.quality = QualityConfig()
-        
+
+        # Soustraction black level RAW (indépendante de l'ISP software)
+        # Valeur en ADU 12-bit natif du capteur. 0 = désactivé.
+        # IMX585 standard : 256 ADU (= 6.25% de 4096)
+        self.raw_black_level = 256
+
+        # Soustraction BL per-canal Bayer (avant débayérisation dans debayer_raw_array)
+        # Élimine le FPN 2×2 causé par les déséquilibres inter-canal (R, G1, G2, B).
+        # None = désactivé (comportement historique, BL global appliqué après débayérisation).
+        # tuple (R, G1, G2, B) en ADU 12-bit natif pour correction manuelle.
+        self.bl_per_channel = None
+
+        # Si True, estimer automatiquement les 4 BL par percentile bas sur chaque
+        # sous-canal Bayer (robuste au fond sombre dominant en imagerie astronomique).
+        # Ignoré si bl_per_channel est fourni.
+        self.bl_auto_estimate = False
+
+        # Suppression de gradient de fond (lumière parasite, vignetage)
+        # Algorithme par grille de médiane/percentile (mesh-based background estimation)
+        self.gradient_removal = False
+        self.gradient_removal_tiles = 8   # Taille de la grille n×n (8 = grille 8×8)
+        self.gradient_removal_flat_strength = 0  # 0=soustraction BG seulement, 100=correction vignetage complète
+        self.gradient_removal_poly_degree = 2    # Degré polynôme 2D (1=linéaire, 2=quad, 3=cubique, 4=quartique)
+        self.gradient_removal_sigma = 2.0        # Seuil σ masquage tuiles (0.5=agressif, 5.0=minimal)
+        self.awb_auto = False             # AWB auto (grey-world) pour preview stack RAW12
+
+        # Paramètres ISP (Image Signal Processor)
+        self.isp_enable = False            # Activer l'ISP (pour RAW12/16)
+        self.isp_config_path = None        # Chemin vers config ISP (ou None = auto-calibration)
+        self.isp_calibration_frames = None # Images de référence pour calibration (RAW, YUV)
+        self.video_format = None           # Format vidéo source: 'yuv420', 'raw12', 'raw16', None=auto
+
+        # Calibration automatique ISP (nouveau)
+        self.isp_auto_calibrate_method = 'histogram_peaks'  # Méthode: 'none', 'histogram_peaks', 'gray_world'
+        self.isp_auto_calibrate_after = 10       # Calibrer après N frames stackées (0 = désactivé)
+        self.isp_recalibrate_interval = 0        # Recalibrer tous les N frames (0 = jamais - calibration unique)
+        self.isp_auto_update_only_wb = True      # Si True, ne met à jour que les gains RGB (préserve gamma, contrast, etc.)
+
         # Paramètres PNG
         self.auto_png = True
+        self.png_bit_depth = None          # None=auto (détecté), 8, ou 16
         self.png_stretch_method = StretchMethod.ASINH
         self.png_stretch_factor = 10.0
         self.png_clip_low = 1.0           # Percentile bas (%)
         self.png_clip_high = 99.5         # Percentile haut (%)
-        
+
+        # Paramètres GHS (Generalized Hyperbolic Stretch) - 5 paramètres
+        self.ghs_D = 3.0                  # Stretch factor (0.0 à 10.0) - force de l'étirement
+        self.ghs_b = 0.13                 # Local intensity (-5.0 à 20.0) - concentration du contraste
+        self.ghs_SP = 0.2                 # Symmetry point (0.0 à 1.0) - point focal du contraste
+        self.ghs_LP = 0.0                 # Protect shadows (0.0 à SP) - protection basses lumières
+        self.ghs_HP = 0.0                 # Protect highlights (SP à 1.0) - protection hautes lumières
+
+        # NOUVEAU: Ajustement automatique SP pour RAW
+        # Compense la différence entre preview hardware ISP et ISP software
+        # En mode RAW, ajuste SP au pic d'histogramme réel des données
+        self.ghs_auto_adjust_sp = True    # Auto-ajuster SP pour RAW (recommandé)
+
+        # Paramètres FITS
+        self.fits_linear = True            # Sauvegarder FITS en linéaire (True=RAW, False=stretched)
+
         # Paramètres affichage (RPiCamera)
         self.preview_refresh_interval = 5  # Rafraîchir preview toutes les N images
-        
+
         # Paramètres sauvegarde DNG (mode hybride)
         self.save_dng_mode = "accepted"   # "none", "accepted", "all"
-        self.output_directory = "/media/admin/THKAILAR/Stacks/"
+        self.output_directory = "/home/admin/stacks/"
         self.save_rejected_list = True
-        
+
         # Paramètres alignement avancés
         self.max_stars_alignment = 50     # Nb max étoiles pour alignement
-        
+
+        # Canvas expandable : fraction de la taille de l'image ajoutée de chaque côté.
+        # 0.0 = taille fixe (comportement historique, bords noirs avec drift).
+        # 0.4 = +40% par côté → supporte un drift total de 80% de la plus petite dimension.
+        # Recommandé pour le mode fichiers avec recadrage : 0.35 à 0.5
+        self.canvas_margin_frac = 0.0
+
+        # Paramètres méthode de stacking
+        self.stacking_method = 'mean'     # 'mean', 'kappa_sigma', 'winsorized', 'median'
+        self.stacking_kappa = 2.5         # Kappa pour sigma-clipping (kappa_sigma/winsorized)
+
+        # Limite de frames (0 = illimité)
+        self.max_frames = 0
+
         # Statistiques (remplies pendant exécution)
         self.num_stacked = 0
         self.total_exposure = 0.0

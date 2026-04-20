@@ -1,0 +1,45 @@
+# Fichiers Python compilés
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pyc
+
+# Répertoires de travail Claude et documentation
+programmes claude/
+mode d'emploi/
+
+# Fichiers de backup
+*.bak
+*.bak_*
+*.phase*
+
+# Fichiers de logs volumineux
+*.log
+
+# Fichiers vidéo et images (peuvent être très gros)
+*.mp4
+*.h264
+*.yuv
+*.mjpeg
+*.jpg
+*.jpeg
+*.png
+*.dng
+*.ser
+*.fit
+*.fits
+
+# Répertoire de vidéos
+Videos/
+
+# Fichiers temporaires et de session
+/run/shm/*
+*.tmp
+*.temp
+session_isp_config.json
+isp_config_*.json
+
+# Archives
+_archive/
+../_archive/

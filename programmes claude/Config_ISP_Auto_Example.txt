@@ -1,0 +1,152 @@
+# Configuration exemple avec calibration automatique ISP
+# Basé sur PiLCConfig104.txt avec ajout des paramètres de calibration auto
+
+# === Paramètres caméra de base ===
+mode : 0
+speed : 0
+gain : 19
+brightness : 2
+contrast : 100
+frame : 0
+red : 13
+blue : 16
+ev : 0
+vlen : 4
+fps : 150
+vformat : 2
+codec : 5
+tinterval : 1.0
+tshots : 264
+extn : 0
+zx : 440
+zy : 290
+zoom : 0
+saturation : 10
+meter : 2
+awb : 0
+sharpness : 22
+denoise : 3
+quality : 100
+profile : 8
+level : 0
+histogram : 5
+histarea : 144
+v3_f_speed : 0
+v3_f_range : 0
+rotate : 0
+IRF : 0
+str_cap : 0
+v3_hdr : 0
+raw_format : 1
+vflip : 1
+hflip : 1
+stretch_p_low : 0
+stretch_p_high : 9998
+stretch_factor : 60
+stretch_preset : 0
+ghs_D : 31
+ghs_b : 1
+ghs_SP : 19
+ghs_LP : 0
+ghs_HP : 85
+ghs_preset : 1
+
+# === Paramètres Live Stacking ===
+ls_preview_refresh : 1
+ls_alignment_mode : 0
+ls_enable_qc : 0
+ls_max_fwhm : 170
+ls_min_sharpness : 70
+ls_max_drift : 2500
+ls_min_stars : 10
+ls_stack_method : 0
+ls_stack_kappa : 25
+ls_stack_iterations : 3
+
+# Planetary mode
+ls_planetary_enable : 0
+ls_planetary_mode : 0
+ls_planetary_disk_min : 40
+ls_planetary_disk_max : 983
+ls_planetary_threshold : 30
+ls_planetary_margin : 10
+ls_planetary_ellipse : 0
+ls_planetary_window : 1
+ls_planetary_upsample : 10
+ls_planetary_highpass : 1
+ls_planetary_roi_center : 1
+ls_planetary_corr : 30
+ls_planetary_max_shift : 100
+
+# Lucky imaging
+ls_lucky_buffer : 10
+ls_lucky_keep : 20
+ls_lucky_score : 2
+ls_lucky_stack : 0
+ls_lucky_align : 1
+ls_lucky_roi : 46
+ls_lucky_save_progress : 0
+ls_lucky_save_final : 1
+
+# Save options
+ls_save_progress : 0
+ls_save_final : 1
+
+# === Paramètres ISP (NOUVEAU) ===
+
+# Activer l'ISP pour traitement RAW
+isp_enable : 1
+
+# === CALIBRATION AUTOMATIQUE (NOUVEAUX PARAMÈTRES) ===
+
+# Méthode de calibration automatique:
+#   0 = none (désactivé, utilise config manuelle ou chargée)
+#   1 = histogram_peaks (recommandé pour astrophotographie)
+#   2 = gray_world (suppose moyenne neutre)
+isp_auto_calibrate_method : 1
+
+# Calibrer automatiquement après N frames stackées
+# Valeur recommandée: 10-20 frames
+# 0 = désactivé (jamais calibrer automatiquement)
+isp_auto_calibrate_after : 10
+
+# Recalibrer tous les N frames
+# Valeur recommandée: 50-100 frames pour sessions longues
+# 0 = désactivé (pas de recalibration périodique)
+isp_recalibrate_interval : 50
+
+# === Autres paramètres ===
+allsky_mode : 2
+allsky_mean_target : 60
+allsky_mean_threshold : 5
+allsky_video_fps : 25
+allsky_max_gain : 200
+allsky_apply_stretch : 0
+allsky_cleanup_jpegs : 1
+use_native_sensor_mode : 1
+focus_method : 0
+star_metric : 0
+snr_display : 0
+metrics_interval : 1
+
+# ============================================================
+# NOTES D'UTILISATION :
+# ============================================================
+#
+# 1. Pour activer la calibration automatique par histogrammes:
+#    - isp_enable : 1
+#    - isp_auto_calibrate_method : 1
+#    - isp_auto_calibrate_after : 10 (ou plus)
+#
+# 2. Pour des sessions courtes (< 100 frames):
+#    - isp_recalibrate_interval : 0 (pas de recalibration)
+#
+# 3. Pour des sessions longues (> 200 frames):
+#    - isp_recalibrate_interval : 50 (recalibrer tous les 50 frames)
+#
+# 4. Pour désactiver complètement la calibration auto:
+#    - isp_auto_calibrate_method : 0
+#
+# 5. Voir CALIBRATION_AUTO_ISP.md pour plus de détails
+#
+# ============================================================
