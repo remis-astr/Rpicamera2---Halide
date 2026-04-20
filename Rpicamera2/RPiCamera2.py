@@ -2401,7 +2401,8 @@ ls_scheduler_enabled = 0     # 0=OFF, 1=ON
 ls_sched_gain = 10           # Gain pour le scheduler (sans affecter preview)
 ls_sched_expo_us = 10000000  # Expo pour le scheduler (sans affecter preview)
 ls_sched_frames = 100        # Nombre de frames à stacker pour le scheduler
-ls_sched_frames_done = 0     # Compteur de frames stackées par le scheduler
+ls_sched_frames_done = 0     # Compteur de frames stackées par le scheduler (séquence en cours)
+ls_sched_start_frames = 0    # accepted_frames au début de la séquence courante
 
 # === PAVÉ NUMÉRIQUE (overlay de saisie directe) ===
 _numpad_active = 0     # 1 = overlay affiché
@@ -2546,6 +2547,14 @@ galaxy_g_gain = 100
 galaxy_b_gain = 100
 
 galaxy_save_raws = 0        # 0=OFF, 1=ON — Sauvegarder chaque frame RAW (FITS) pendant le stacking
+
+# Galaxy Scheduler
+galaxy_scheduler_enabled = 0     # 0=OFF, 1=ON
+galaxy_sched_gain = 10           # Gain pour le scheduler (sans affecter preview)
+galaxy_sched_expo_us = 10000000  # Expo pour le scheduler (sans affecter preview)
+galaxy_sched_frames = 100        # Nombre de frames à stacker pour le scheduler
+galaxy_sched_frames_done = 0     # Compteur de frames stackées par le scheduler (séquence en cours)
+galaxy_sched_start_frames = 0    # accepted_frames au début de la séquence courante
 
 # ─── Mode FICHIERS ────────────────────────────────────────────────────────────
 files_interface_mode  = 0       # 0=OFF, 1=interface active
@@ -7738,7 +7747,8 @@ def is_click_on_galaxy_zoom_slider(mx, my, screen_width, screen_height):
 
 # --- Galaxy stats bar ---
 
-def draw_galaxy_stats_bar(screen_width, screen_height, stats, is_paused=False, hdr_bits=2):
+def draw_galaxy_stats_bar(screen_width, screen_height, stats, is_paused=False, hdr_bits=2,
+                          is_scheduler=False, sched_frames=100, sched_done=0):
     """Barre de statistiques Galaxy — bas-centre."""
     global windowSurfaceObj, _font_cache
     if not stats:
@@ -7752,7 +7762,8 @@ def draw_galaxy_stats_bar(screen_width, screen_height, stats, is_paused=False, h
     rejected = stats.get('rejected_frames', 0)
     snr = stats.get('snr_gain', 1.0)
     pause_txt = "  PAUSE" if is_paused else ""
-    line = f"GALAXY HDR{hdr_bits}b: {accepted}/{total}  Rej: {rejected}  SNR: x{snr:.1f}{pause_txt}"
+    sched_txt = f"  |  Scheduler: {sched_done}/{sched_frames}" if is_scheduler and sched_frames > 0 else ""
+    line = f"GALAXY HDR{hdr_bits}b: {accepted}/{total}  Rej: {rejected}  SNR: x{snr:.1f}{sched_txt}{pause_txt}"
     bar_w = min(len(line) * 8 + 20, screen_width - 100)
     bar_h = 24
     surf = pygame.Surface((bar_w, bar_h), pygame.SRCALPHA)
@@ -7770,7 +7781,7 @@ def draw_galaxy_stats_bar(screen_width, screen_height, stats, is_paused=False, h
 def _draw_galaxy_tab_bar(panel_x, panel_w, y):
     """Dessine la barre d'onglets Galaxy (6 onglets) et retourne les rects."""
     global windowSurfaceObj, _font_cache, galaxy_settings_tab
-    tab_labels = ["Cap.", "HDR", "Stack", "Img/Str.", "Filtres", "Struct."]
+    tab_labels = ["Cap.", "HDR", "Stack", "Img/Str.", "Filtres", "Struct.", "Sched."]
     n = len(tab_labels)
     tab_h = 24
     tab_w = panel_w // n
@@ -7824,6 +7835,8 @@ def draw_galaxy_controls(screen_width, screen_height):
     global galaxy_color_enabled, galaxy_r_gain, galaxy_g_gain, galaxy_b_gain
     global ls_raw_awb_auto
     global galaxy_save_raws
+    global galaxy_scheduler_enabled, galaxy_sched_gain, galaxy_sched_expo_us
+    global galaxy_sched_frames, galaxy_sched_frames_done
 
     panel_w  = 260
     panel_m  = 10
@@ -8413,6 +8426,79 @@ def draw_galaxy_controls(screen_width, screen_height):
             galaxy_filter_n_scales, 2, 6, _cns)
         start_y += slider_h + margin
 
+    # =====================================================
+    # ONGLET 6 : Scheduler Galaxy
+    # =====================================================
+    elif galaxy_settings_tab == 6:
+        windowSurfaceObj.blit(
+            _font_cache[ck_sect].render("Scheduler Galaxy", True, (170, 140, 210)),
+            (panel_x + 2, start_y))
+        start_y += 16
+
+        control_rects['gx_scheduler_enabled'] = draw_jsk_slider(
+            panel_x, start_y, slider_w, slider_h,
+            f"Scheduler: {'ON' if galaxy_scheduler_enabled else 'OFF'}",
+            galaxy_scheduler_enabled, 0, 1, (140, 100, 190))
+        start_y += slider_h + margin + 4
+
+        if galaxy_scheduler_enabled:
+            ck18 = 18
+            if ck18 not in _font_cache:
+                _font_cache[ck18] = pygame.font.Font(None, ck18)
+            windowSurfaceObj.blit(
+                _font_cache[ck18].render("Paramètres (sans affecter preview):", True, (150, 130, 185)),
+                (panel_x + 2, start_y))
+            start_y += 15
+
+            _nb_w = 24
+            if 14 not in _font_cache:
+                _font_cache[14] = pygame.font.Font(None, 14)
+
+            def _gx_nb_btn(key, y):
+                """Dessine bouton [123] à droite du slider et stocke dans control_rects."""
+                _b = pygame.Rect(panel_x + slider_w - _nb_w, y, _nb_w, slider_h)
+                pygame.draw.rect(windowSurfaceObj, (42, 32, 58), _b, border_radius=3)
+                pygame.draw.rect(windowSurfaceObj, (100, 80, 148), _b, 1, border_radius=3)
+                _t = _font_cache[14].render("123", True, (160, 140, 210))
+                windowSurfaceObj.blit(_t, _t.get_rect(center=_b.center))
+                control_rects[key] = _b
+
+            control_rects['gx_sched_gain'] = draw_jsk_slider(
+                panel_x, start_y, slider_w - _nb_w - 2, slider_h,
+                f"Gain: {galaxy_sched_gain}", galaxy_sched_gain, 0, 300, (120, 90, 170))
+            _gx_nb_btn('num_gx_sched_gain', start_y)
+            start_y += slider_h + margin
+
+            import math as _math
+            _gsexp_s = galaxy_sched_expo_us / 1000000.0
+            _gsexp_text = f"Expo: {_gsexp_s:.1f}s" if _gsexp_s < 10 else f"Expo: {_gsexp_s:.0f}s"
+            _gsexp_c = max(100000, min(galaxy_sched_expo_us, 60000000))
+            _gsratio = (_math.log10(_gsexp_c) - _math.log10(100000)) / (_math.log10(60000000) - _math.log10(100000))
+            control_rects['gx_sched_expo'] = draw_jsk_slider(
+                panel_x, start_y, slider_w - _nb_w - 2, slider_h,
+                _gsexp_text, int(_gsratio * 1000), 0, 1000, (100, 75, 155))
+            _gx_nb_btn('num_gx_sched_expo', start_y)
+            start_y += slider_h + margin
+
+            control_rects['gx_sched_frames'] = draw_jsk_slider(
+                panel_x, start_y, slider_w - _nb_w - 2, slider_h,
+                f"Nb frames: {galaxy_sched_frames}", galaxy_sched_frames, 10, 1000, (120, 90, 170))
+            _gx_nb_btn('num_gx_sched_frames', start_y)
+            start_y += slider_h + margin + 4
+
+            ck20 = 20
+            if ck20 not in _font_cache:
+                _font_cache[ck20] = pygame.font.Font(None, ck20)
+            if galaxy_active and galaxy_sched_frames_done > 0:
+                prog = f"En cours: {galaxy_sched_frames_done}/{galaxy_sched_frames} frames"
+                windowSurfaceObj.blit(
+                    _font_cache[ck20].render(prog, True, (190, 165, 255)),
+                    (panel_x + 2, start_y))
+            else:
+                windowSurfaceObj.blit(
+                    _font_cache[ck20].render("Appuyer START pour lancer", True, (150, 130, 185)),
+                    (panel_x + 2, start_y))
+
     return control_rects
 
 
@@ -8424,6 +8510,7 @@ def draw_galaxy_interface(screen_width, screen_height):
     """
     global _galaxy_slider_rects, galaxy_settings_visible, galaxy_active, galaxy_livestack
     global galaxy_paused, galaxy_hdr_bits_clip, galaxy_binning
+    global galaxy_scheduler_enabled, galaxy_sched_frames, galaxy_sched_frames_done
 
     has_stack = False
     if galaxy_livestack is not None:
@@ -8448,7 +8535,10 @@ def draw_galaxy_interface(screen_width, screen_height):
             stats = galaxy_livestack.get_stats()
             draw_galaxy_stats_bar(screen_width, screen_height, stats,
                                   is_paused=galaxy_paused,
-                                  hdr_bits=galaxy_hdr_bits_clip)
+                                  hdr_bits=galaxy_hdr_bits_clip,
+                                  is_scheduler=bool(galaxy_scheduler_enabled),
+                                  sched_frames=galaxy_sched_frames,
+                                  sched_done=galaxy_sched_frames_done)
         except Exception:
             pass
 
@@ -8456,6 +8546,9 @@ def draw_galaxy_interface(screen_width, screen_height):
         _galaxy_slider_rects = draw_galaxy_controls(screen_width, screen_height)
     else:
         _galaxy_slider_rects = {}
+
+    if _numpad_active:
+        draw_numpad_overlay()
 
 
 # =============================================================================
@@ -9450,6 +9543,8 @@ def handle_galaxy_slider_click(mx, my, control_rects):
     global galaxy_filter_usm, galaxy_filter_star_r, galaxy_filter_star_k, galaxy_filter_n_scales
     global galaxy_save_raws
     global galaxy_pre_gradient_array
+    global galaxy_scheduler_enabled, galaxy_sched_gain, galaxy_sched_expo_us
+    global galaxy_sched_frames
 
     for name, rect in control_rects.items():
         if rect.collidepoint(mx, my):
@@ -9498,6 +9593,23 @@ def handle_galaxy_slider_click(mx, my, control_rects):
             elif name == 'gx_save_raws':
                 galaxy_save_raws = 1 if ratio > 0.5 else 0
                 print(f"[GALAXY] Sauvegarde RAW: {'ON' if galaxy_save_raws else 'OFF'}")
+            elif name == 'gx_scheduler_enabled':
+                galaxy_scheduler_enabled = 1 if ratio > 0.5 else 0
+            elif name == 'num_gx_sched_gain':
+                _open_numpad('gx_sched_gain')
+            elif name == 'num_gx_sched_expo':
+                _open_numpad('gx_sched_expo')
+            elif name == 'num_gx_sched_frames':
+                _open_numpad('gx_sched_frames')
+            elif name == 'gx_sched_gain':
+                galaxy_sched_gain = max(0, min(300, int(ratio * 300)))
+            elif name == 'gx_sched_expo':
+                import math as _math
+                _log_min = _math.log10(100000)
+                _log_max = _math.log10(60000000)
+                galaxy_sched_expo_us = int(10 ** (_log_min + ratio * (_log_max - _log_min)))
+            elif name == 'gx_sched_frames':
+                galaxy_sched_frames = max(10, min(1000, int(ratio * 990) + 10))
 
             # --- Tab 1: HDR ---
             elif name == 'gx_hdr_clip':
@@ -9755,6 +9867,7 @@ def _open_numpad(target):
     """Ouvre le pavé numérique pour saisir la valeur du paramètre target."""
     global _numpad_active, _numpad_target, _numpad_input
     global tinterval, tshots, ls_sched_gain, ls_sched_expo_us, ls_sched_frames
+    global galaxy_sched_gain, galaxy_sched_expo_us, galaxy_sched_frames
     _numpad_active = 1
     _numpad_target = target
     # Pré-remplir avec la valeur actuelle en unités affichées
@@ -9768,6 +9881,12 @@ def _open_numpad(target):
         _numpad_input = str(int(ls_sched_expo_us / 1000))  # µs → ms
     elif target == 'ls_sched_frames':
         _numpad_input = str(int(ls_sched_frames))
+    elif target == 'gx_sched_gain':
+        _numpad_input = str(int(galaxy_sched_gain))
+    elif target == 'gx_sched_expo':
+        _numpad_input = str(int(galaxy_sched_expo_us / 1000))  # µs → ms
+    elif target == 'gx_sched_frames':
+        _numpad_input = str(int(galaxy_sched_frames))
     else:
         _numpad_input = ''
 
@@ -9806,6 +9925,9 @@ def draw_numpad_overlay():
         'ls_sched_gain':   'Gain scheduler',
         'ls_sched_expo':   'Expo scheduler (ms)',
         'ls_sched_frames': 'Nb frames scheduler',
+        'gx_sched_gain':   'Gain scheduler Galaxy',
+        'gx_sched_expo':   'Expo scheduler Galaxy (ms)',
+        'gx_sched_frames': 'Nb frames scheduler Galaxy',
     }
     _LIMITS = {
         'cfg_tinterval':   (100,   3600000),
@@ -9813,6 +9935,9 @@ def draw_numpad_overlay():
         'ls_sched_gain':   (0,     300),
         'ls_sched_expo':   (100,   60000),
         'ls_sched_frames': (10,    1000),
+        'gx_sched_gain':   (0,     300),
+        'gx_sched_expo':   (100,   60000),
+        'gx_sched_frames': (10,    1000),
     }
     label = _LABELS.get(_numpad_target, _numpad_target or '?')
     windowSurfaceObj.blit(
@@ -9879,6 +10004,7 @@ def handle_numpad_click(mx, my):
     """Traite un clic sur le pavé numérique. Retourne True si clic consommé."""
     global _numpad_active, _numpad_target, _numpad_input, _numpad_rects
     global tinterval, tshots, ls_sched_gain, ls_sched_expo_us, ls_sched_frames
+    global galaxy_sched_gain, galaxy_sched_expo_us, galaxy_sched_frames
 
     for key, r in _numpad_rects.items():
         if not r.collidepoint(mx, my):
@@ -9900,6 +10026,9 @@ def handle_numpad_click(mx, my):
                     'ls_sched_gain':   (0,    300),
                     'ls_sched_expo':   (100,  60000),
                     'ls_sched_frames': (10,   1000),
+                    'gx_sched_gain':   (0,    300),
+                    'gx_sched_expo':   (100,  60000),
+                    'gx_sched_frames': (10,   1000),
                 }
                 lo, hi = _LIMITS.get(_numpad_target, (0, 999999))
                 v = max(lo, min(hi, v))
@@ -9913,6 +10042,12 @@ def handle_numpad_click(mx, my):
                     ls_sched_expo_us = int(v * 1000 + 0.5)  # ms → µs
                 elif _numpad_target == 'ls_sched_frames':
                     ls_sched_frames = int(v + 0.5)
+                elif _numpad_target == 'gx_sched_gain':
+                    galaxy_sched_gain = int(v + 0.5)
+                elif _numpad_target == 'gx_sched_expo':
+                    galaxy_sched_expo_us = int(v * 1000 + 0.5)  # ms → µs
+                elif _numpad_target == 'gx_sched_frames':
+                    galaxy_sched_frames = int(v + 0.5)
                 save_config_to_file()
             except (ValueError, ZeroDivisionError):
                 pass
@@ -20148,6 +20283,24 @@ while True:
                 else:
                     windowSurfaceObj.fill((0, 0, 0))
 
+                # Arrêt automatique scheduler Galaxy → mise en pause
+                if galaxy_active and galaxy_scheduler_enabled and galaxy_sched_frames > 0 \
+                        and galaxy_livestack is not None:
+                    try:
+                        _gx_stats = galaxy_livestack.get_stats()
+                        galaxy_sched_frames_done = _gx_stats.get('accepted_frames', 0) - galaxy_sched_start_frames
+                        if galaxy_sched_frames_done >= galaxy_sched_frames:
+                            galaxy_active = False
+                            galaxy_paused = True
+                            galaxy_last_filtered_array = None
+                            galaxy_livestack.pause()
+                            apply_controls_immediately(
+                                gain_value=galaxy_gain if galaxy_gain > 0 else None,
+                                exposure_time=galaxy_exposure_us)
+                            print(f"[GALAXY SCHEDULER] {galaxy_sched_frames} frames stackées — mise en pause automatique")
+                    except Exception:
+                        pass
+
                 draw_galaxy_interface(max_width, max_height)
                 pygame.display.update()
 
@@ -20641,18 +20794,18 @@ while True:
                                 stats_text = f"LiveStack: {stats['accepted_frames']}/{stats['total_frames']} | Rejected: {stats['rejected_frames']}"
                                 text(0, 0, 2, 2, 1, stats_text, ft, 1)
 
-                            # Arrêt automatique scheduler
+                            # Arrêt automatique scheduler → mise en pause
                             if ls_scheduler_enabled and ls_sched_frames > 0:
-                                ls_sched_frames_done = stats.get('accepted_frames', 0)
+                                ls_sched_frames_done = stats.get('accepted_frames', 0) - ls_sched_start_frames
                                 if ls_sched_frames_done >= ls_sched_frames:
                                     livestack_active = False
-                                    livestack.stop()
-                                    if hasattr(pygame, '_ls_raw_save_queue'):
-                                        pygame._ls_raw_save_queue.put(None)
-                                        del pygame._ls_raw_save_queue
-                                        if hasattr(pygame, '_ls_prev_accepted'):
-                                            del pygame._ls_prev_accepted
-                                    print(f"[SCHEDULER] {ls_sched_frames} frames stackées — arrêt automatique")
+                                    ls_paused = True
+                                    ls_last_filtered_array = None
+                                    livestack.pause()
+                                    apply_controls_immediately(
+                                        gain_value=ls_gain if ls_gain > 0 else None,
+                                        exposure_time=ls_exposure_us)
+                                    print(f"[SCHEDULER] {ls_sched_frames} frames stackées — mise en pause automatique")
 
                             # PNG intermédiaire
                             accepted = stats['accepted_frames']
@@ -22578,11 +22731,20 @@ while True:
                     galaxy_paused = False
                     if galaxy_livestack is not None:
                         galaxy_livestack.resume()
-                    apply_controls_immediately(
-                        gain_value=galaxy_gain if galaxy_gain > 0 else None,
-                        exposure_time=galaxy_exposure_us)
+                    if galaxy_scheduler_enabled:
+                        # Nouvelle séquence scheduler sur le stack en cours
+                        galaxy_sched_start_frames = galaxy_livestack.get_stats().get('accepted_frames', 0) if galaxy_livestack is not None else 0
+                        galaxy_sched_frames_done = 0
+                        apply_controls_immediately(
+                            gain_value=galaxy_sched_gain if galaxy_sched_gain > 0 else None,
+                            exposure_time=galaxy_sched_expo_us)
+                    else:
+                        apply_controls_immediately(
+                            gain_value=galaxy_gain if galaxy_gain > 0 else None,
+                            exposure_time=galaxy_exposure_us)
                     galaxy_active = True
-                    print("[GALAXY] Stack REPRIS")
+                    _gx_resume_str = f" [Scheduler: nouvelle séquence {galaxy_sched_frames} frames]" if galaxy_scheduler_enabled else ""
+                    print(f"[GALAXY] Stack REPRIS{_gx_resume_str}")
                 continue
 
             # RESET
@@ -22598,6 +22760,8 @@ while True:
                 galaxy_pre_filter_array = None
                 galaxy_pre_stretch_array = None
                 galaxy_pre_gradient_array = None
+                galaxy_sched_frames_done = 0
+                galaxy_sched_start_frames = 0
                 if hasattr(pygame, '_gx_proc'):
                     pygame._gx_proc['last_display'] = None
                 print("[GALAXY] Session réinitialisée")
@@ -22610,11 +22774,21 @@ while True:
                     galaxy_active = False
                     if galaxy_livestack is not None:
                         galaxy_livestack.stop()
+                    if galaxy_scheduler_enabled:
+                        apply_controls_immediately(
+                            gain_value=galaxy_gain if galaxy_gain > 0 else None,
+                            exposure_time=galaxy_exposure_us)
                     print("[GALAXY] Stack arrêté")
                 else:
                     # START — créer et configurer la session
-                    _cam_expo = galaxy_exposure_us
-                    _cam_gain = galaxy_gain
+                    if galaxy_scheduler_enabled:
+                        _cam_expo = galaxy_sched_expo_us
+                        _cam_gain = galaxy_sched_gain
+                    else:
+                        _cam_expo = galaxy_exposure_us
+                        _cam_gain = galaxy_gain
+                    galaxy_sched_frames_done = 0
+                    galaxy_sched_start_frames = 0
                     if use_picamera2 and picam2 is not None:
                         try:
                             picam2.set_controls({
@@ -22681,7 +22855,8 @@ while True:
                     if hasattr(pygame, '_gx_proc'):
                         pygame._gx_proc['vmax_ema'] = 0.0
                         pygame._gx_proc['raw_save_count'] = 0
-                    print("[GALAXY] Stack démarré (HDR LiveStack)")
+                    _gx_sched_str = f" [Scheduler: {galaxy_sched_frames} frames]" if galaxy_scheduler_enabled else ""
+                    print(f"[GALAXY] Stack démarré (HDR LiveStack){_gx_sched_str}")
                 continue
 
             # BINNING toggle
@@ -23101,14 +23276,23 @@ while True:
                     ls_paused = False
                     if livestack is not None:
                         livestack.resume()
-                    apply_controls_immediately(
-                        gain_value=ls_gain if ls_gain > 0 else None,
-                        exposure_time=ls_exposure_us)
-                    # Mettre à jour la cible d'exposition du guard (l'expo a peut-être changé en pause)
-                    pygame._ls_target_exposure_us = ls_exposure_us
+                    if ls_scheduler_enabled:
+                        # Nouvelle séquence scheduler sur le stack en cours
+                        ls_sched_start_frames = livestack.get_stats().get('accepted_frames', 0) if livestack is not None else 0
+                        ls_sched_frames_done = 0
+                        apply_controls_immediately(
+                            gain_value=ls_sched_gain if ls_sched_gain > 0 else None,
+                            exposure_time=ls_sched_expo_us)
+                        pygame._ls_target_exposure_us = ls_sched_expo_us
+                    else:
+                        apply_controls_immediately(
+                            gain_value=ls_gain if ls_gain > 0 else None,
+                            exposure_time=ls_exposure_us)
+                        pygame._ls_target_exposure_us = ls_exposure_us
                     pygame._ls_exposure_skip_count = 0
                     livestack_active = True
-                    print("[LS INTERFACE] Stack REPRIS")
+                    _ls_resume_str = f" [Scheduler: nouvelle séquence {ls_sched_frames} frames]" if ls_scheduler_enabled else ""
+                    print(f"[LS INTERFACE] Stack REPRIS{_ls_resume_str}")
                 continue
 
             # RESET → réinitialiser la session de stacking
@@ -23128,6 +23312,7 @@ while True:
                 if livestack is not None:
                     livestack.reset()
                 ls_sched_frames_done = 0
+                ls_sched_start_frames = 0
                 for _attr in ['_livestack_last_saved', '_livestack_display_info_shown', '_ls_prev_accepted']:
                     if hasattr(pygame, _attr):
                         delattr(pygame, _attr)
@@ -23208,6 +23393,7 @@ while True:
                             exposure_time=_cam_expo)
 
                     ls_sched_frames_done = 0
+                    ls_sched_start_frames = 0
                     for _attr in ['_livestack_last_saved', '_livestack_display_info_shown',
                                   '_stacking_mode_shown']:
                         if hasattr(pygame, _attr):
