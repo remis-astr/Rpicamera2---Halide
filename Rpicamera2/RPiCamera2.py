@@ -363,6 +363,18 @@ def apply_controls_immediately(exposure_time=None, gain_value=None):
     global picam2, Pi_Cam, max_shutters
     global custom_sspeed, sspeed, gain
 
+    # MiniCam mode : router vers le contrôleur distant
+    if minicam_mode and _minicam_controller is not None:
+        try:
+            if gain_value is not None:
+                _minicam_controller.set_gain(float(gain_value))
+            if exposure_time is not None:
+                _minicam_controller.set_exposure_ms(exposure_time / 1000.0)
+            return True
+        except Exception as _mce:
+            print(f"[MiniCam] apply_controls_immediately: {_mce}")
+        return False
+
     if not use_picamera2 or picam2 is None:
         return False
 
@@ -2196,6 +2208,54 @@ sun_false_color_names = ['None', 'Hot', 'Viridis', 'Inferno']
 sun_align_names = ['Off', 'Disque', 'Surface']
 sun_settings_tab = 0        # 0=Acquisition/Disque, 1=Sharpening/Affichage
 
+# MINICAM Settings
+minicam_mode = 0              # 0=OFF, 1=Active
+minicam_connected = False     # True si connexion WebSocket établie
+minicam_transport = 'usb'    # 'usb' ou 'wifi'
+minicam_wifi_ip = 'rpi0.local'     # Hostname mDNS du Pi0 (USB toujours 192.168.7.2)
+_minicam_connecting = False         # Guard anti-double-thread connexion
+minicam_settings_visible = 0  # 0=Masqué, 1=Affiché
+minicam_status = 'Déconnecté'
+minicam_latency_ms = 0.0
+minicam_gain = 8.0            # Gain IMX462 (1.0–64.0)
+minicam_exposure_us = 6600    # Exposition en µs
+_minicam_controller = None    # MiniCamController instance
+_minicam_capture_thread = None  # MiniCamCaptureThread instance
+_minicam_preview_surface = None  # pygame.Surface du dernier JPEG reçu
+_minicam_preview_thread = None
+_minicam_preview_running = False
+_minicam_slider_rects = {}
+_minicam_ge_dragging = None   # 'gain' ou 'expo'
+_minicam_slider_dragging = False
+_minicam_ip_editing = False   # True si le champ IP WiFi est en édition
+_minicam_snap_surface = None  # Dernière frame BGR pour SNAP
+_minicam_ui_rects = {}        # Rects retournés par draw_minicam_fullscreen()
+
+# MiniCam Plate Solve / Push-To
+minicam_solve_mode = 0          # 0=inactif, 1=overlay visible
+minicam_focal_mm = 50.0         # Focale en mm (25–600)
+minicam_pixel_um = 2.9          # Taille pixel µm (IMX462)
+minicam_solve_result = None     # Dernier SolveResult (ou None)
+minicam_solve_running = False   # True pendant un solve en cours
+_minicam_solve_thread = None    # Thread du plate solving
+_minicam_solver = None          # Instance PlateSolver active (pour cancel)
+_minicam_solve_cancelled = False  # Mis à True pour interrompre le thread de solve
+minicam_target_ra = None        # RA cible J2000 (degrés) via Stellarium
+minicam_target_dec = None       # Dec cible J2000 (degrés)
+minicam_target_name = ""        # Nom de la cible (affiché en push-to)
+minicam_stellarium_host = "192.168.1.100:8090"  # host:port du laptop Stellarium
+_minicam_stellarium_ip_editing = False  # True si saisie IP Stellarium active
+minicam_pushto_active = False   # Mode push-to activé
+_minicam_focal_dragging = False  # Drag du slider focale en cours
+minicam_solve_max_stars = 200    # Nb max étoiles ASTAP (50-500) — contrôle implicite magnitude
+_minicam_stars_dragging = False  # Drag du slider stars en cours
+obs_lat_deg = 47.312            # Latitude observateur (degrés, N+)
+obs_lon_deg = 0.482             # Longitude observateur (degrés, E+)
+_minicam_lx200_server = None    # Instance LX200Server (actif si solve_mode=1)
+_minicam_solve_fn = None        # Référence à _minicam_do_solve (pour push-to button + on_goto)
+_minicam_last_good_solve = None  # Dernier solve réussi — conservé même si un solve ultérieur échoue
+minicam_lx200_port = 4030       # Port LX200 (Stellarium Mobile → RPi)
+
 # COLLIMATION Settings
 collimation_mode = 0              # 0=OFF, 1=Active
 collimation_detector = None       # Instance CollimationDetector
@@ -2299,6 +2359,7 @@ _lucky_ge_dragging = None    # 'gain', 'expo', 'zoom' ou None
 lucky_raw_interface_mode = 0   # 0=OFF, 1=Interface active (RAW Bayer)
 lucky_raw_active = False       # True = stacking RAW Bayer en cours
 raw_lucky_stacker = None       # Instance BayerLuckyStacker
+_lucky_enter_time = 0.0        # Timestamp entrée dans Lucky interface (anti-exit immédiat)
 
 # === HOME SCREEN NOUVELLE INTERFACE ===
 home_settings_visible = 0    # Panneau réglages affiché (0=masqué, 1=visible)
@@ -13597,11 +13658,11 @@ def draw_home_left_modes(sw, sh):
 
 
 def draw_home_right_modes(sw, sh):
-    """Dessine les 4 boutons de modes sur le bord droit."""
+    """Dessine les 5 boutons de modes sur le bord droit."""
     global windowSurfaceObj, _font_cache
     rects = {}
     btn_w, btn_h, step = 78, 32, 42
-    start_y = sh // 2 - (4 * btn_h + 3 * (step - btn_h)) // 2
+    start_y = sh // 2 - (5 * btn_h + 4 * (step - btn_h)) // 2
 
     ck = 18
     if ck not in _font_cache:
@@ -13609,10 +13670,11 @@ def draw_home_right_modes(sw, sh):
     f = _font_cache[ck]
 
     modes = [
-        ('mode_jsk',   "JSK",   "LIVE",  (80, 60, 40)),
-        ('mode_sun',   "SUN",   "",      (100, 80, 30)),
-        ('mode_moon',  "MOON",  "",      (40, 60, 100)),
-        ('mode_colim', "COLIM", "",      (60, 80, 60)),
+        ('mode_jsk',     "JSK",   "LIVE",  (80, 60, 40)),
+        ('mode_sun',     "SUN",   "",      (100, 80, 30)),
+        ('mode_moon',    "MOON",  "",      (40, 60, 100)),
+        ('mode_colim',   "COLIM", "",      (60, 80, 60)),
+        ('mode_minicam', "MINI",  "CAM",   (20, 80, 80)),
     ]
     for i, (key, line1, line2, bg) in enumerate(modes):
         bx = sw - btn_w - 5
@@ -14475,7 +14537,7 @@ def handle_home_click(mx, my):
     global collimation_circle_enabled, collimation_circle_min_pct, collimation_circle_max_pct
     global picam2, capture_thread, custom_sspeed, sspeed, restart
     global focus_gain, focus_exposure_us, focus_zoom_focus
-    global lucky_raw_interface_mode, lucky_raw_active, raw_lucky_stacker
+    global lucky_raw_interface_mode, lucky_raw_active, raw_lucky_stacker, _lucky_enter_time
     global galaxy_interface_mode, galaxy_settings_visible, galaxy_active, galaxy_livestack
     global galaxy_saved_gain, galaxy_saved_exposure, galaxy_saved_zoom
     global galaxy_saved_vwidth, galaxy_saved_vheight, galaxy_saved_use_native
@@ -14487,6 +14549,19 @@ def handle_home_click(mx, my):
     global files_livestack, files_last_filtered_array, files_pre_filter_array, files_pre_stretch_array
     global files_pre_gradient_array
     global files_browser_scroll
+    global minicam_mode, minicam_connected, minicam_transport, minicam_wifi_ip
+    global minicam_settings_visible, minicam_status, minicam_latency_ms
+    global minicam_gain, minicam_exposure_us
+    global _minicam_controller, _minicam_capture_thread
+    global _minicam_preview_surface, _minicam_preview_thread, _minicam_preview_running
+    global _minicam_slider_rects, _minicam_ge_dragging, _minicam_slider_dragging
+    global _minicam_ip_editing, _minicam_snap_surface, _minicam_ui_rects
+    global minicam_solve_mode, minicam_focal_mm, minicam_pixel_um
+    global minicam_solve_result, minicam_solve_running, _minicam_solve_thread, _minicam_solver, _minicam_solve_cancelled
+    global _minicam_lx200_server, minicam_lx200_port
+    global minicam_target_ra, minicam_target_dec, minicam_target_name
+    global minicam_stellarium_host, _minicam_stellarium_ip_editing
+    global minicam_pushto_active, _minicam_focal_dragging
 
     import math
 
@@ -14767,11 +14842,13 @@ def handle_home_click(mx, my):
 
         elif key == 'mode_lucky_raw':
             if not lucky_raw_active and lucky_raw_interface_mode == 0 and lucky_interface_mode == 0:
+                import time as _lrt
                 stretch_mode = 1
                 display_modes = pygame.display.list_modes()
                 _mw, _mh = display_modes[0] if display_modes and display_modes != -1 else (1024, 600)
                 windowSurfaceObj = pygame.display.set_mode((_mw, _mh), pygame.FULLSCREEN, 24)
                 lucky_raw_interface_mode = 1
+                _lucky_enter_time = _lrt.time()
                 lucky_recorder = JSKVideoRecorder()
                 if raw_format < 2:
                     raw_format = 2   # Forcer RAW12
@@ -15013,6 +15090,18 @@ def handle_home_click(mx, my):
             pygame.display.update()
             restart = 1
             print(f"[HOME] Mode COLLIMATION activé (zoom=0, gain={collimation_gain})")
+            return True
+
+        elif key == 'mode_minicam':
+            minicam_mode = 1
+            minicam_settings_visible = 1  # Ouvrir le panneau par défaut
+            _minicam_snap_surface = None
+            display_modes = pygame.display.list_modes()
+            _mw, _mh = display_modes[0] if display_modes and display_modes != -1 else (1024, 600)
+            windowSurfaceObj = pygame.display.set_mode((_mw, _mh), pygame.FULLSCREEN, 24)
+            windowSurfaceObj.fill((0, 0, 0))
+            pygame.display.update()
+            print("[HOME] Mode MINICAM activé")
             return True
 
     # --- Barre d'action bas ---
@@ -16487,6 +16576,885 @@ def handle_sun_slider_click(mx, my, control_rects):
 
 # ============================================================================
 # FIN SOLAR WHITE LIGHT FULLSCREEN CONTROLS
+# ============================================================================
+
+
+# ============================================================================
+# MINICAM FULLSCREEN CONTROLS
+# ============================================================================
+
+def _minicam_ge_slider_positions(panel_x, panel_w):
+    """Retourne les positions des sliders gain/expo dans le panneau MiniCam."""
+    x = panel_x + 10
+    w = panel_w - 20
+    return {
+        'minicam_gain': pygame.Rect(x, 80, w, 20),
+        'minicam_expo': pygame.Rect(x, 130, w, 20),
+    }
+
+
+def draw_minicam_settings_icon(screen_width, screen_height, is_active):
+    """Icône engrenage ouvre/ferme le panneau de réglages."""
+    global windowSurfaceObj, _font_cache
+    sz = 40
+    x = screen_width - sz - 8
+    y = screen_height - sz - 8
+    color = (0, 180, 180) if is_active else (60, 120, 120)
+    r = pygame.Rect(x, y, sz, sz)
+    pygame.draw.rect(windowSurfaceObj, color, r, border_radius=6)
+    pygame.draw.rect(windowSurfaceObj, (100, 200, 200), r, 1, border_radius=6)
+    ck = 22
+    if ck not in _font_cache:
+        _font_cache[ck] = pygame.font.Font(None, ck)
+    f = _font_cache[ck]
+    lbl = f.render("SET", True, (220, 220, 220))
+    windowSurfaceObj.blit(lbl, lbl.get_rect(center=r.center))
+    return r
+
+
+def draw_minicam_exit_button(screen_width, screen_height):
+    """Bouton EXIT pour quitter le mode MiniCam."""
+    global windowSurfaceObj, _font_cache
+    w, h = 70, 28
+    x = screen_width - w - 8
+    y = 8
+    r = pygame.Rect(x, y, w, h)
+    pygame.draw.rect(windowSurfaceObj, (100, 30, 30), r, border_radius=5)
+    pygame.draw.rect(windowSurfaceObj, (180, 60, 60), r, 1, border_radius=5)
+    ck = 20
+    if ck not in _font_cache:
+        _font_cache[ck] = pygame.font.Font(None, ck)
+    f = _font_cache[ck]
+    lbl = f.render("EXIT", True, (220, 180, 180))
+    windowSurfaceObj.blit(lbl, lbl.get_rect(center=r.center))
+    return r
+
+
+def draw_minicam_snap_button(screen_width, screen_height):
+    """Bouton capture image unique."""
+    global windowSurfaceObj, _font_cache
+    w, h = 80, 28
+    x = screen_width - w - 90
+    y = 8
+    r = pygame.Rect(x, y, w, h)
+    pygame.draw.rect(windowSurfaceObj, (30, 80, 80), r, border_radius=5)
+    pygame.draw.rect(windowSurfaceObj, (60, 160, 160), r, 1, border_radius=5)
+    ck = 20
+    if ck not in _font_cache:
+        _font_cache[ck] = pygame.font.Font(None, ck)
+    f = _font_cache[ck]
+    lbl = f.render("SNAP", True, (180, 220, 220))
+    windowSurfaceObj.blit(lbl, lbl.get_rect(center=r.center))
+    return r
+
+
+def draw_minicam_mode_buttons(screen_width, screen_height):
+    """Dessine les 4 boutons de mode sur le côté gauche (LIVE STACK / GALAXY / LUCKY RAW / SOLVE)."""
+    global windowSurfaceObj, _font_cache, minicam_solve_mode
+    rects = {}
+    btn_w, btn_h, step = 78, 32, 42
+    # Centré verticalement pour 4 boutons
+    start_y = screen_height // 2 - (4 * btn_h + 3 * (step - btn_h)) // 2
+    ck = 18
+    if ck not in _font_cache:
+        _font_cache[ck] = pygame.font.Font(None, ck)
+    f = _font_cache[ck]
+    buttons = [
+        ('minicam_livestack', "LIVE",  "STACK", (40, 80, 60)),
+        ('minicam_galaxy',    "GALAXY","",       (60, 40, 80)),
+        ('minicam_lucky',     "LUCKY", "RAW",    (80, 60, 20)),
+        ('minicam_solve',     "SOLVE", "",        (15, 50, 80)),
+    ]
+    for i, (key, line1, line2, bg) in enumerate(buttons):
+        bx = 5
+        by = start_y + i * step
+        r = pygame.Rect(bx, by, btn_w, btn_h)
+        # Le bouton SOLVE est surligné quand le mode est actif
+        active = (key == 'minicam_solve' and minicam_solve_mode == 1)
+        alpha = 240 if active else 200
+        s = pygame.Surface((btn_w, btn_h), pygame.SRCALPHA)
+        s.fill((*bg, alpha))
+        windowSurfaceObj.blit(s, (bx, by))
+        border_col = (0, 180, 255) if active else (min(bg[0]+40,255), min(bg[1]+40,255), min(bg[2]+40,255))
+        border_w = 2 if active else 1
+        pygame.draw.rect(windowSurfaceObj, border_col, r, border_w, border_radius=5)
+        if line2:
+            l1 = f.render(line1, True, (230, 230, 230))
+            l2 = f.render(line2, True, (200, 200, 200))
+            windowSurfaceObj.blit(l1, l1.get_rect(centerx=r.centerx, centery=by + btn_h//2 - 8))
+            windowSurfaceObj.blit(l2, l2.get_rect(centerx=r.centerx, centery=by + btn_h//2 + 8))
+        else:
+            text_col = (100, 210, 255) if active else (230, 230, 230)
+            l1 = f.render(line1, True, text_col)
+            windowSurfaceObj.blit(l1, l1.get_rect(center=r.center))
+        rects[key] = r
+    return rects
+
+
+def draw_minicam_gain_exposure(screen_width, screen_height, panel_x, panel_w):
+    """Dessine les sliders gain et exposition MiniCam dans le panneau."""
+    global windowSurfaceObj, _font_cache, minicam_gain, minicam_exposure_us, _minicam_slider_rects
+    ck = 18
+    if ck not in _font_cache:
+        _font_cache[ck] = pygame.font.Font(None, ck)
+    f = _font_cache[ck]
+
+    sliders = _minicam_ge_slider_positions(panel_x, panel_w)
+
+    # Gain (1.0 – 64.0, log scale)
+    import math as _math
+    r_g = sliders['minicam_gain']
+    gain_log_min, gain_log_max = _math.log(1.0), _math.log(64.0)
+    gain_frac = (_math.log(max(1.0, minicam_gain)) - gain_log_min) / (gain_log_max - gain_log_min)
+    pygame.draw.rect(windowSurfaceObj, (40, 60, 60), r_g, border_radius=3)
+    filled_w = int(r_g.w * gain_frac)
+    if filled_w > 0:
+        pygame.draw.rect(windowSurfaceObj, (0, 160, 160),
+                         pygame.Rect(r_g.x, r_g.y, filled_w, r_g.h), border_radius=3)
+    pygame.draw.rect(windowSurfaceObj, (80, 140, 140), r_g, 1, border_radius=3)
+    lbl = f.render(f"Gain: {minicam_gain:.1f}×", True, (200, 230, 230))
+    windowSurfaceObj.blit(lbl, (r_g.x, r_g.y - 16))
+    _minicam_slider_rects['minicam_gain'] = r_g
+
+    # Exposition (0.1 – 30000 ms, log scale)
+    r_e = sliders['minicam_expo']
+    expo_ms = minicam_exposure_us / 1000.0
+    expo_log_min, expo_log_max = _math.log(0.1), _math.log(30000.0)
+    expo_frac = (_math.log(max(0.1, expo_ms)) - expo_log_min) / (expo_log_max - expo_log_min)
+    pygame.draw.rect(windowSurfaceObj, (40, 60, 60), r_e, border_radius=3)
+    filled_w = int(r_e.w * expo_frac)
+    if filled_w > 0:
+        pygame.draw.rect(windowSurfaceObj, (0, 140, 160),
+                         pygame.Rect(r_e.x, r_e.y, filled_w, r_e.h), border_radius=3)
+    pygame.draw.rect(windowSurfaceObj, (80, 130, 140), r_e, 1, border_radius=3)
+    if expo_ms >= 1000:
+        expo_str = f"{expo_ms/1000:.2f}s"
+    elif expo_ms >= 1:
+        expo_str = f"{expo_ms:.0f}ms"
+    else:
+        expo_str = f"{expo_ms:.1f}ms"
+    lbl = f.render(f"Expo: {expo_str}", True, (200, 220, 230))
+    windowSurfaceObj.blit(lbl, (r_e.x, r_e.y - 16))
+    _minicam_slider_rects['minicam_expo'] = r_e
+
+
+def draw_minicam_panel(screen_width, screen_height):
+    """Panneau droit : connexion, statut, sliders gain/expo."""
+    global windowSurfaceObj, _font_cache
+    global minicam_connected, minicam_transport, minicam_wifi_ip, minicam_status
+    global minicam_latency_ms, minicam_gain, minicam_exposure_us
+    global _minicam_slider_rects, _minicam_ip_editing
+
+    panel_w = 200
+    panel_x = screen_width - panel_w - 55
+    panel_h = screen_height - 60
+    panel_y = 44
+
+    s = pygame.Surface((panel_w, panel_h), pygame.SRCALPHA)
+    s.fill((15, 30, 30, 210))
+    windowSurfaceObj.blit(s, (panel_x, panel_y))
+    pygame.draw.rect(windowSurfaceObj, (40, 100, 100),
+                     pygame.Rect(panel_x, panel_y, panel_w, panel_h), 1, border_radius=6)
+
+    ck18 = 18
+    ck16 = 16
+    if ck18 not in _font_cache:
+        _font_cache[ck18] = pygame.font.Font(None, ck18)
+    if ck16 not in _font_cache:
+        _font_cache[ck16] = pygame.font.Font(None, ck16)
+    f18 = _font_cache[ck18]
+    f16 = _font_cache[ck16]
+
+    rects = {}
+    y = panel_y + 10
+
+    # Titre
+    title = f18.render("MINI CAM", True, (0, 200, 200))
+    windowSurfaceObj.blit(title, title.get_rect(centerx=panel_x + panel_w//2, y=y))
+    y += 22
+
+    # Sélecteur transport USB / WiFi
+    for i, (label, val) in enumerate([("USB", "usb"), ("WiFi", "wifi")]):
+        bx = panel_x + 10 + i * 90
+        br = pygame.Rect(bx, y, 80, 22)
+        active = (minicam_transport == val)
+        bg = (0, 100, 100) if active else (30, 50, 50)
+        pygame.draw.rect(windowSurfaceObj, bg, br, border_radius=4)
+        pygame.draw.rect(windowSurfaceObj, (60, 160, 160), br, 1, border_radius=4)
+        lbl = f16.render(label, True, (220, 220, 220) if active else (140, 160, 160))
+        windowSurfaceObj.blit(lbl, lbl.get_rect(center=br.center))
+        rects[f'minicam_transport_{val}'] = br
+    y += 30
+
+    # Champ IP (WiFi uniquement)
+    if minicam_transport == 'wifi':
+        ip_r = pygame.Rect(panel_x + 10, y, panel_w - 20, 22)
+        border_col = (0, 200, 200) if _minicam_ip_editing else (60, 120, 120)
+        pygame.draw.rect(windowSurfaceObj, (20, 40, 40), ip_r, border_radius=3)
+        pygame.draw.rect(windowSurfaceObj, border_col, ip_r, 1, border_radius=3)
+        ip_lbl = f16.render(minicam_wifi_ip, True, (200, 230, 230))
+        windowSurfaceObj.blit(ip_lbl, ip_lbl.get_rect(midleft=(ip_r.x + 4, ip_r.centery)))
+        rects['minicam_ip_field'] = ip_r
+        y += 30
+
+    # Bouton Connect / Disconnect
+    btn_label = "DISCONNECT" if minicam_connected else "CONNECT"
+    btn_col = (80, 30, 30) if minicam_connected else (20, 80, 40)
+    conn_r = pygame.Rect(panel_x + 10, y, panel_w - 20, 26)
+    pygame.draw.rect(windowSurfaceObj, btn_col, conn_r, border_radius=5)
+    pygame.draw.rect(windowSurfaceObj, (100, 180, 100), conn_r, 1, border_radius=5)
+    lbl = f18.render(btn_label, True, (220, 220, 220))
+    windowSurfaceObj.blit(lbl, lbl.get_rect(center=conn_r.center))
+    rects['minicam_connect_btn'] = conn_r
+    y += 36
+
+    # Statut
+    status_col = (0, 200, 100) if minicam_connected else (180, 80, 80)
+    st_lbl = f16.render(minicam_status, True, status_col)
+    windowSurfaceObj.blit(st_lbl, (panel_x + 10, y))
+    y += 18
+    if minicam_connected and minicam_latency_ms > 0:
+        lat_lbl = f16.render(f"Latence: {minicam_latency_ms:.0f}ms", True, (160, 200, 160))
+        windowSurfaceObj.blit(lat_lbl, (panel_x + 10, y))
+    y += 24
+
+    # Séparateur
+    pygame.draw.line(windowSurfaceObj, (40, 80, 80),
+                     (panel_x + 10, y), (panel_x + panel_w - 10, y))
+    y += 10
+
+    # Sliders gain/expo (positionnés dans l'espace restant du panneau)
+    # Recalculate positions relative to panel
+    sliders_offset_y = y - panel_y
+    old_rects = _minicam_slider_rects.copy() if _minicam_slider_rects else {}
+
+    import math as _math
+    ck18b = 18
+
+    # Gain
+    r_g = pygame.Rect(panel_x + 10, panel_y + sliders_offset_y + 16, panel_w - 20, 18)
+    gain_log_min, gain_log_max = _math.log(1.0), _math.log(64.0)
+    gain_frac = (_math.log(max(1.0, minicam_gain)) - gain_log_min) / (gain_log_max - gain_log_min)
+    pygame.draw.rect(windowSurfaceObj, (40, 60, 60), r_g, border_radius=3)
+    filled_w = int(r_g.w * gain_frac)
+    if filled_w > 0:
+        pygame.draw.rect(windowSurfaceObj, (0, 160, 160),
+                         pygame.Rect(r_g.x, r_g.y, filled_w, r_g.h), border_radius=3)
+    pygame.draw.rect(windowSurfaceObj, (80, 140, 140), r_g, 1, border_radius=3)
+    gain_lbl = f16.render(f"Gain {minicam_gain:.1f}×", True, (180, 220, 220))
+    windowSurfaceObj.blit(gain_lbl, (r_g.x, r_g.y - 14))
+    _minicam_slider_rects['minicam_gain'] = r_g
+
+    # Expo
+    r_e = pygame.Rect(panel_x + 10, r_g.bottom + 26, panel_w - 20, 18)
+    expo_ms = minicam_exposure_us / 1000.0
+    expo_log_min, expo_log_max = _math.log(0.1), _math.log(30000.0)
+    expo_frac = (_math.log(max(0.1, expo_ms)) - expo_log_min) / (expo_log_max - expo_log_min)
+    pygame.draw.rect(windowSurfaceObj, (40, 60, 60), r_e, border_radius=3)
+    filled_w = int(r_e.w * expo_frac)
+    if filled_w > 0:
+        pygame.draw.rect(windowSurfaceObj, (0, 140, 160),
+                         pygame.Rect(r_e.x, r_e.y, filled_w, r_e.h), border_radius=3)
+    pygame.draw.rect(windowSurfaceObj, (80, 130, 140), r_e, 1, border_radius=3)
+    if expo_ms >= 1000:
+        expo_str = f"{expo_ms/1000:.2f}s"
+    elif expo_ms >= 1:
+        expo_str = f"{expo_ms:.0f}ms"
+    else:
+        expo_str = f"{expo_ms:.1f}ms"
+    expo_lbl = f16.render(f"Expo {expo_str}", True, (180, 210, 220))
+    windowSurfaceObj.blit(expo_lbl, (r_e.x, r_e.y - 14))
+    _minicam_slider_rects['minicam_expo'] = r_e
+
+    return rects
+
+
+def _minicam_preview_loop(host: str):
+    """Thread daemon : poll GET /preview_frame.jpg et met à jour _minicam_preview_surface."""
+    import urllib.request
+    import io
+    import time as _tp
+    global _minicam_preview_surface, _minicam_preview_running
+    interval = 0.1  # ~10 fps
+    url = f"http://{host}/preview_frame.jpg"
+    _consec_errors = 0
+    _last_ok_t = _tp.time()
+    while _minicam_preview_running:
+        try:
+            t0 = _tp.time()
+            with urllib.request.urlopen(url, timeout=3) as resp:
+                data = resp.read()
+            buf = io.BytesIO(data)
+            img = pygame.image.load(buf, "jpeg")
+            _minicam_preview_surface = img
+            elapsed = _tp.time() - t0
+            if _consec_errors > 0:
+                print(f"[preview_loop] reprise OK après {_consec_errors} erreurs consécutives")
+            _consec_errors = 0
+            _last_ok_t = _tp.time()
+        except Exception as _e:
+            elapsed = 0.0
+            _consec_errors += 1
+            if _consec_errors <= 3 or _consec_errors % 20 == 0:
+                print(f"[preview_loop] ERREUR #{_consec_errors} ({type(_e).__name__}: {_e}) "
+                      f"— dernière OK il y a {_tp.time()-_last_ok_t:.1f}s")
+        remaining = interval - elapsed
+        if remaining > 0:
+            _tp.sleep(remaining)
+
+
+def _minicam_connect():
+    """Connecte le controller WS et démarre le thread preview."""
+    global minicam_connected, minicam_status, minicam_latency_ms
+    global _minicam_controller, _minicam_preview_thread, _minicam_preview_running
+    global minicam_transport, minicam_wifi_ip, _minicam_connecting
+
+    if _minicam_connecting:
+        return
+    _minicam_connecting = True
+
+    try:
+        _minicam_connect_inner()
+    finally:
+        _minicam_connecting = False
+
+
+def _minicam_connect_inner():
+    """Logique de connexion (appelée depuis _minicam_connect avec guard)."""
+    global minicam_connected, minicam_status, minicam_latency_ms
+    global _minicam_controller, _minicam_preview_thread, _minicam_preview_running
+    global minicam_transport, minicam_wifi_ip
+
+    from libastrostack.minicam import MiniCamController
+    # SSH : toujours via l'alias pi0 (→ rpi0.local WiFi) indépendamment du transport.
+    # HTTP/WS : 192.168.7.2 pour USB gadget, sinon l'IP/hostname WiFi saisi.
+    wifi_host = minicam_wifi_ip if minicam_wifi_ip else 'rpi0.local'
+    host = "192.168.7.2:8000" if minicam_transport == 'usb' else f"{wifi_host}:8000"
+
+    # Bascule du service réseau selon le transport choisi.
+    import subprocess as _sp, time as _t, pathlib as _pl
+    if minicam_transport == 'usb':
+        minicam_status = "Démarrage gadget USB…"
+        try:
+            _sp.run(["ssh", "pi0", "sudo systemctl start minicam-net-usb minicam-api"],
+                    timeout=15, check=True, capture_output=True)
+        except Exception as _e:
+            minicam_status = f"Gadget SSH erreur: {_e}"
+            minicam_connected = False
+            return
+        # Attendre que usb0 apparaisse localement (max 8 s).
+        for _ in range(16):
+            _t.sleep(0.5)
+            if _pl.Path("/sys/class/net/usb0").exists():
+                break
+    else:
+        # WiFi : arrêter le gadget USB si actif (best-effort, non bloquant).
+        if _pl.Path("/sys/class/net/usb0").exists():
+            try:
+                _sp.run(["ssh", "pi0", "sudo systemctl stop minicam-net-usb"],
+                        timeout=3, capture_output=True)
+            except Exception:
+                pass  # non critique, on continue en WiFi
+
+    try:
+        ctrl = MiniCamController(host)
+        ctrl.connect()
+        import time as _time
+        t0 = _time.time()
+        st = ctrl.status()
+        minicam_latency_ms = (_time.time() - t0) * 1000.0
+        if st:
+            minicam_connected = True
+            minicam_status = "Connecté"
+            _minicam_controller = ctrl
+            # Sync gain/expo
+            ctrl.set_gain(minicam_gain)
+            ctrl.set_exposure_ms(minicam_exposure_us / 1000.0)
+        else:
+            minicam_status = "Erreur connexion"
+            minicam_connected = False
+    except Exception as e:
+        minicam_status = f"Erreur: {e}"
+        minicam_connected = False
+        _minicam_controller = None
+        return
+
+    # Preview thread
+    _minicam_preview_running = True
+    import threading as _threading
+    t = _threading.Thread(target=_minicam_preview_loop, args=(host,), daemon=True)
+    t.start()
+    _minicam_preview_thread = t
+
+
+def _minicam_disconnect():
+    """Déconnecte le controller et arrête le thread preview."""
+    global minicam_connected, minicam_status, _minicam_controller
+    global _minicam_preview_running, _minicam_preview_thread, _minicam_preview_surface
+    global _minicam_capture_thread
+
+    _minicam_preview_running = False
+    if _minicam_preview_thread:
+        _minicam_preview_thread.join(timeout=2.0)
+        _minicam_preview_thread = None
+    _minicam_preview_surface = None
+
+    if _minicam_capture_thread:
+        _minicam_capture_thread.stop()
+        _minicam_capture_thread = None
+
+    if _minicam_controller:
+        try:
+            _minicam_controller.disconnect()
+        except Exception:
+            pass
+        _minicam_controller = None
+
+    minicam_connected = False
+    minicam_status = "Déconnecté"
+
+
+def draw_minicam_solve_overlay(screen_width, screen_height):
+    """Dessine le panneau Plate Solve / Push-To sous les boutons de mode (gauche)
+    et l'overlay résultat + flèches sur le preview."""
+    global windowSurfaceObj, _font_cache, _minicam_slider_rects
+    global minicam_focal_mm, minicam_solve_running, minicam_solve_result, _minicam_last_good_solve
+    global minicam_target_ra, minicam_target_dec, minicam_target_name
+    global minicam_pushto_active, _minicam_lx200_server, minicam_lx200_port
+    global minicam_solve_max_stars
+
+    import math as _math
+
+    rects = {}
+
+    # --- Fonts ---
+    for _ck in (14, 16, 18, 20):
+        if _ck not in _font_cache:
+            _font_cache[_ck] = pygame.font.Font(None, _ck)
+    f14 = _font_cache[14]
+    f16 = _font_cache[16]
+    f18 = _font_cache[18]
+    f20 = _font_cache[20]
+
+    # --- Position des contrôles : sous les 4 boutons de mode ---
+    btn_h_mode, step_mode = 32, 42
+    start_y_mode = screen_height // 2 - (4 * btn_h_mode + 3 * (step_mode - btn_h_mode)) // 2
+    cy0 = start_y_mode + 3 * step_mode + btn_h_mode + 8  # bas du 4e bouton + marge
+    x, w = 5, 78
+
+    # Slider focale
+    focal_lbl = f16.render(f"Focale: {minicam_focal_mm:.0f}mm", True, (160, 200, 220))
+    windowSurfaceObj.blit(focal_lbl, (x, cy0))
+    r_focal = pygame.Rect(x, cy0 + 14, w, 11)
+    focal_log_min = _math.log(25.0)
+    focal_log_max = _math.log(600.0)
+    focal_frac = (_math.log(max(25.0, min(600.0, minicam_focal_mm))) - focal_log_min) / (focal_log_max - focal_log_min)
+    pygame.draw.rect(windowSurfaceObj, (25, 45, 60), r_focal, border_radius=3)
+    fw = int(w * focal_frac)
+    if fw > 0:
+        pygame.draw.rect(windowSurfaceObj, (0, 110, 160),
+                         pygame.Rect(x, r_focal.y, fw, r_focal.h), border_radius=3)
+    pygame.draw.rect(windowSurfaceObj, (50, 100, 130), r_focal, 1, border_radius=3)
+    _minicam_slider_rects['minicam_focal'] = r_focal
+    rects['minicam_focal_slider'] = r_focal
+
+    # Slider Stars (nb max étoiles ASTAP = limite magnitude implicite)
+    stars_lbl = f14.render(f"Stars: {minicam_solve_max_stars}", True, (160, 190, 160))
+    windowSurfaceObj.blit(stars_lbl, (x, cy0 + 28))
+    r_stars = pygame.Rect(x, cy0 + 38, w, 10)
+    _stars_min, _stars_max = 50, 500
+    stars_frac = (minicam_solve_max_stars - _stars_min) / (_stars_max - _stars_min)
+    pygame.draw.rect(windowSurfaceObj, (30, 50, 30), r_stars, border_radius=3)
+    sw = int(w * stars_frac)
+    if sw > 0:
+        pygame.draw.rect(windowSurfaceObj, (40, 130, 60),
+                         pygame.Rect(x, r_stars.y, sw, r_stars.h), border_radius=3)
+    pygame.draw.rect(windowSurfaceObj, (60, 130, 70), r_stars, 1, border_radius=3)
+    _minicam_slider_rects['minicam_stars'] = r_stars
+    rects['minicam_stars_slider'] = r_stars
+
+    # Bouton SOLVE (décalé de +24px)
+    r_solve = pygame.Rect(x, cy0 + 54, w, 24)
+    if minicam_solve_running:
+        solve_bg = (70, 60, 10)
+        solve_lbl_txt = "Solving..."
+        solve_fg = (255, 210, 60)
+    elif minicam_solve_result is not None and not minicam_solve_result.success:
+        solve_bg = (70, 20, 20)
+        solve_lbl_txt = "SOLVE"
+        solve_fg = (255, 180, 180)
+    else:
+        solve_bg = (15, 70, 25)
+        solve_lbl_txt = "SOLVE"
+        solve_fg = (180, 255, 200)
+    pygame.draw.rect(windowSurfaceObj, solve_bg, r_solve, border_radius=4)
+    pygame.draw.rect(windowSurfaceObj, (60, 160, 100), r_solve, 1, border_radius=4)
+    sl = f16.render(solve_lbl_txt, True, solve_fg)
+    windowSurfaceObj.blit(sl, sl.get_rect(center=r_solve.center))
+    rects['minicam_solve_btn'] = r_solve
+
+    # Statut LX200 (remplace bouton Stellarium + champ IP)
+    r_lx200 = pygame.Rect(x, cy0 + 82, w, 36)
+    lx200_ok = (_minicam_lx200_server is not None and _minicam_lx200_server.client_connected)
+    lx200_running = (_minicam_lx200_server is not None and _minicam_lx200_server.is_running)
+    lx200_bg = (10, 40, 10) if lx200_ok else (20, 20, 35)
+    lx200_border = (60, 180, 60) if lx200_ok else (50, 50, 100)
+    pygame.draw.rect(windowSurfaceObj, lx200_bg, r_lx200, border_radius=4)
+    pygame.draw.rect(windowSurfaceObj, lx200_border, r_lx200, 1, border_radius=4)
+    lx_l1 = f14.render(f"LX200 :{minicam_lx200_port}", True, (180, 220, 180))
+    if lx200_ok:
+        lx_l2 = f14.render("Connecte", True, (100, 255, 120))
+    elif lx200_running:
+        lx_l2 = f14.render("En attente...", True, (140, 140, 170))
+    else:
+        lx_l2 = f14.render("OFF", True, (100, 100, 120))
+    windowSurfaceObj.blit(lx_l1, (r_lx200.x + 4, r_lx200.y + 4))
+    windowSurfaceObj.blit(lx_l2, (r_lx200.x + 4, r_lx200.y + 20))
+    if minicam_target_ra is not None:
+        tgt_txt = "★ " + (minicam_target_name[:8] if minicam_target_name else "GoTo")
+        tgt_surf = f14.render(tgt_txt, True, (255, 220, 100))
+        windowSurfaceObj.blit(tgt_surf, tgt_surf.get_rect(midright=(r_lx200.right - 3, r_lx200.y + 28)))
+    rects['minicam_lx200_status'] = r_lx200
+
+    # Bouton PUSH-TO (seulement si solve réussi + cible définie)
+    if (minicam_solve_result is not None and minicam_solve_result.success
+            and minicam_target_ra is not None):
+        r_pt = pygame.Rect(x, cy0 + 122, w, 22)
+        pt_bg = (55, 15, 75) if minicam_pushto_active else (30, 10, 45)
+        pt_border = (180, 80, 255) if minicam_pushto_active else (100, 50, 140)
+        pygame.draw.rect(windowSurfaceObj, pt_bg, r_pt, border_radius=4)
+        pygame.draw.rect(windowSurfaceObj, pt_border, r_pt, 1, border_radius=4)
+        pt_txt = "PUSH-TO ON" if minicam_pushto_active else "PUSH-TO"
+        ptl = f14.render(pt_txt, True, (220, 170, 255))
+        windowSurfaceObj.blit(ptl, ptl.get_rect(center=r_pt.center))
+        rects['minicam_pushto_btn'] = r_pt
+
+    # ----------------------------------------------------------------
+    # Overlay sur le preview : résultat du solve
+    # ----------------------------------------------------------------
+    preview_x = 88
+    preview_y = 44
+
+    if minicam_solve_running:
+        bx, by = preview_x + 5, preview_y + 5
+        s = pygame.Surface((190, 20), pygame.SRCALPHA)
+        s.fill((0, 0, 0, 170))
+        windowSurfaceObj.blit(s, (bx, by))
+        rl = f16.render("Solving en cours...", True, (255, 205, 50))
+        windowSurfaceObj.blit(rl, (bx + 4, by + 2))
+
+    elif minicam_solve_result is not None:
+        sr = minicam_solve_result
+        if sr.success:
+            lines = [
+                f"RA  {sr.ra_hms()}",
+                f"Dec {sr.dec_dms()}",
+                f"{sr.pixel_scale_arcsec:.1f}\"/px  {sr.field_w_deg:.1f}°×{sr.field_h_deg:.1f}°",
+                f"Focale: {sr.focal_mm_measured:.0f}mm  Angle: {sr.field_angle_deg:.1f}°",
+                f"Solve: {sr.elapsed_s:.0f}s",
+            ]
+            info_col = (80, 220, 140)
+        else:
+            lines = ["Solve échoué:", sr.error[:32]]
+            info_col = (220, 100, 100)
+
+        bx, by = preview_x + 5, preview_y + 5
+        box_w, line_h = 210, 14
+        box_h = line_h * len(lines) + 8
+        s = pygame.Surface((box_w, box_h), pygame.SRCALPHA)
+        s.fill((0, 0, 0, 170))
+        windowSurfaceObj.blit(s, (bx, by))
+        for i, line in enumerate(lines):
+            rl = f14.render(line, True, info_col)
+            windowSurfaceObj.blit(rl, (bx + 4, by + 4 + i * line_h))
+
+    # ----------------------------------------------------------------
+    # Overlay push-to : panneau HUD compact en bas du preview
+    # ----------------------------------------------------------------
+    if (minicam_pushto_active
+            and _minicam_last_good_solve is not None
+            and minicam_target_ra is not None):
+
+        sr = _minicam_last_good_solve
+        cos_dec = _math.cos(_math.radians(sr.dec_deg))
+
+        dra = (minicam_target_ra - sr.ra_deg) % 360.0
+        if dra > 180.0:
+            dra -= 360.0
+        dra_arcmin = dra * cos_dec * 60.0
+        ddec_arcmin = (minicam_target_dec - sr.dec_deg) * 60.0
+        dist_arcmin = _math.sqrt(dra_arcmin**2 + ddec_arcmin**2)
+
+        preview_w = screen_width - 88 - 55
+        preview_h = screen_height - 50
+        cx = preview_x + preview_w // 2
+        cy_bottom = preview_y + preview_h - 10
+        cy_mid    = preview_y + preview_h // 2
+
+        # Vecteurs WCS Nord/Est + projection cible sur les pixels display
+        # cdelt1_sign : -1 = Est à gauche (CDELT1<0, standard), +1 = Est à droite (miroir)
+        rot    = _math.radians(sr.field_angle_deg)
+        _es    = float(sr.cdelt1_sign)   # signe East : ±1
+        # ey = +_es*sin (pas négatif) : pour CDELT1>0 (Est=droite),
+        # l'Est a une composante Y positive quand rot>0 (image tournée CW).
+        ex     =  _es * _math.cos(rot)
+        ey     =  _es * _math.sin(rot)
+        nx     = -_math.sin(rot)
+        ny     = -_math.cos(rot)
+        dx_img = dra_arcmin * ex + ddec_arcmin * nx
+        dy_img = dra_arcmin * ey + ddec_arcmin * ny
+
+        fov_w_am   = sr.field_w_deg * 60.0
+        fov_h_am   = sr.field_h_deg * 60.0
+        # Échelles display séparées X/Y (preview pas forcément 16:9)
+        pix_per_am = (preview_w / fov_w_am) if fov_w_am > 0 else 0.0
+        _ppm_y     = (preview_h / fov_h_am) if fov_h_am > 0 else pix_per_am
+        # Coordonnées display — échelles X/Y séparées pour corriger la distorsion d'aspect
+        dx_disp    = dx_img * pix_per_am
+        dy_disp    = dy_img * _ppm_y
+        tgt_px     = cx + int(dx_disp)
+        tgt_py     = cy_mid + int(dy_disp)
+        tgt_in_fov = (preview_x + 10 <= tgt_px <= preview_x + preview_w - 10 and
+                      preview_y + 10 <= tgt_py <= preview_y + preview_h - 10)
+
+        # Réticule IMX585 @600mm centré sur le preview
+        # IMX462 (MiniCam) : 1920×1080 px, 2.9µm — solve donne l'échelle courante
+        # IMX585 (caméra principale) : 3840×2160 px, 2.9µm, focale fixe 600mm
+        _imx585_fov_w_am = (3840 * 2.9e-3 / 600.0) * (180.0 / _math.pi) * 60.0  # ~63.8'
+        _imx585_fov_h_am = (2160 * 2.9e-3 / 600.0) * (180.0 / _math.pi) * 60.0  # ~35.9'
+        _ret_w   = int(_imx585_fov_w_am * pix_per_am)
+        _ret_h   = int(_imx585_fov_h_am * _ppm_y)
+        _ret_col = (0, 200, 120)
+        _fov_col = (0, 130, 200)
+        # Champ MiniCam en haut à droite (info solve)
+        _fov_dim = f14.render(f"Champ: {fov_w_am:.0f}' \xd7 {fov_h_am:.0f}'",
+                              True, _fov_col)
+        windowSurfaceObj.blit(_fov_dim,
+                              _fov_dim.get_rect(topright=(preview_x + preview_w - 6,
+                                                           preview_y + 6)))
+        # Rectangle IMX585 centré, clippé au preview
+        if _ret_w >= 4 and _ret_h >= 4:
+            _ret_x = cx - _ret_w // 2
+            _ret_y = cy_mid - _ret_h // 2
+            _old_clip = windowSurfaceObj.get_clip()
+            windowSurfaceObj.set_clip(
+                pygame.Rect(preview_x, preview_y, preview_w, preview_h))
+            pygame.draw.rect(windowSurfaceObj, _ret_col,
+                             pygame.Rect(_ret_x, _ret_y, _ret_w, _ret_h), 1)
+            windowSurfaceObj.set_clip(_old_clip)
+            # Label sous/sur le rectangle
+            _ret_lbl = f14.render(
+                f"IMX585 @600mm  {_imx585_fov_w_am:.0f}' \xd7 {_imx585_fov_h_am:.0f}'",
+                True, _ret_col)
+            _lbl_y = max(preview_y + _fov_dim.get_height() + 6,
+                         _ret_y - _ret_lbl.get_height() - 2)
+            windowSurfaceObj.blit(_ret_lbl, _ret_lbl.get_rect(midtop=(cx, _lbl_y)))
+        # Viseur central (bras avec espace au milieu)
+        pygame.draw.line(windowSurfaceObj, _ret_col, (cx - 14, cy_mid), (cx - 5, cy_mid), 1)
+        pygame.draw.line(windowSurfaceObj, _ret_col, (cx + 5, cy_mid), (cx + 14, cy_mid), 1)
+        pygame.draw.line(windowSurfaceObj, _ret_col, (cx, cy_mid - 14), (cx, cy_mid - 5), 1)
+        pygame.draw.line(windowSurfaceObj, _ret_col, (cx, cy_mid + 5), (cx, cy_mid + 14), 1)
+
+        def _fmt_a(am):
+            a = abs(am)
+            if a >= 60.0:
+                d = int(a / 60)
+                m = a - d * 60
+                return f"{d}\xb0{m:04.1f}'"
+            return f"{a:.1f}'"
+
+        for _ck in (22, 24):
+            if _ck not in _font_cache:
+                _font_cache[_ck] = pygame.font.Font(None, _ck)
+
+        if dist_arcmin < 1.0:
+            # Sur la cible — cercle rouge (identification) + anneau vert + bannière
+            pygame.draw.circle(windowSurfaceObj, (220, 30, 30), (tgt_px, tgt_py), 30, 2)
+            pygame.draw.circle(windowSurfaceObj, (220, 30, 30), (tgt_px, tgt_py), 8, -1)
+            pygame.draw.circle(windowSurfaceObj, (0, 255, 120), (tgt_px, tgt_py), 46, 3)
+            tl = _font_cache[24].render("SUR LA CIBLE", True, (0, 255, 120))
+            tw, th = tl.get_size()
+            bg = pygame.Surface((tw + 16, th + 8), pygame.SRCALPHA)
+            bg.fill((0, 0, 0, 200))
+            windowSurfaceObj.blit(bg, (cx - tw // 2 - 8, tgt_py + 54))
+            windowSurfaceObj.blit(tl, tl.get_rect(centerx=cx, y=tgt_py + 58))
+        else:
+            ra_sym  = "→" if dra_arcmin  > 0 else "←"
+            dec_sym = "↑" if ddec_arcmin > 0 else "↓"   # ↑ ↓
+            ra_dir  = "E" if dra_arcmin  > 0 else "O"
+            dec_dir = "N" if ddec_arcmin > 0 else "S"
+            tgt = (minicam_target_name or "Cible")[:16]
+            refresh = " ↻" if minicam_solve_running else ""   # ↻
+
+            # Ligne 1 : cible + distance totale
+            # Ligne 2 : RA à corriger
+            # Ligne 3 : Dec à corriger
+            hud = [
+                (f"★ {tgt}   dist {_fmt_a(dist_arcmin)}{refresh}", (255, 215, 60)),
+                (f"{ra_sym}  RA   {_fmt_a(dra_arcmin)}  {ra_dir}",  (80, 190, 255)),
+                (f"{dec_sym}  Dec  {_fmt_a(ddec_arcmin)}  {dec_dir}", (255, 165, 70)),
+            ]
+
+            # Ajout ΔAlt / ΔAz (calcul silencieux, optionnel)
+            try:
+                import datetime as _dt
+                def _radec_to_altaz(ra_d, dec_d, lat_d, lon_d):
+                    utc = _dt.datetime.utcnow()
+                    days = (utc - _dt.datetime(2000, 1, 1, 12, 0, 0)).total_seconds() / 86400.0
+                    gmst_h = (18.697374558 + 24.06570982441908 * days) % 24.0
+                    lst_d = (gmst_h * 15.0 + lon_d) % 360.0
+                    ha = _math.radians((lst_d - ra_d) % 360.0)
+                    dec = _math.radians(dec_d)
+                    lat = _math.radians(lat_d)
+                    sin_alt = (_math.sin(dec) * _math.sin(lat)
+                               + _math.cos(dec) * _math.cos(lat) * _math.cos(ha))
+                    alt = _math.asin(max(-1.0, min(1.0, sin_alt)))
+                    cos_alt = _math.cos(alt)
+                    if abs(cos_alt) > 1e-9:
+                        sin_az = -_math.sin(ha) * _math.cos(dec) / cos_alt
+                        cos_az = ((_math.sin(dec) - _math.sin(alt) * _math.sin(lat))
+                                  / (cos_alt * _math.cos(lat)))
+                        az = _math.degrees(_math.atan2(sin_az, cos_az)) % 360.0
+                    else:
+                        az = 0.0
+                    return _math.degrees(alt), az
+
+                cur_alt, cur_az = _radec_to_altaz(sr.ra_deg, sr.dec_deg, obs_lat_deg, obs_lon_deg)
+                tgt_alt, tgt_az = _radec_to_altaz(minicam_target_ra, minicam_target_dec,
+                                                   obs_lat_deg, obs_lon_deg)
+                dalt_arcmin = (tgt_alt - cur_alt) * 60.0
+                daz_arcmin  = ((tgt_az - cur_az + 180.0) % 360.0 - 180.0) * 60.0
+                hud.append((f"{'→' if daz_arcmin > 0 else '←'}  Az   {_fmt_a(daz_arcmin)}  "
+                             f"{'E' if daz_arcmin > 0 else 'O'}", (140, 255, 180)))
+                hud.append((f"{'↑' if dalt_arcmin > 0 else '↓'}  Alt  {_fmt_a(dalt_arcmin)}  "
+                             f"{'H' if dalt_arcmin > 0 else 'B'}", (255, 140, 200)))
+            except Exception:
+                pass
+
+            # Rendu HUD (une seule fois, après ajout Alt-Az)
+            f22 = _font_cache[22]
+            lh, pad = 22, 8
+            box_w = max(f22.size(t)[0] for t, _ in hud) + pad * 2 + 4
+            box_h = len(hud) * lh + pad * 2
+            bx = cx - box_w // 2
+            by = cy_bottom - box_h
+            bg = pygame.Surface((box_w, box_h), pygame.SRCALPHA)
+            bg.fill((0, 0, 0, 210))
+            windowSurfaceObj.blit(bg, (bx, by))
+            pygame.draw.rect(windowSurfaceObj, (70, 90, 70),
+                             pygame.Rect(bx, by, box_w, box_h), 1, border_radius=5)
+            for i, (txt, col) in enumerate(hud):
+                s = f22.render(txt, True, col)
+                windowSurfaceObj.blit(s, (bx + pad, by + pad + i * lh))
+
+            # Flèche directionnelle vers la cible
+            # Angle calculé en pixels display (échelles X/Y séparées → direction visuellement correcte)
+            ang   = _math.atan2(dy_disp, dx_disp)
+            _cos  = _math.cos(ang)
+            _sin  = _math.sin(ang)
+            # Distance du centre au bord du preview dans la direction ang (avec marge 22px)
+            _mar  = 22
+            _ts   = []
+            if abs(_cos) > 1e-9:
+                _ts.append(((preview_x + preview_w - cx - _mar) if _cos > 0
+                             else (cx - preview_x - _mar)) / abs(_cos))
+            if abs(_sin) > 1e-9:
+                _ts.append(((preview_y + preview_h - cy_mid - _mar) if _sin > 0
+                             else (cy_mid - preview_y - _mar)) / abs(_sin))
+            al_max = max(20, int(min(_ts))) if _ts else 20
+            # Longueur proportionnelle à la distance réelle (pixels display), plafonnée au bord
+            dist_px = _math.sqrt(dx_disp ** 2 + dy_disp ** 2)
+            al = max(15, min(al_max, int(dist_px)))
+            ax = cx + int(al * _cos)
+            ay = cy_mid + int(al * _sin)
+            # Couleur : vert si proche (< 10'), orange si medium, jaune si loin
+            if dist_arcmin < 10.0:
+                _arrow_col = (80, 255, 120)
+            elif dist_arcmin < 60.0:
+                _arrow_col = (255, 180, 50)
+            else:
+                _arrow_col = (255, 215, 60)
+            pygame.draw.circle(windowSurfaceObj, (160, 160, 160), (cx, cy_mid), 5, 1)
+            pygame.draw.line(windowSurfaceObj, _arrow_col, (cx, cy_mid), (ax, ay), 2)
+            head = 14
+            for da in (0.42, -0.42):
+                hx = int(ax - head * _math.cos(ang + da))
+                hy = int(ay - head * _math.sin(ang + da))
+                pygame.draw.line(windowSurfaceObj, _arrow_col, (ax, ay), (hx, hy), 2)
+
+            # Identification cible dès qu'elle entre dans le champ
+            if tgt_in_fov:
+                pygame.draw.circle(windowSurfaceObj, (220, 30, 30), (tgt_px, tgt_py), 28, 2)
+                pygame.draw.circle(windowSurfaceObj, (220, 30, 30), (tgt_px, tgt_py), 6, -1)
+                _tgt_lbl = f16.render(minicam_target_name or "Cible", True, (255, 80, 80))
+                windowSurfaceObj.blit(_tgt_lbl,
+                                      _tgt_lbl.get_rect(midleft=(tgt_px + 34, tgt_py)))
+
+    return rects
+
+
+def draw_minicam_fullscreen(screen_width, screen_height):
+    """Rendu complet du mode MiniCam (preview + panneau + boutons)."""
+    global windowSurfaceObj, _minicam_preview_surface, _minicam_snap_surface
+    global minicam_connected, minicam_settings_visible, _minicam_slider_rects, _font_cache
+
+    _minicam_slider_rects = {}
+
+    # Fond
+    windowSurfaceObj.fill((5, 15, 20))
+
+    # Preview (centre)
+    preview_x = 88
+    preview_w = screen_width - 88 - 55
+    preview_h = screen_height - 50
+    preview_y = 44
+    preview_rect = pygame.Rect(preview_x, preview_y, preview_w, preview_h)
+    pygame.draw.rect(windowSurfaceObj, (20, 35, 40), preview_rect)
+
+    surf = _minicam_preview_surface
+    if surf is not None:
+        try:
+            scaled = pygame.transform.scale(surf, (preview_w, preview_h))
+            windowSurfaceObj.blit(scaled, (preview_x, preview_y))
+        except Exception:
+            pass
+    else:
+        ck = 22
+        if ck not in _font_cache:
+            _font_cache[ck] = pygame.font.Font(None, ck)
+        f = _font_cache[ck]
+        msg = "MiniCam — Non connectée" if not minicam_connected else "En attente du flux…"
+        lbl = f.render(msg, True, (80, 100, 100))
+        windowSurfaceObj.blit(lbl, lbl.get_rect(center=preview_rect.center))
+
+    # Boutons mode gauche
+    mode_rects = draw_minicam_mode_buttons(screen_width, screen_height)
+
+    # Panneau droit si visible
+    panel_rects = {}
+    if minicam_settings_visible:
+        panel_rects = draw_minicam_panel(screen_width, screen_height)
+
+    # Overlay Solve / Push-To (si actif)
+    solve_rects = {}
+    if minicam_solve_mode:
+        solve_rects = draw_minicam_solve_overlay(screen_width, screen_height)
+
+    # EXIT
+    exit_r = draw_minicam_exit_button(screen_width, screen_height)
+    # SNAP
+    snap_r = draw_minicam_snap_button(screen_width, screen_height)
+    # Gear
+    gear_r = draw_minicam_settings_icon(screen_width, screen_height, bool(minicam_settings_visible))
+
+    all_rects = {**mode_rects, **panel_rects, **solve_rects,
+                 'minicam_exit': exit_r,
+                 'minicam_snap': snap_r,
+                 'minicam_gear': gear_r}
+    return all_rects
+
+
+# FIN MINICAM FULLSCREEN CONTROLS
 # ============================================================================
 
 
@@ -19931,6 +20899,16 @@ while True:
                     _sun_slider_rects = draw_sun_controls(max_width, max_height)
                 pygame.display.update()
 
+            # === MINICAM MODE: Preview + panneau contrôle ===
+            # N'afficher l'UI MiniCam que si aucun mode de stacking n'est actif.
+            # Quand LS/Galaxy/Lucky est lancé depuis MiniCam, leur propre UI prend le dessus.
+            if minicam_mode == 1 and ls_interface_mode == 0 and galaxy_interface_mode == 0 and lucky_raw_interface_mode == 0:
+                max_width, max_height = windowSurfaceObj.get_size()
+
+                _minicam_ui_rects = draw_minicam_fullscreen(max_width, max_height)
+                frame_from_thread = None  # Empêcher le traitement normal
+                pygame.display.update()
+
             # === JSK LIVE MODE: Traitement dédié dans le chemin Picamera2 ===
             # Le pipeline JSK LIVE (HDR + Denoise) remplace le pipeline normal (debayer + ISP)
             # Ce bloc DOIT être avant le traitement normal pour éviter le debayering inutile
@@ -20059,6 +21037,7 @@ while True:
                         # Normaliser vers 12-bit (CSI-2 ×16)
                         if gx_raw_input is not None and gx_raw_input.max() > 4095:
                             gx_raw_input = (gx_raw_input >> 4).astype(np.uint16)
+
                     else:
                         if capture_thread is not None:
                             capture_thread.set_capture_params({'type': 'raw'})
@@ -20770,8 +21749,8 @@ while True:
                             else:
                                 image = pygame.surfarray.make_surface(stacked_array.T)
 
-                            # Redimensionner en fullscreen si stretch activé
-                            if stretch_mode == 1:
+                            # Redimensionner en fullscreen si stretch activé ou MiniCam source
+                            if stretch_mode == 1 or minicam_mode:
                                 display_modes = pygame.display.list_modes()
                                 if display_modes and display_modes != -1:
                                     max_width, max_height = display_modes[0]
@@ -21001,8 +21980,8 @@ while True:
                                 # MONO
                                 image = pygame.surfarray.make_surface(stacked_array.T)
 
-                            # Redimensionner pour l'affichage
-                            if stretch_mode == 1:
+                            # Redimensionner pour l'affichage (fullscreen si stretch ou MiniCam source)
+                            if stretch_mode == 1 or minicam_mode:
                                 display_modes = pygame.display.list_modes()
                                 if display_modes and display_modes != -1:
                                     max_width, max_height = display_modes[0]
@@ -21055,7 +22034,7 @@ while True:
                         text(0, 1, 2, 2, 1, stats_text2, ft, 1)
 
                 # ===== LUCKY STACK RAW BAYER =====
-                elif lucky_raw_active and raw_lucky_stacker is not None and raw_format >= 2:
+                elif lucky_raw_active and raw_lucky_stacker is not None and (raw_format >= 2 or minicam_mode):
                     livestack_display_done = True   # empêche le fallback 2D Bayer d'apparaître
                     try:
                         if not hasattr(pygame, '_lucky_raw_resolution_check'):
@@ -21133,7 +22112,13 @@ while True:
                             else:
                                 _rimg = pygame.surfarray.make_surface(_disp.T)
 
-                            if stretch_mode == 1:
+                            if stretch_mode == 1 or minicam_mode:
+                                display_modes = pygame.display.list_modes()
+                                if display_modes and display_modes != -1:
+                                    max_width, max_height = display_modes[0]
+                                else:
+                                    screen_info = pygame.display.Info()
+                                    max_width, max_height = screen_info.current_w, screen_info.current_h
                                 _rimg = pygame.transform.scale(_rimg, (max_width, max_height))
                             elif _rimg.get_width() != preview_width or _rimg.get_height() != preview_height:
                                 _rimg = pygame.transform.scale(_rimg, (preview_width, preview_height))
@@ -21202,19 +22187,21 @@ while True:
                 if not livestack_display_done:
                     # *** VALIDATION: Vérifier que array est 3D avant affichage ***
                     if len(array.shape) == 2:
-                        # Array 2D (RAW Bayer non débayérisé) - ne devrait pas arriver ici
-                        # Mais si c'est le cas, afficher en niveaux de gris comme fallback
-                        if not hasattr(pygame, '_raw_2d_warning'):
-                            print(f"[WARNING] Array 2D détecté dans fallback display: shape={array.shape}")
-                            print(f"  → Conversion en niveaux de gris pour affichage")
-                            pygame._raw_2d_warning = True
-                        # Convertir en grayscale displayable (normaliser si nécessaire)
-                        if array.max() > 255:
-                            array = (array.astype(np.float32) / array.max() * 255).astype(np.uint8)
+                        # Array 2D (RAW Bayer non débayérisé)
+                        if minicam_mode and _minicam_preview_surface is not None:
+                            # MiniCam: utiliser le preview JPEG déjà traité par le Pi0
+                            _pa = pygame.surfarray.array3d(_minicam_preview_surface)  # (W,H,3) RGB
+                            array = np.swapaxes(_pa, 0, 1)[:, :, [2, 1, 0]]  # (H,W,3) BGR
                         else:
-                            array = array.astype(np.uint8)
-                        # Dupliquer en 3 canaux pour RGB
-                        array = np.stack([array, array, array], axis=-1)
+                            if not hasattr(pygame, '_raw_2d_warning'):
+                                print(f"[WARNING] Array 2D détecté dans fallback display: shape={array.shape}")
+                                print(f"  → Conversion en niveaux de gris pour affichage")
+                                pygame._raw_2d_warning = True
+                            if array.max() > 255:
+                                array = (array.astype(np.float32) / array.max() * 255).astype(np.uint8)
+                            else:
+                                array = array.astype(np.uint8)
+                            array = np.stack([array, array, array], axis=-1)
 
                     # Appliquer les réglages ISP en temps réel si mode RAW (preview reflète le stacking)
                     # Toujours appliquer l'ISP quand on est en mode stretch RAW, pas seulement avec le panneau ouvert
@@ -21239,16 +22226,12 @@ while True:
                     else:
                         image = pygame.surfarray.make_surface(np.swapaxes(array, 0, 1)[:,:,[2,1,0]])
 
-                    # Scaling si nécessaire
-                    if stretch_mode == 1:
-                        # En mode stretch, afficher en VRAI plein écran (cache la barre de tâches)
-                        # Obtenir la résolution maximale de l'écran
+                    # Scaling si nécessaire (fullscreen si stretch ou MiniCam source)
+                    if stretch_mode == 1 or minicam_mode:
                         display_modes = pygame.display.list_modes()
                         if display_modes and display_modes != -1:
-                            # Prendre la résolution la plus grande (la première de la liste)
                             max_width, max_height = display_modes[0]
                         else:
-                            # Fallback si list_modes ne fonctionne pas
                             screen_info = pygame.display.Info()
                             max_width, max_height = screen_info.current_w, screen_info.current_h
                         image = pygame.transform.scale(image, (max_width, max_height))
@@ -21526,8 +22509,8 @@ while True:
                 if jsk_settings_visible == 1:
                     _jsk_slider_rects = draw_jsk_controls(max_width, max_height, None)
 
-    # Ne pas afficher les overlays en mode stretch ou JSK LIVE
-    if (zoom > 0 or foc_man == 1 or focus_mode == 1 or histogram > 0) and stretch_mode == 0 and jsk_live_mode == 0 and collimation_mode == 0 and moon_mode == 0 and sun_mode == 0 and galaxy_interface_mode == 0 and files_interface_mode == 0:
+    # Ne pas afficher les overlays en mode stretch ou JSK LIVE ou MiniCam
+    if (zoom > 0 or foc_man == 1 or focus_mode == 1 or histogram > 0) and stretch_mode == 0 and jsk_live_mode == 0 and collimation_mode == 0 and moon_mode == 0 and sun_mode == 0 and galaxy_interface_mode == 0 and files_interface_mode == 0 and not minicam_mode:
         # Utiliser array3d au lieu de pixels3d pour ne pas verrouiller la surface
         # Cela améliore grandement la fluidité de l'affichage en mode focus et histogram
         image2 = pygame.surfarray.array3d(image)
@@ -21771,7 +22754,8 @@ while True:
     _home_active = (moon_mode == 0 and sun_mode == 0 and jsk_live_mode == 0 and
                     collimation_mode == 0 and stretch_mode == 0 and
                     ls_interface_mode == 0 and lucky_interface_mode == 0 and
-                    galaxy_interface_mode == 0 and files_interface_mode == 0)
+                    galaxy_interface_mode == 0 and files_interface_mode == 0 and
+                    minicam_mode == 0)
 
     # === HOME SCREEN OVERLAY ===
     if _home_active:
@@ -21887,6 +22871,26 @@ while True:
           if not use_picamera2 and p is not None:
               os.killpg(p.pid, signal.SIGTERM)
           pygame.quit()
+      # === MINICAM: saisie IP WiFi ===
+      elif event.type == pygame.KEYDOWN and minicam_mode == 1 and _minicam_ip_editing:
+          if event.key == pygame.K_RETURN or event.key == pygame.K_ESCAPE:
+              _minicam_ip_editing = False
+          elif event.key == pygame.K_BACKSPACE:
+              minicam_wifi_ip = minicam_wifi_ip[:-1]
+          else:
+              ch = event.unicode
+              if ch in '0123456789.':
+                  minicam_wifi_ip = minicam_wifi_ip + ch
+      elif event.type == pygame.KEYDOWN and minicam_mode == 1 and _minicam_stellarium_ip_editing:
+          if event.key == pygame.K_RETURN or event.key == pygame.K_ESCAPE:
+              _minicam_stellarium_ip_editing = False
+              pygame.key.stop_text_input()
+          elif event.key == pygame.K_BACKSPACE:
+              minicam_stellarium_host = minicam_stellarium_host[:-1]
+          else:
+              ch = event.unicode
+              if ch and ch in '0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ.-_:':
+                  minicam_stellarium_host = minicam_stellarium_host + ch
       # === MOON / JSK LIVE: gestion du drag des sliders (MOUSEBUTTONDOWN + MOUSEMOTION) ===
       elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
         # === HOME SCREEN : Drag sliders gain/expo/zoom ===
@@ -22028,6 +23032,39 @@ while True:
                 if handle_sun_slider_click(mx, my, _sun_slider_rects):
                     _sun_slider_dragging = True
                     continue
+        if minicam_mode == 1 and _minicam_slider_rects:
+            mx, my = event.pos
+            import math as _math_mc
+            for _mkey, _mrect in _minicam_slider_rects.items():
+                if not _mrect.collidepoint(mx, my):
+                    continue
+                _ratio = max(0.0, min(1.0, (mx - _mrect.x) / max(1, _mrect.w)))
+                if _mkey == 'minicam_gain':
+                    _glog_min, _glog_max = _math_mc.log(1.0), _math_mc.log(64.0)
+                    minicam_gain = _math_mc.exp(_glog_min + _ratio * (_glog_max - _glog_min))
+                    minicam_gain = max(1.0, min(64.0, minicam_gain))
+                    if _minicam_controller is not None:
+                        _minicam_controller.set_gain(minicam_gain)
+                    _minicam_ge_dragging = 'gain'
+                elif _mkey == 'minicam_expo':
+                    _elog_min, _elog_max = _math_mc.log(0.1), _math_mc.log(30000.0)
+                    _expo_ms = _math_mc.exp(_elog_min + _ratio * (_elog_max - _elog_min))
+                    minicam_exposure_us = int(max(100, min(30000000, _expo_ms * 1000)))
+                    if _minicam_controller is not None:
+                        _minicam_controller.set_exposure_ms(minicam_exposure_us / 1000.0)
+                    _minicam_ge_dragging = 'expo'
+                elif _mkey == 'minicam_focal':
+                    _flog_min, _flog_max = _math_mc.log(25.0), _math_mc.log(600.0)
+                    minicam_focal_mm = _math_mc.exp(_flog_min + _ratio * (_flog_max - _flog_min))
+                    minicam_focal_mm = max(25.0, min(600.0, minicam_focal_mm))
+                    _minicam_focal_dragging = True
+                elif _mkey == 'minicam_stars':
+                    minicam_solve_max_stars = int(50 + _ratio * (500 - 50) + 0.5)
+                    minicam_solve_max_stars = max(50, min(500, minicam_solve_max_stars))
+                    _minicam_stars_dragging = True
+                break
+            if _minicam_ge_dragging is not None or _minicam_focal_dragging or _minicam_stars_dragging:
+                continue
         if ls_interface_mode == 1:
             mx, my = event.pos
             display_modes = pygame.display.list_modes()
@@ -22264,6 +23301,56 @@ while True:
                 continue
             else:
                 _sun_slider_dragging = False
+        # Drag sliders Gain/Expo MiniCam
+        if _minicam_ge_dragging is not None and minicam_mode == 1 and _minicam_slider_rects:
+            buttons = pygame.mouse.get_pressed()
+            if buttons[0]:
+                mx, my = event.pos
+                import math as _math_mc2
+                _mrect = _minicam_slider_rects.get(f'minicam_{_minicam_ge_dragging}')
+                if _mrect is not None:
+                    _ratio = max(0.0, min(1.0, (mx - _mrect.x) / max(1, _mrect.w)))
+                    if _minicam_ge_dragging == 'gain':
+                        _glog_min, _glog_max = _math_mc2.log(1.0), _math_mc2.log(64.0)
+                        minicam_gain = _math_mc2.exp(_glog_min + _ratio * (_glog_max - _glog_min))
+                        minicam_gain = max(1.0, min(64.0, minicam_gain))
+                        if _minicam_controller is not None:
+                            _minicam_controller.set_gain(minicam_gain)
+                    elif _minicam_ge_dragging == 'expo':
+                        _elog_min, _elog_max = _math_mc2.log(0.1), _math_mc2.log(30000.0)
+                        _expo_ms = _math_mc2.exp(_elog_min + _ratio * (_elog_max - _elog_min))
+                        minicam_exposure_us = int(max(100, min(30000000, _expo_ms * 1000)))
+                        if _minicam_controller is not None:
+                            _minicam_controller.set_exposure_ms(minicam_exposure_us / 1000.0)
+                continue
+            else:
+                _minicam_ge_dragging = None
+        # Drag slider Focale (MiniCam Solve)
+        if _minicam_focal_dragging and minicam_mode == 1 and 'minicam_focal' in _minicam_slider_rects:
+            buttons = pygame.mouse.get_pressed()
+            if buttons[0]:
+                mx, my = event.pos
+                import math as _math_focal
+                _mrect = _minicam_slider_rects['minicam_focal']
+                _ratio = max(0.0, min(1.0, (mx - _mrect.x) / max(1, _mrect.w)))
+                _flog_min, _flog_max = _math_focal.log(25.0), _math_focal.log(600.0)
+                minicam_focal_mm = _math_focal.exp(_flog_min + _ratio * (_flog_max - _flog_min))
+                minicam_focal_mm = max(25.0, min(600.0, minicam_focal_mm))
+                continue
+            else:
+                _minicam_focal_dragging = False
+        # Drag slider Stars (MiniCam Solve)
+        if _minicam_stars_dragging and minicam_mode == 1 and 'minicam_stars' in _minicam_slider_rects:
+            buttons = pygame.mouse.get_pressed()
+            if buttons[0]:
+                mx, my = event.pos
+                _mrect = _minicam_slider_rects['minicam_stars']
+                _ratio = max(0.0, min(1.0, (mx - _mrect.x) / max(1, _mrect.w)))
+                minicam_solve_max_stars = int(50 + _ratio * (500 - 50) + 0.5)
+                minicam_solve_max_stars = max(50, min(500, minicam_solve_max_stars))
+                continue
+            else:
+                _minicam_stars_dragging = False
         # Drag sliders Gain/Expo/Zoom LS interface
         if _ls_ge_dragging is not None and ls_interface_mode == 1:
             buttons = pygame.mouse.get_pressed()
@@ -22452,7 +23539,7 @@ while True:
             continue
         if _home_passthrough:
             _home_passthrough = False  # laisser passer vers les anciens handlers
-        elif moon_mode == 0 and sun_mode == 0 and jsk_live_mode == 0 and collimation_mode == 0 and stretch_mode == 0 and ls_interface_mode == 0 and lucky_interface_mode == 0 and galaxy_interface_mode == 0 and files_interface_mode == 0:
+        elif moon_mode == 0 and sun_mode == 0 and jsk_live_mode == 0 and collimation_mode == 0 and stretch_mode == 0 and ls_interface_mode == 0 and lucky_interface_mode == 0 and galaxy_interface_mode == 0 and files_interface_mode == 0 and minicam_mode == 0:
             if focus_mode == 1:
                 handle_focus_overlay_click(mousex, mousey)
             else:
@@ -22585,6 +23672,16 @@ while True:
             _sun_slider_dragging = False
             if sun_mode == 1 and sun_settings_visible == 1 and _sun_slider_rects:
                 handle_sun_slider_click(mousex, mousey, _sun_slider_rects)
+            continue
+        # Fin du drag MiniCam gain/expo/focale/stars
+        if _minicam_ge_dragging is not None:
+            _minicam_ge_dragging = None
+            continue
+        if _minicam_focal_dragging:
+            _minicam_focal_dragging = False
+            continue
+        if _minicam_stars_dragging:
+            _minicam_stars_dragging = False
             continue
 
         # Si on est en mode LiveStack actif ET PAS en mode interface LS,
@@ -22897,24 +23994,32 @@ while True:
                 stretch_mode = 0
                 stretch_adjust_mode = 0
 
-                # Restaurer paramètres caméra sauvegardés
-                vwidth = galaxy_saved_vwidth
-                vheight = galaxy_saved_vheight
-                use_native_sensor_mode = galaxy_saved_use_native
-                zoom = galaxy_saved_zoom
-                gain = galaxy_saved_gain
-                kill_preview_process()
-                preview()
-                apply_controls_immediately(
-                    gain_value=galaxy_saved_gain if galaxy_saved_gain > 0 else None,
-                    exposure_time=galaxy_saved_exposure)
+                if minicam_mode:
+                    # Retour à l'UI MiniCam sans toucher à picamera2
+                    if _minicam_capture_thread is not None:
+                        _minicam_capture_thread.stop()
+                        _minicam_capture_thread = None
+                    capture_thread = None
+                    print("[GALAXY] Retour au mode MiniCam")
+                else:
+                    # Restaurer paramètres caméra sauvegardés
+                    vwidth = galaxy_saved_vwidth
+                    vheight = galaxy_saved_vheight
+                    use_native_sensor_mode = galaxy_saved_use_native
+                    zoom = galaxy_saved_zoom
+                    gain = galaxy_saved_gain
+                    kill_preview_process()
+                    preview()
+                    apply_controls_immediately(
+                        gain_value=galaxy_saved_gain if galaxy_saved_gain > 0 else None,
+                        exposure_time=galaxy_saved_exposure)
+                    menu = 0
 
                 # Restaurer affichage
                 display_modes = pygame.display.list_modes()
                 _hw, _hh = display_modes[0] if display_modes and display_modes != -1 else (1024, 600)
                 windowSurfaceObj = pygame.display.set_mode((_hw, _hh), pygame.FULLSCREEN, 24)
                 windowSurfaceObj.fill((0, 0, 0))
-                menu = 0
                 print("[GALAXY] Mode GALAXY désactivé")
                 continue
 
@@ -23371,7 +24476,7 @@ while True:
                     _ls_prev_cs = getattr(preview, 'prev_config', {}).get('capture_size')
                     _ls_new_cs = get_imx585_sensor_mode(zoom, use_native_sensor_mode == 1) if Pi_Cam == 10 else None
                     _ls_zoom_changed = Pi_Cam == 10 and _ls_new_cs is not None and _ls_new_cs != _ls_prev_cs
-                    if raw_format >= 2 or _ls_zoom_changed:
+                    if (raw_format >= 2 or _ls_zoom_changed) and not minicam_mode:
                         display_modes = pygame.display.list_modes()
                         _dw, _dh = display_modes[0] if display_modes and display_modes != -1 else (fs_width, fs_height)
                         windowSurfaceObj.fill((0, 0, 0))
@@ -23391,6 +24496,9 @@ while True:
                         apply_controls_immediately(
                             gain_value=_cam_gain if _cam_gain > 0 else None,
                             exposure_time=_cam_expo)
+                    elif minicam_mode:
+                        # MiniCam : pas de reconfiguration caméra locale, capture_thread reste MiniCamCaptureThread
+                        livestack_active = True
 
                     ls_sched_frames_done = 0
                     ls_sched_start_frames = 0
@@ -23534,17 +24642,25 @@ while True:
                         "Saturation": saturation / 10.0,
                     })
 
-                # Reconfigurer la caméra si mode RAW
-                if raw_format >= 2:
-                    kill_preview_process()
-                    preview()
+                if minicam_mode:
+                    # Retour à l'UI MiniCam sans toucher à picamera2
+                    if _minicam_capture_thread is not None:
+                        _minicam_capture_thread.stop()
+                        _minicam_capture_thread = None
+                    capture_thread = None
+                    print("[LS INTERFACE] Retour au mode MiniCam")
+                else:
+                    # Reconfigurer la caméra si mode RAW
+                    if raw_format >= 2:
+                        kill_preview_process()
+                        preview()
+                    menu = 0
 
-                # Restaurer affichage fullscreen pour le home screen
+                # Restaurer affichage fullscreen
                 display_modes = pygame.display.list_modes()
                 _hw, _hh = display_modes[0] if display_modes and display_modes != -1 else (1024, 600)
                 windowSurfaceObj = pygame.display.set_mode((_hw, _hh), pygame.FULLSCREEN, 24)
                 windowSurfaceObj.fill((0, 0, 0))
-                menu = 0
                 print("[LS INTERFACE] Mode interface LS désactivé")
                 continue
 
@@ -23905,6 +25021,9 @@ while True:
 
             # EXIT → quitter le mode interface Lucky (RGB8 ou RAW)
             if is_click_on_ls_exit(mousex, mousey, fs_height):
+                import time as _exit_time_mod
+                if _exit_time_mod.time() - _lucky_enter_time < 1.0:
+                    continue  # Ignorer EXIT pendant 1s après entrée (anti-exit accidentel)
                 if _is_raw_lucky:
                     lucky_raw_active = False
                     if ls_lucky_save_final == 1 and lucky_last_filtered_array is not None:
@@ -23950,16 +25069,24 @@ while True:
                         "Saturation": saturation / 10.0,
                     })
 
-                # Reconfigurer la caméra (nécessaire pour les deux modes)
-                if raw_format >= 2:
-                    kill_preview_process()
-                    preview()
+                if minicam_mode:
+                    # Retour à l'UI MiniCam sans toucher à picamera2
+                    if _minicam_capture_thread is not None:
+                        _minicam_capture_thread.stop()
+                        _minicam_capture_thread = None
+                    capture_thread = None
+                    print("[LUCKY INTERFACE] Retour au mode MiniCam")
+                else:
+                    # Reconfigurer la caméra (nécessaire pour les deux modes)
+                    if raw_format >= 2:
+                        kill_preview_process()
+                        preview()
+                    menu = 0
 
                 display_modes = pygame.display.list_modes()
                 _hw, _hh = display_modes[0] if display_modes and display_modes != -1 else (1024, 600)
                 windowSurfaceObj = pygame.display.set_mode((_hw, _hh), pygame.FULLSCREEN, 24)
                 windowSurfaceObj.fill((0, 0, 0))
-                menu = 0
                 pygame.display.update()
                 print("[LUCKY INTERFACE] Mode interface Lucky désactivé")
                 continue
@@ -24799,6 +25926,349 @@ while True:
 
             continue  # Rester en mode JSK LIVE
 
+        # ===== GESTION DES CLICS EN MODE MINICAM =====
+        # Quand LS/Galaxy/Lucky est actif, leurs propres handlers gèrent les clics.
+        if minicam_mode == 1 and ls_interface_mode == 0 and galaxy_interface_mode == 0 and lucky_raw_interface_mode == 0:
+            display_modes = pygame.display.list_modes()
+            if display_modes and display_modes != -1:
+                fs_width, fs_height = display_modes[0]
+            else:
+                screen_info = pygame.display.Info()
+                fs_width, fs_height = screen_info.current_w, screen_info.current_h
+
+            # Positions fixes EXIT et GEAR (fallback si _minicam_ui_rects pas encore peuplé)
+            _mc_exit_r = _minicam_ui_rects.get('minicam_exit',
+                             pygame.Rect(fs_width - 70 - 8, 8, 70, 28))
+            _mc_gear_r = _minicam_ui_rects.get('minicam_gear',
+                             pygame.Rect(fs_width - 40 - 8, fs_height - 40 - 8, 40, 40))
+            _mc_snap_r = _minicam_ui_rects.get('minicam_snap',
+                             pygame.Rect(fs_width - 80 - 90, 8, 80, 28))
+
+            # EXIT
+            if _mc_exit_r.collidepoint(mousex, mousey):
+                _minicam_disconnect()
+                minicam_mode = 0
+                minicam_settings_visible = 0
+                _minicam_ui_rects = {}
+                _minicam_slider_rects = {}
+                windowSurfaceObj.fill((0, 0, 0))
+                menu = 0
+                pygame.display.update()
+                continue
+
+            # Gear (toggle panneau)
+            if _mc_gear_r.collidepoint(mousex, mousey):
+                minicam_settings_visible = 1 - minicam_settings_visible
+                _minicam_slider_rects = {}
+                continue
+
+            # SNAP
+            if _mc_snap_r.collidepoint(mousex, mousey):
+                surf = _minicam_preview_surface
+                if surf is not None:
+                    import datetime
+                    ts = datetime.datetime.now().strftime("%y%m%d%H%M%S")
+                    snap_path = pic_dir + "minicam_snap_" + ts + ".jpg"
+                    import pygame as _pg
+                    _pg.image.save(surf, snap_path)
+                continue
+
+            # Champ IP (clic pour éditer)
+            if 'minicam_ip_field' in _minicam_ui_rects and _minicam_ui_rects['minicam_ip_field'].collidepoint(mousex, mousey):
+                _minicam_ip_editing = True
+                pygame.key.start_text_input()
+                continue
+            else:
+                if _minicam_ip_editing:
+                    _minicam_ip_editing = False
+                    pygame.key.stop_text_input()
+
+            # Transport selector
+            _mc_transport_clicked = False
+            for _tk in ('minicam_transport_usb', 'minicam_transport_wifi'):
+                if _tk in _minicam_ui_rects and _minicam_ui_rects[_tk].collidepoint(mousex, mousey):
+                    minicam_transport = 'usb' if _tk.endswith('usb') else 'wifi'
+                    if minicam_connected:
+                        _minicam_disconnect()
+                    _mc_transport_clicked = True
+                    break
+            if _mc_transport_clicked:
+                continue
+
+            # Connect / Disconnect
+            if 'minicam_connect_btn' in _minicam_ui_rects and _minicam_ui_rects['minicam_connect_btn'].collidepoint(mousex, mousey):
+                if minicam_connected:
+                    _minicam_disconnect()
+                else:
+                    import threading as _thr_mc
+                    _thr_mc.Thread(target=_minicam_connect, daemon=True).start()
+                continue
+
+            # Stacking mode buttons (left side)
+            def _minicam_ensure_controller(host):
+                """Crée un MiniCamController si pas déjà connecté, pour gain/expo en stacking.
+                La connexion WS est lancée dans un thread daemon pour ne pas bloquer l'UI."""
+                global _minicam_controller
+                if _minicam_controller is None:
+                    try:
+                        import threading as _mc_threading
+                        from libastrostack.minicam import MiniCamController
+                        ctrl = MiniCamController(host)
+                        _minicam_controller = ctrl  # disponible immédiatement (ws=None tant que pas connecté)
+                        _mc_threading.Thread(target=ctrl.connect, daemon=True).start()
+                    except Exception:
+                        pass  # Stacking fonctionne sans contrôleur (gain/expo non ajustables)
+
+            if 'minicam_livestack' in _minicam_ui_rects and _minicam_ui_rects['minicam_livestack'].collidepoint(mousex, mousey):
+                from libastrostack.minicam import MiniCamCaptureThread
+                host = "192.168.7.2:8000" if minicam_transport == 'usb' else f"{minicam_wifi_ip}:8000"
+                _minicam_ensure_controller(host)
+                _minicam_capture_thread = MiniCamCaptureThread(host)
+                _minicam_capture_thread.start()
+                capture_thread = _minicam_capture_thread
+                raw_stream_size = (1920, 1080)  # Pi0 envoie du 1920×1080 uint16
+                raw_format = 2  # Active la voie RAW Bayer pour le LiveStack MiniCam
+                ls_interface_mode = 1
+                continue
+
+            if 'minicam_galaxy' in _minicam_ui_rects and _minicam_ui_rects['minicam_galaxy'].collidepoint(mousex, mousey):
+                from libastrostack.minicam import MiniCamCaptureThread
+                host = "192.168.7.2:8000" if minicam_transport == 'usb' else f"{minicam_wifi_ip}:8000"
+                _minicam_ensure_controller(host)
+                _minicam_capture_thread = MiniCamCaptureThread(host)
+                _minicam_capture_thread.start()
+                capture_thread = _minicam_capture_thread
+                raw_stream_size = (1920, 1080)  # Pi0 envoie du 1920×1080 uint16
+                galaxy_interface_mode = 1
+                continue
+
+            if 'minicam_lucky' in _minicam_ui_rects and _minicam_ui_rects['minicam_lucky'].collidepoint(mousex, mousey):
+                from libastrostack.minicam import MiniCamCaptureThread
+                import time as _minicam_time
+                host = "192.168.7.2:8000" if minicam_transport == 'usb' else f"{minicam_wifi_ip}:8000"
+                _minicam_ensure_controller(host)
+                _minicam_capture_thread = MiniCamCaptureThread(host)
+                _minicam_capture_thread.start()
+                capture_thread = _minicam_capture_thread
+                raw_stream_size = (1920, 1080)  # Pi0 envoie du 1920×1080 uint16
+                raw_format = 2  # Active la voie RAW (debayer + Lucky RAW display)
+                lucky_raw_interface_mode = 1
+                stretch_mode = 1
+                _lucky_enter_time = _minicam_time.time()
+                display_modes = pygame.display.list_modes()
+                _lw, _lh = display_modes[0] if display_modes and display_modes != -1 else (1024, 600)
+                windowSurfaceObj = pygame.display.set_mode((_lw, _lh), pygame.FULLSCREEN, 24)
+                lucky_settings_visible = 0
+                _lucky_slider_rects = {}
+                _lucky_slider_dragging = False
+                _lucky_ge_dragging = None
+                continue
+
+            # === SOLVE (toggle overlay + LX200 server) ===
+            if 'minicam_solve' in _minicam_ui_rects and _minicam_ui_rects['minicam_solve'].collidepoint(mousex, mousey):
+                minicam_solve_mode = 1 - minicam_solve_mode
+                if minicam_solve_mode == 1:
+                    from libastrostack.lx200_server import LX200Server as _LX200Server
+                    _minicam_lx200_server = _LX200Server(port=minicam_lx200_port)
+                    def _on_lx200_goto(_ra, _dec):
+                        global minicam_target_ra, minicam_target_dec, minicam_target_name
+                        global minicam_pushto_active, minicam_solve_running
+                        minicam_target_ra = _ra
+                        minicam_target_dec = _dec
+                        minicam_target_name = "GoTo"
+                        minicam_pushto_active = True
+                        print(f"[LX200] GoTo RA={_ra:.4f} Dec={_dec:.4f} — Push-To activé")
+                        import threading as _thr_goto
+                        if not minicam_solve_running and minicam_solve_mode == 1 and _minicam_solve_fn is not None:
+                            minicam_solve_running = True
+                            _thr_goto.Thread(target=_minicam_solve_fn, daemon=True).start()
+                            print("[LX200] Solve auto déclenché suite à GoTo")
+                    _minicam_lx200_server.on_goto = _on_lx200_goto
+                    _minicam_lx200_server.start()
+                else:
+                    if _minicam_lx200_server is not None:
+                        _minicam_lx200_server.stop()
+                        _minicam_lx200_server = None
+                    minicam_pushto_active = False
+                continue
+
+            # === SOLVE: bouton SOLVE (lancer ou annuler le plate solving) ===
+            if 'minicam_solve_btn' in _minicam_ui_rects and _minicam_ui_rects['minicam_solve_btn'].collidepoint(mousex, mousey):
+                if minicam_solve_running:
+                    print("[SOLVE] Annulation demandée")
+                    _minicam_solve_cancelled = True
+                    if _minicam_solver is not None:
+                        _minicam_solver.cancel()
+                    minicam_solve_running = False
+                    continue
+
+                def _minicam_do_solve():
+                    global minicam_solve_result, minicam_solve_running, _minicam_solver, _minicam_solve_cancelled
+                    global minicam_solve_max_stars, _minicam_last_good_solve
+                    import cv2 as _cv2
+                    import numpy as _np
+
+                    _minicam_solve_cancelled = False
+                    host = "192.168.7.2:8000" if minicam_transport == 'usb' else f"{minicam_wifi_ip}:8000"
+                    bgr = None
+                    import time as _tsolve
+
+                    # 1. Thread actif → attendre sa prochaine frame (ne JAMAIS ouvrir une 2e
+                    # connexion /ws/raw : tuerait le flux preview/stack existant)
+                    if _minicam_capture_thread is not None and _minicam_capture_thread.running:
+                        print("[SOLVE] Source: thread capture existant (attente max 3s)…")
+                        _wait_end = _tsolve.time() + 3.0
+                        _frame = None
+                        while _tsolve.time() < _wait_end:
+                            _frame, _meta = _minicam_capture_thread.get_latest_frame()
+                            if _frame is not None:
+                                break
+                            _tsolve.sleep(0.1)
+                        if _frame is not None:
+                            bgr = _cv2.cvtColor(_frame, _cv2.COLOR_BayerRG2BGR)
+                            print(f"[SOLVE] Frame obtenue — shape={_frame.shape} dtype={_frame.dtype}")
+                        else:
+                            print("[SOLVE] AVERTISSEMENT: thread actif mais aucune frame en 3s")
+
+                    # 2. Connexion dédiée uniquement si pas de thread actif
+                    if bgr is None and (_minicam_capture_thread is None or not _minicam_capture_thread.running):
+                        try:
+                            print("[SOLVE] Source: capture WS /ws/raw dédiée (settle=2, timeout=8s)…")
+                            from libastrostack.minicam import capture_one_raw_frame
+                            _frame, _meta = capture_one_raw_frame(host, timeout=8.0, settle=2)
+                            if _frame is not None:
+                                bgr = _cv2.cvtColor(_frame, _cv2.COLOR_BayerRG2BGR)
+                                print(f"[SOLVE] Image capturée via WS — shape={_frame.shape} meta={_meta}")
+                            else:
+                                print("[SOLVE] capture_one_raw_frame retourné None")
+                        except Exception as _e:
+                            print(f"[SOLVE] Capture WS échouée: {_e}")
+
+                    if _minicam_solve_cancelled:
+                        minicam_solve_running = False
+                        return
+
+                    # 3. Fallback: preview JPEG
+                    if bgr is None and _minicam_preview_surface is not None:
+                        try:
+                            _arr = pygame.surfarray.array3d(_minicam_preview_surface)
+                            bgr = _np.transpose(_arr, (1, 0, 2))[:, :, ::-1]
+                            print(f"[SOLVE] Source: fallback preview JPEG — shape={bgr.shape}")
+                        except Exception as _e:
+                            print(f"[SOLVE] Preview fallback échoué: {_e}")
+
+                    if bgr is None:
+                        print("[SOLVE] ERREUR: aucune image disponible")
+                        from libastrostack.platesolve import SolveResult
+                        minicam_solve_result = SolveResult(success=False, error="Aucune image disponible")
+                        minicam_solve_running = False
+                        return
+
+                    # Infos image et paramètres optiques
+                    _scale_th = 206.265 * minicam_pixel_um / minicam_focal_mm
+                    _fw = _scale_th * bgr.shape[1] / 3600.0
+                    _fh = _scale_th * bgr.shape[0] / 3600.0
+                    print(f"[SOLVE] Image: {bgr.shape[1]}×{bgr.shape[0]} px — "
+                          f"min={int(bgr.min())} max={int(bgr.max())}")
+                    print(f"[SOLVE] Optique: focal={minicam_focal_mm:.0f}mm "
+                          f"pixel={minicam_pixel_um}µm → {_scale_th:.1f}\"/px "
+                          f"— champ {_fw:.1f}°×{_fh:.1f}°")
+
+                    # Hint RA/Dec si solve précédent réussi.
+                    # En mode push-to, le télescope peut avoir bougé de >5° entre
+                    # deux solves → rayon élargi à 20° pour couvrir les déplacements
+                    # manuels typiques sans pénaliser trop les solves consécutifs.
+                    if minicam_pushto_active and minicam_target_ra is not None:
+                        # En push-to : scope pointé manuellement vers la cible GoTo —
+                        # c'est une meilleure estimation que l'ancien solve (qui peut être
+                        # à 20°+ après un déplacement important).
+                        _hint_ra = minicam_target_ra
+                        _hint_dec = minicam_target_dec
+                        _hint_r = 30.0
+                        print(f"[SOLVE] Hint (cible push-to): RA={_hint_ra:.4f}° Dec={_hint_dec:.4f}° r={_hint_r:.0f}°")
+                    elif _minicam_last_good_solve is not None:
+                        _hint_ra = _minicam_last_good_solve.ra_deg
+                        _hint_dec = _minicam_last_good_solve.dec_deg
+                        _hint_r = 15.0  # > step ASTAP (~7°) → couvre ~19 positions au lieu de 1
+                        print(f"[SOLVE] Hint (dernier solve): RA={_hint_ra:.4f}° Dec={_hint_dec:.4f}° r={_hint_r:.0f}°")
+                    else:
+                        _hint_ra = None
+                        _hint_dec = None
+                        _hint_r = 180.0
+                        print("[SOLVE] Pas de hint → blind solve 180°")
+
+                    if _minicam_solve_cancelled:
+                        minicam_solve_running = False
+                        return
+
+                    # Auto-downsample selon FOV — conservateur pour éviter "dimensions too low"
+                    _fov_h = 206.265 * minicam_pixel_um / minicam_focal_mm * bgr.shape[0] / 3600.0
+                    if _fov_h > 20.0:
+                        _auto_ds = 2
+                    elif _fov_h > 10.0:
+                        _auto_ds = 1
+                    else:
+                        _auto_ds = 0  # ASTAP auto — safe pour tout champ ≤ 10°
+                    print(f"[SOLVE] FOV_h={_fov_h:.1f}° → downsample={_auto_ds} max_stars={minicam_solve_max_stars}")
+
+                    from libastrostack.platesolve import PlateSolver
+                    _minicam_solver = PlateSolver(
+                        pixel_size_um=minicam_pixel_um,
+                        max_stars=minicam_solve_max_stars,
+                        downsample=_auto_ds,
+                    )
+                    _result = _minicam_solver.solve(
+                        bgr, minicam_focal_mm,
+                        hint_ra=_hint_ra, hint_dec=_hint_dec,
+                        hint_radius_deg=_hint_r,
+                    )
+                    _minicam_solver = None
+                    minicam_solve_result = _result
+                    if _result.success:
+                        _minicam_last_good_solve = _result  # conserver même si un solve ultérieur échoue
+                    minicam_solve_running = False
+                    _thr_state = ("running" if (_minicam_capture_thread is not None and _minicam_capture_thread.running) else "stopped/None")
+                    if _result.success:
+                        print(f"[SOLVE] OK RA={_result.ra_deg:.4f}° Dec={_result.dec_deg:.4f}° "
+                              f"scale={_result.pixel_scale_arcsec:.2f}\"/px "
+                              f"champ={_result.field_w_deg:.1f}°×{_result.field_h_deg:.1f}° "
+                              f"({_result.elapsed_s:.1f}s) thread={_thr_state}")
+                    else:
+                        print(f"[SOLVE] ÉCHEC: {_result.error} ({_result.elapsed_s:.1f}s) thread={_thr_state}")
+                    print(f"[SOLVE] preview_running={_minicam_preview_running} "
+                          f"preview_surface={'OK' if _minicam_preview_surface is not None else 'None'}")
+                    if not _minicam_solve_cancelled and _result.success and _minicam_lx200_server is not None:
+                        _minicam_lx200_server.set_position(_result.ra_deg, _result.dec_deg)
+
+                    # Auto-boucle push-to : re-solve automatiquement tant que push-to actif.
+                    # Permet aux flèches de s'actualiser sans intervention de l'utilisateur.
+                    if (not _minicam_solve_cancelled and minicam_pushto_active
+                            and minicam_solve_mode == 1):
+                        import time as _t
+                        import threading as _thr_auto
+                        _t.sleep(5.0)
+                        if minicam_pushto_active and minicam_solve_mode == 1 and not minicam_solve_running:
+                            minicam_solve_running = True
+                            _thr_auto.Thread(target=_minicam_do_solve, daemon=True).start()
+
+                _minicam_solve_fn = _minicam_do_solve
+                minicam_solve_running = True
+                import threading as _thr_solve
+                _minicam_solve_thread = _thr_solve.Thread(target=_minicam_do_solve, daemon=True)
+                _minicam_solve_thread.start()
+                continue
+
+            # === SOLVE: bouton PUSH-TO (toggle) ===
+            if 'minicam_pushto_btn' in _minicam_ui_rects and _minicam_ui_rects['minicam_pushto_btn'].collidepoint(mousex, mousey):
+                minicam_pushto_active = not minicam_pushto_active
+                if minicam_pushto_active and not minicam_solve_running and minicam_solve_mode == 1 and _minicam_solve_fn is not None:
+                    minicam_solve_running = True
+                    import threading as _thr_pt
+                    _thr_pt.Thread(target=_minicam_solve_fn, daemon=True).start()
+                continue
+
+            continue  # Rester en mode MiniCam
+
         # Permettre le déplacement du réticule même avec menu ouvert si on est en mode focus
         if mousex < preview_width and mousey < preview_height and mousex != 0 and mousey != 0 and event.button != 3 and (menu == 0 or focus_mode == 1):
             # Calculer histarea_display pour les limites (même logique que l'affichage du réticule)
@@ -24831,7 +26301,7 @@ while True:
                 fyz = 1
                 if (v3_f_mode == 0 or v3_f_mode == 2) and menu == 0:
                     text(0,3,3,1,1,str(v3_f_modes[v3_f_mode]),fv,7)
-            if ((Pi_Cam == 3 and v3_af == 1) or ((Pi_Cam == 5 or Pi_Cam == 6)) or Pi_Cam == 8) and zoom == 0:
+            if ((Pi_Cam == 3 and v3_af == 1) or ((Pi_Cam == 5 or Pi_Cam == 6)) or Pi_Cam == 8) and zoom == 0 and not minicam_mode:
                 restart = 1
         
         # external trigger
