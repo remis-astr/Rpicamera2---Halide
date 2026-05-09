@@ -76,6 +76,7 @@ class FinderScreen:
         theme.set_night(night_mode)
 
         self._target:  Optional[Target] = None
+        self.on_target_changed = None  # Callable[[Target], None] | None
         self._fov_deg: float = 30.0
         self._autoresolve_s: int = _AUTORESOLVE_DEFAULT
 
@@ -159,6 +160,12 @@ class FinderScreen:
     def close(self) -> None:
         """Stop background threads."""
         self._imu.stop()
+
+    def set_target(self, target: Optional[Target]) -> None:
+        """Set push-to target and notify RPiCamera2 if a callback is registered."""
+        self._target = target
+        if target is not None and callable(self.on_target_changed):
+            self.on_target_changed(target)
 
     def update_solve_params(self, focal_mm: float, max_stars: int) -> None:
         """Sync focal length and max_stars from the MiniCam solve sliders."""
@@ -724,7 +731,7 @@ class FinderScreen:
         if self._search_results:
             e = self._search_results[self._search_selected]
             from libastrostack.finder.target_source import target_from_catalog_entry
-            self._target = target_from_catalog_entry(e, source="search")
+            self.set_target(target_from_catalog_entry(e, source="search"))
         self._show_search = False
 
     # ------------------------------------------------------------------
