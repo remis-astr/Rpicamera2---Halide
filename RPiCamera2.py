@@ -2233,7 +2233,7 @@ _minicam_ui_rects = {}        # Rects retournés par draw_minicam_fullscreen()
 
 # MiniCam Plate Solve / Push-To
 minicam_solve_mode = 0          # 0=inactif, 1=overlay visible
-minicam_focal_mm = 50.0         # Focale en mm (25–600)
+minicam_focal_mm = 176.0        # Focale en mm (25–600)
 minicam_pixel_um = 2.9          # Taille pixel µm (IMX462)
 minicam_solve_result = None     # Dernier SolveResult (ou None)
 minicam_solve_running = False   # True pendant un solve en cours
@@ -2247,9 +2247,9 @@ minicam_stellarium_host = "192.168.1.100:8090"  # host:port du laptop Stellarium
 _minicam_stellarium_ip_editing = False  # True si saisie IP Stellarium active
 minicam_pushto_active = False   # Mode push-to activé
 pushto_flip_x = False           # Inverse axe X (gauche/droite) cercle cible + flèche
-pushto_flip_y = False           # Inverse axe Y (haut/bas) cercle cible + flèche
+pushto_flip_y = True            # Inverse axe Y (haut/bas) cercle cible + flèche
 _minicam_focal_dragging = False  # Drag du slider focale en cours
-minicam_solve_max_stars = 200    # Nb max étoiles ASTAP (50-500) — contrôle implicite magnitude
+minicam_solve_max_stars = 50     # Nb max étoiles ASTAP (50-500) — contrôle implicite magnitude
 _minicam_stars_dragging = False  # Drag du slider stars en cours
 obs_lat_deg = 47.312            # Latitude observateur (degrés, N+)
 obs_lon_deg = 0.482             # Longitude observateur (degrés, E+)
@@ -2257,6 +2257,10 @@ _minicam_lx200_server = None    # Instance LX200Server (actif si solve_mode=1)
 _minicam_solve_fn = None        # Référence à _minicam_do_solve (pour push-to button + on_goto)
 _minicam_last_good_solve = None  # Dernier solve réussi — conservé même si un solve ultérieur échoue
 minicam_lx200_port = 4030       # Port LX200 (Stellarium Mobile → RPi)
+
+# Finder mode
+_finder_screen = None           # Instance FinderScreen (créée à la demande)
+_finder_active = False          # True quand le Finder a le contrôle de l'écran
 
 # COLLIMATION Settings
 collimation_mode = 0              # 0=OFF, 1=Active
@@ -4548,6 +4552,17 @@ _screen_info = pygame.display.Info()
 _home_init_w = _screen_info.current_w or 1024
 _home_init_h = _screen_info.current_h or 600
 windowSurfaceObj = pygame.display.set_mode((_home_init_w, _home_init_h), pygame.FULLSCREEN, 24)
+
+# Splash screen — affiché pendant l'init caméra (aucun délai ajouté)
+_splash_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "splash.png")
+if os.path.exists(_splash_path):
+    try:
+        _splash_img = pygame.image.load(_splash_path).convert()
+        _splash_img = pygame.transform.scale(_splash_img, (_home_init_w, _home_init_h))
+        windowSurfaceObj.blit(_splash_img, (0, 0))
+        pygame.display.update()
+    except Exception:
+        pass
 
 Camera_Version()
 
@@ -16655,8 +16670,8 @@ def draw_minicam_mode_buttons(screen_width, screen_height):
     global windowSurfaceObj, _font_cache, minicam_solve_mode
     rects = {}
     btn_w, btn_h, step = 78, 32, 42
-    # Centré verticalement pour 4 boutons
-    start_y = screen_height // 2 - (4 * btn_h + 3 * (step - btn_h)) // 2
+    # Centré verticalement pour 5 boutons
+    start_y = screen_height // 2 - (5 * btn_h + 4 * (step - btn_h)) // 2
     ck = 18
     if ck not in _font_cache:
         _font_cache[ck] = pygame.font.Font(None, ck)
@@ -16666,13 +16681,15 @@ def draw_minicam_mode_buttons(screen_width, screen_height):
         ('minicam_galaxy',    "GALAXY","",       (60, 40, 80)),
         ('minicam_lucky',     "LUCKY", "RAW",    (80, 60, 20)),
         ('minicam_solve',     "SOLVE", "",        (15, 50, 80)),
+        ('minicam_finder',    "FINDER","",        (20, 55, 55)),
     ]
     for i, (key, line1, line2, bg) in enumerate(buttons):
         bx = 5
         by = start_y + i * step
         r = pygame.Rect(bx, by, btn_w, btn_h)
-        # Le bouton SOLVE est surligné quand le mode est actif
-        active = (key == 'minicam_solve' and minicam_solve_mode == 1)
+        # Les boutons SOLVE et FINDER sont surlignés quand leur mode est actif
+        active = ((key == 'minicam_solve' and minicam_solve_mode == 1) or
+                  (key == 'minicam_finder' and _finder_active))
         alpha = 240 if active else 200
         s = pygame.Surface((btn_w, btn_h), pygame.SRCALPHA)
         s.fill((*bg, alpha))
@@ -17212,13 +17229,14 @@ def draw_minicam_solve_overlay(screen_width, screen_height):
 
         # Vecteurs WCS Nord/Est + projection cible sur les pixels display
         # cdelt1_sign : -1 = Est à gauche (CDELT1<0, standard), +1 = Est à droite (miroir)
-        # Formule correcte (inversion WCS sky→pixel + flip y FITS→écran) :
+        # Formule (WCS sky→pixel + flip y FITS→écran) :
         #   Δx_écran = _es · (cos·ξ + sin·η)  →  ex=_es·cos, nx=_es·sin
         #   Δy_écran = sin·ξ − cos·η           →  ey=sin (sans _es), ny=−cos
+        # Note : pushto_flip_y=True corrige l'orientation selon le setup optique
         rot    = _math.radians(sr.field_angle_deg)
         _es    = float(sr.cdelt1_sign)   # signe East : ±1
         ex     =  _es * _math.cos(rot)
-        ey     =       _math.sin(rot)   # pas de facteur _es : CDELT2 toujours positif
+        ey     =       _math.sin(rot)
         nx     =  _es * _math.sin(rot)  # facteur _es requis pour chiralité
         ny     = -_math.cos(rot)
         dx_img = dra_arcmin * ex + ddec_arcmin * nx
@@ -20922,6 +20940,18 @@ while True:
                 if sun_settings_visible == 1:
                     _sun_slider_rects = draw_sun_controls(max_width, max_height)
                 pygame.display.update()
+
+            # === FINDER MODE: prend le contrôle complet de l'écran ===
+            if _finder_active and _finder_screen is not None:
+                stay = _finder_screen.update(windowSurfaceObj, pygame.event.get())
+                if not stay:
+                    # Back pressé → fermer le Finder
+                    _finder_screen.close()
+                    _finder_active = False
+                    pygame.event.clear()  # purge clicks from Finder so they don't leak into MiniCam
+                frame_from_thread = None
+                pygame.display.update()
+                continue
 
             # === MINICAM MODE: Preview + panneau contrôle ===
             # N'afficher l'UI MiniCam que si aucun mode de stacking n'est actif.
@@ -26088,6 +26118,31 @@ while True:
                 _lucky_ge_dragging = None
                 continue
 
+            # === FINDER (ouvre / ferme le mode Finder) ===
+            if 'minicam_finder' in _minicam_ui_rects and _minicam_ui_rects['minicam_finder'].collidepoint(mousex, mousey):
+                if not _finder_active:
+                    from libastrostack.finder.finder_screen import FinderScreen
+                    host = "192.168.7.2:8000" if minicam_transport == 'usb' else f"{minicam_wifi_ip}:8000"
+                    if _finder_screen is None:
+                        _finder_screen = FinderScreen(
+                            obs_lat      = obs_lat_deg,
+                            obs_lon      = obs_lon_deg,
+                            minicam_host = host,
+                            night_mode   = True,
+                            focal_mm     = minicam_focal_mm,
+                            max_stars    = minicam_solve_max_stars,
+                        )
+                    else:
+                        # Sync slider values that may have changed since creation
+                        _finder_screen.update_solve_params(minicam_focal_mm, minicam_solve_max_stars)
+                    _finder_screen.open()   # (re)démarre l'IMU client
+                    _finder_active = True
+                else:
+                    if _finder_screen is not None:
+                        _finder_screen.close()
+                    _finder_active = False
+                continue
+
             # === SOLVE (toggle overlay + LX200 server) ===
             if 'minicam_solve' in _minicam_ui_rects and _minicam_ui_rects['minicam_solve'].collidepoint(mousex, mousey):
                 minicam_solve_mode = 1 - minicam_solve_mode
@@ -26102,6 +26157,14 @@ while True:
                         minicam_target_name = "GoTo"
                         minicam_pushto_active = True
                         print(f"[LX200] GoTo RA={_ra:.4f} Dec={_dec:.4f} — Push-To activé")
+                        # Mettre à jour la cible du Finder si ouvert
+                        if _finder_active and _finder_screen is not None:
+                            from libastrostack.finder.target_source import Target
+                            _finder_screen._target = Target(
+                                ra_deg=_ra, dec_deg=_dec,
+                                name="GoTo", code="", source="stellarium",
+                            )
+                            print("[LX200] Cible transmise au Finder")
                         import threading as _thr_goto
                         if not minicam_solve_running and minicam_solve_mode == 1 and _minicam_solve_fn is not None:
                             minicam_solve_running = True
@@ -26250,6 +26313,8 @@ while True:
                     minicam_solve_result = _result
                     if _result.success:
                         _minicam_last_good_solve = _result  # conserver même si un solve ultérieur échoue
+                        if _finder_screen is not None:
+                            _finder_screen.notify_solve(_result.ra_deg, _result.dec_deg)
                     minicam_solve_running = False
                     _thr_state = ("running" if (_minicam_capture_thread is not None and _minicam_capture_thread.running) else "stopped/None")
                     if _result.success:
