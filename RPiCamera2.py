@@ -26132,9 +26132,23 @@ while True:
                             focal_mm     = minicam_focal_mm,
                             max_stars    = minicam_solve_max_stars,
                         )
+                        def _on_finder_target_changed(t):
+                            global minicam_target_ra, minicam_target_dec, minicam_target_name, minicam_pushto_active
+                            minicam_target_ra   = t.ra_deg
+                            minicam_target_dec  = t.dec_deg
+                            minicam_target_name = t.name or t.code or "GoTo"
+                            minicam_pushto_active = True
+                        _finder_screen.on_target_changed = _on_finder_target_changed
                     else:
                         # Sync slider values that may have changed since creation
                         _finder_screen.update_solve_params(minicam_focal_mm, minicam_solve_max_stars)
+                    # Pré-charger la cible MiniCam active dans le Finder
+                    if minicam_target_ra is not None and _finder_screen._target is None:
+                        from libastrostack.finder.target_source import Target as _FTarget
+                        _finder_screen._target = _FTarget(
+                            ra_deg=minicam_target_ra, dec_deg=minicam_target_dec,
+                            name=minicam_target_name or "GoTo", code="", source="stellarium",
+                        )
                     _finder_screen.open()   # (re)démarre l'IMU client
                     _finder_active = True
                 else:
