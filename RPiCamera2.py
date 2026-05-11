@@ -2262,6 +2262,10 @@ minicam_lx200_port = 4030       # Port LX200 (Stellarium Mobile → RPi)
 _finder_screen = None           # Instance FinderScreen (créée à la demande)
 _finder_active = False          # True quand le Finder a le contrôle de l'écran
 
+# Polar alignment mode
+_polar_align_screen = None      # Instance PolarAlignScreen (créée à la demande)
+_polar_align_active = False     # True quand le mode mise en station est actif
+
 # COLLIMATION Settings
 collimation_mode = 0              # 0=OFF, 1=Active
 collimation_detector = None       # Instance CollimationDetector
@@ -16666,12 +16670,12 @@ def draw_minicam_snap_button(screen_width, screen_height):
 
 
 def draw_minicam_mode_buttons(screen_width, screen_height):
-    """Dessine les 4 boutons de mode sur le côté gauche (LIVE STACK / GALAXY / LUCKY RAW / SOLVE)."""
+    """Dessine les boutons de mode sur le côté gauche (LIVE STACK / GALAXY / LUCKY RAW / SOLVE / FINDER / POLAR)."""
     global windowSurfaceObj, _font_cache, minicam_solve_mode
     rects = {}
     btn_w, btn_h, step = 78, 32, 42
-    # Centré verticalement pour 5 boutons
-    start_y = screen_height // 2 - (5 * btn_h + 4 * (step - btn_h)) // 2
+    # Centré verticalement pour 6 boutons
+    start_y = screen_height // 2 - (6 * btn_h + 5 * (step - btn_h)) // 2
     ck = 18
     if ck not in _font_cache:
         _font_cache[ck] = pygame.font.Font(None, ck)
@@ -16682,14 +16686,16 @@ def draw_minicam_mode_buttons(screen_width, screen_height):
         ('minicam_lucky',     "LUCKY", "RAW",    (80, 60, 20)),
         ('minicam_solve',     "SOLVE", "",        (15, 50, 80)),
         ('minicam_finder',    "FINDER","",        (20, 55, 55)),
+        ('minicam_polar',     "POLAR", "ALIGN",  (50, 30, 70)),
     ]
     for i, (key, line1, line2, bg) in enumerate(buttons):
         bx = 5
         by = start_y + i * step
         r = pygame.Rect(bx, by, btn_w, btn_h)
-        # Les boutons SOLVE et FINDER sont surlignés quand leur mode est actif
+        # Les boutons SOLVE, FINDER et POLAR sont surlignés quand leur mode est actif
         active = ((key == 'minicam_solve' and minicam_solve_mode == 1) or
-                  (key == 'minicam_finder' and _finder_active))
+                  (key == 'minicam_finder' and _finder_active) or
+                  (key == 'minicam_polar'  and _polar_align_active))
         alpha = 240 if active else 200
         s = pygame.Surface((btn_w, btn_h), pygame.SRCALPHA)
         s.fill((*bg, alpha))
@@ -20949,6 +20955,17 @@ while True:
                     _finder_screen.close()
                     _finder_active = False
                     pygame.event.clear()  # purge clicks from Finder so they don't leak into MiniCam
+                frame_from_thread = None
+                pygame.display.update()
+                continue
+
+            # === POLAR ALIGNMENT MODE: prend le contrôle complet de l'écran ===
+            if _polar_align_active and _polar_align_screen is not None:
+                stay = _polar_align_screen.update(windowSurfaceObj, pygame.event.get())
+                if not stay:
+                    _polar_align_screen.close()
+                    _polar_align_active = False
+                    pygame.event.clear()
                 frame_from_thread = None
                 pygame.display.update()
                 continue
@@ -26155,6 +26172,35 @@ while True:
                     if _finder_screen is not None:
                         _finder_screen.close()
                     _finder_active = False
+                continue
+
+            # === POLAR ALIGNMENT (ouvre / ferme la mise en station) ===
+            if 'minicam_polar' in _minicam_ui_rects and _minicam_ui_rects['minicam_polar'].collidepoint(mousex, mousey):
+                if not _polar_align_active:
+                    from libastrostack.polar_align.polar_align_screen import PolarAlignScreen as _PolarAlignScreen
+                    host = "192.168.7.2:8000" if minicam_transport == 'usb' else f"{minicam_wifi_ip}:8000"
+                    if _polar_align_screen is None:
+                        _polar_align_screen = _PolarAlignScreen(
+                            obs_lat       = obs_lat_deg,
+                            obs_lon       = obs_lon_deg,
+                            minicam_host  = host,
+                            focal_mm      = minicam_focal_mm,
+                            pixel_um      = minicam_pixel_um,
+                            max_stars     = minicam_solve_max_stars,
+                            capture_thread= _minicam_capture_thread,
+                        )
+                    else:
+                        _polar_align_screen.update_params(
+                            focal_mm      = minicam_focal_mm,
+                            max_stars     = minicam_solve_max_stars,
+                            capture_thread= _minicam_capture_thread,
+                        )
+                    _polar_align_screen.open()
+                    _polar_align_active = True
+                else:
+                    if _polar_align_screen is not None:
+                        _polar_align_screen.close()
+                    _polar_align_active = False
                 continue
 
             # === SOLVE (toggle overlay + LX200 server) ===
