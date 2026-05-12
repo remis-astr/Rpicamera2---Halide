@@ -15,7 +15,7 @@ Dérivé de [RPiCamera](https://github.com/Gordon999) de Gordon999, entièrement
 | Écran | 7″ HDMI tactile recommandé — [LCD Wiki](https://www.lcdwiki.com/7inch_HDMI_Display-H) |
 | Stockage | NVMe SSD (recommandé, voire indispensable pour RAW12 haute cadence) |
 | GPIO (optionnel) | Boutons externes mise au point / déclenchement |
-| IMU (optionnel) | MPU6050 ou BNO055 — pour AstroHopper / mise en station polaire |
+| IMU (optionnel) | MPU6050 (à installer sur le RPI0 de la Minicam: AstroHopper sur le RPI5: mise en station polaire / Finder |
 
 ---
 
@@ -93,8 +93,7 @@ Copier et adapter `PiLCConfig104.txt` à la racine du projet. Ce fichier contien
 # Manuel
 python3 RPiCamera2.py
 
-# Via le script de démarrage (gère l'attente X11, ferme le splash)
-bash start_rpicamera2.sh
+
 ```
 
 Pour un démarrage automatique au boot, configurer `start_rpicamera2.sh` comme service systemd ou entrée autostart.
@@ -134,10 +133,10 @@ Les vidéos YUV420 et RAW peuvent être converties automatiquement au format **S
 | **Lucky Stack RGB8** | Sélection des meilleures frames sur flux RGB8/YUV — score, alignement, stack, post-filtres |
 | **Lucky Stack RAW** | Même pipeline mais en domaine Bayer RAW12 : score sur canal G1 linéaire, alignement sous-pixel, débayérisation unique en fin de stack — pas d'artefact ISP, 12 bits préservés |
 | **JSK Live** | Pipeline HDR + débruitage pour ciel profond : RAW12 → stack (1–4 frames) → fusion HDR (médiane / moyenne / Mertens) → débayer → débruitage (bilatéral, Gaussian, médian, guided) → stretch. Accéléré ×16 via pipeline Halide AOT |
-| **Galaxy** | Live stack avec enhancement galactique multi-échelle : réduction d'étoiles (ouverture morphologique) + filtre Frangi structurel modifié + USM multi-échelle. 3 presets : Elliptique, Spirale, Par la tranche |
+| **Galaxy** | Live stack pipeline HDR (JSK) avec enhancement galactique multi-échelle : réduction d'étoiles (ouverture morphologique) + filtre Frangi structurel modifié + USM multi-échelle. 3 presets : Elliptique, Spirale, Par la tranche |
 | **Moon Mineral** | 6 presets scientifiques — saturation HSV, décorrélation PCA, faux-couleurs spectral NASA |
 | **Solar** | Traitement dédié imagerie solaire |
-| **Collimation** | Assistant de collimation par analyse de la tache de diffraction |
+| **Collimation** | Assistant de collimation par cercles concentriques |
 
 ### MiniCam (caméra secondaire)
 
