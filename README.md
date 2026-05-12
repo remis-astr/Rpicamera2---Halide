@@ -15,7 +15,7 @@ Dérivé de [RPiCamera](https://github.com/Gordon999) de Gordon999, entièrement
 | Écran | 7″ HDMI tactile recommandé — [LCD Wiki](https://www.lcdwiki.com/7inch_HDMI_Display-H) |
 | Stockage | NVMe SSD (recommandé, voire indispensable pour RAW12 haute cadence) |
 | GPIO (optionnel) | Boutons externes mise au point / déclenchement |
-| IMU (optionnel) | MPU6050 (à installer sur le RPI0 de la Minicam: AstroHopper sur le RPI5: mise en station polaire / Finder |
+| IMU (optionnel) | MPU6050 à installer sur le RPI0 de la Minicam pour AstroHopper. Sur le RPI5: mise en station polaire / Finder |
 
 ---
 
